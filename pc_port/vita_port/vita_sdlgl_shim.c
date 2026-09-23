@@ -4,6 +4,12 @@
 #include "vita_sdlgl_shim.h"
 #include <string.h>
 
+/* newlib reserves its whole heap as one block at startup (default 128 MB);
+ * vitaGL's RAM pool is then what is free minus ram_threshold below. The game's
+ * own allocations (texture pools, the flashlight view-space table) come from
+ * this heap. Starting point for on-device tuning, not a measurement. */
+int _newlib_heap_size_user = 160 * 1024 * 1024;
+
 static int s_vglReady = 0;
 
 SDL_GLContext VitaGL_CreateContext(SDL_Window* w)

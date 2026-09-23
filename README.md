@@ -6,9 +6,9 @@ Rendering goes through [vitaGL](https://github.com/Rinnegatamante/vitaGL) (OpenG
 
 ## Status
 
-**Work in progress. Not playable yet.**
+**Work in progress. Not yet tested on a console.**
 
-The Vita build compiles, links and packages into a `.vpk`. It has not been run on a console yet, and the game can't find its data on the Vita until file paths are set up (step 1 below).
+The Vita build compiles, links and packages into a `.vpk`. It has not been run on real hardware yet, so expect it to fail somewhere on first boot.
 
 Done:
 - Vita CMake target, SELF and VPK packaging
@@ -17,22 +17,24 @@ Done:
 - Blend modes that need a constant blend colour (which GXM lacks) done in the fragment shader instead
 - Flashlight shadow maps: depth is packed into an RGBA8 texture, 512x512, on by default (`flashlight_mode = 1`)
 - All 43 map overlays linked in statically
+- Data folder `ux0:data/silenthill/`: config, saves and logs live there, and the bundled fonts and language packs are copied there on first run
+- Memory: static data cut from 187 MB to 45 MB, extended memory mode enabled
 
 Next, in order:
-1. File paths: `fs_pc`, config and saves under `ux0:data/silenthill/`
-2. Memory: the static maps reserve about 187 MB of .bss. Share one region between the maps, or load them on demand
-3. Vita controls: pad mapping, and the rear touchpad for L2/R2
-4. On-device testing: shader compilation, performance, audio latency
+1. On-device testing: memory split, shader compilation, performance, audio latency
+2. Vita controls: pad mapping, and the rear touchpad for L2/R2
 
 Full technical notes: [pc_port/vita_port/HANDOFF.md](pc_port/vita_port/HANDOFF.md).
 
 Not available on Vita: MSAA, post-processing, RetroAchievements, Discord Rich Presence, DLL mods/plugins, the ffmpeg FMV fallback and the Windows launcher.
 
-## Requirements (once playable)
+## Requirements
 
 - A PS Vita or PS TV running custom firmware (HENkaku/h-encore/Enso) with VitaShell
 - `libshacccg.suprx` in `ur0:data/` or `ur0:data/external/`, needed to compile shaders at runtime. Extract it with [ShaRKBR33D](https://github.com/Rinnegatamante/ShaRKBR33D)
-- Your own legally obtained Silent Hill PlayStation disc image. **No game data is included.**
+- Your own legally obtained Silent Hill PlayStation disc image (`.bin`), copied to `ux0:data/silenthill/gamedata/`. **No game data is included.**
+
+Logs are written to `ux0:data/silenthill/` as `SilentHill_<date>_<time>.log`.
 
 ## Building
 

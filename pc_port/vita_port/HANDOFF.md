@@ -34,15 +34,22 @@ Host needs llvm-nm + llvm-objcopy (static map symbol prefixing), python3.
   glad.h so it compiles -- confirm on device that vitaGL answers it (else VAO 0 gets restored).
 
 ## Next steps (in order)
-1. DONE — links. .bss is 187 MB (arm-vita-eabi-size), see step 4.
-2. File paths: point fs_pc / config / saves at `ux0:data/silenthill/` (disc image lives there).
+1. DONE — links.
+2. DONE — file paths: main_pc.c creates and chdirs into `ux0:data/silenthill/` (disc image goes in
+   `gamedata/` there), creates the mod folders, and stages the VPK's `app0:assets/` (fonts, lang,
+   decal, licenses; not the RA symbol maps / unlock sounds) on first run without overwriting.
+   Memory cards are created by PsyCross in `gamedata/save/` on first use.
 3. DONE — constant-colour blend modes: GXM has no glBlendColor, so BM_ADD_QUATER_SOURCE and
    BM_CONSTANT_ALPHA scale the source in the fragment shader (u_blendSrc). Quarter-add uses 0.5,
    matching the desktop constant alpha. Feedback damp keeps dst alpha instead of lerping it.
-4. MEMORY — biggest risk: static maps reserve ~198 MB .bss (demand-zero on iOS, NOT on Vita).
-   Measure `arm-vita-eabi-size` on the ELF. If too big: union the per-map .bss into one shared
-   region (only one map is live at a time), or load maps with so_util (Rinnegatamante).
-   Also tune vglInitExtended ram_threshold and `_newlib_heap_size_user`.
+4. MEMORY — .bss 187 MB -> 44.6 MB. The static maps were NOT the cause (all 43 together ~1.5 MB);
+   it was PsyX_GPU.cpp's PGXP / flashlight view-space hash tables (2^21 entries, 48 + 88 MB). On Vita
+   they are 2^19 and calloc'd on first use: s_shadow 12 MB only with use_pgxp=1, s_vshadow 22 MB once
+   the per-pixel flashlight runs (on by default). Probe overflow degrades a vertex to untracked.
+   param.sfo ATTRIBUTE2=12 (extended memory). `_newlib_heap_size_user` = 160 MB in
+   vita_sdlgl_shim.c; vitaGL's RAM pool is the remainder minus ram_threshold (16 MB). Both are
+   guesses: tune from the "Vita free memory after GL init" log line on device.
+   `-Wl,--defsym,__sce_headroom=0x2000` keeps vita-elf-create's "segment 1 overlaps" away.
 5. Controls: Vita pad/touch mapping (SDL gamecontroller works on Vita; rear touch for L2/R2).
 6. On-device: shader compile errors from vitaShaRK (needs libshacccg.suprx on the console),
    performance (try 444 MHz via PSVshell), audio latency.

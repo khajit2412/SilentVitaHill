@@ -733,13 +733,17 @@ elseif(VITA)
     # SDL2's Vita backend needs. Order matters: static archives, stubs last.
     target_sources(SilentHillPC PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/vita_port/vita_sdlgl_shim.c)
+    # vita-elf-create appends the import/export tables after the code segment,
+    # and the data segment is 64 KB aligned, so whether they fit depended on the
+    # code size ("segment 1 overlaps"). The vitasdk linker script reserves this.
+    target_link_options(SilentHillPC PRIVATE "-Wl,--defsym,__sce_headroom=0x2000")
     target_link_libraries(SilentHillPC PRIVATE
         vitaGL vitashark SceShaccCgExt mathneon taihen_stub
         SDL2
         SceShaccCg_stub SceKernelDmacMgr_stub SceGxm_stub SceDisplay_stub
         SceCtrl_stub SceTouch_stub SceHid_stub SceMotion_stub
         SceAudio_stub SceAudioIn_stub SceSysmodule_stub SceCommonDialog_stub
-        SceAppMgr_stub SceAppUtil_stub SceIme_stub SceRtc_stub ScePower_stub
+        SceAppMgr_stub SceAppUtil_stub SceIme_stub SceRtc_stub ScePower_stub SceSysmem_stub
         SceLibKernel_stub SceKernelThreadMgr_stub SceIofilemgr_stub
         z m pthread)
 elseif(ANDROID)
@@ -1150,10 +1154,23 @@ endif()
 # PS Vita packaging: ELF -> SELF -> VPK
 # =============================================================================
 if(VITA)
-    # Vita heap: newlib gets what vitaGL leaves (see vita_sdlgl_shim.c).
+    # Heap and vitaGL pool split: see vita_sdlgl_shim.c. ATTRIBUTE2=12 asks for
+    # extended memory mode (about 109 MB more for the app).
+    set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
     vita_create_self(eboot.bin SilentHillPC UNSAFE)
+    # Shipped assets go in as app0:assets/ and main_pc.c stages them into
+    # ux0:data/silenthill/ on first run. RetroAchievements is off on Vita, so
+    # its symbol maps and unlock sounds stay out.
+    file(GLOB_RECURSE SH_VITA_ASSETS RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/*")
+    list(FILTER SH_VITA_ASSETS EXCLUDE REGEX "^assets/gamedata/(ra|sound)/")
+    set(SH_VITA_VPK_FILES "")
+    foreach(asset ${SH_VITA_ASSETS})
+        list(APPEND SH_VITA_VPK_FILES FILE "${CMAKE_CURRENT_SOURCE_DIR}/${asset}" "${asset}")
+    endforeach()
     vita_create_vpk(SilentHillPC.vpk ${VITA_TITLEID} eboot.bin
         VERSION ${VITA_VERSION}
         NAME ${VITA_APP_NAME}
+        ${SH_VITA_VPK_FILES}
     )
 endif()

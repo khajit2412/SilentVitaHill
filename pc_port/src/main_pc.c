@@ -37,9 +37,17 @@
 #include <SDL_main.h>
 #if defined(__ANDROID__) || defined(SH_IOS)
 #include <SDL_system.h>   /* SDL_AndroidGetExternalStoragePath */
+#endif
+#if defined(__ANDROID__) || defined(SH_IOS) || defined(SH_VITA)
 #include <sys/stat.h>    /* mkdir */
 #include <errno.h>
 #include <unistd.h>       /* chdir */
+#endif
+#ifdef SH_VITA
+#include <dirent.h>
+#include <psp2/kernel/sysmem.h>
+/* The one place VitaShell and FTP users are told to put homebrew data. */
+#define SH_VITA_DATA_ROOT "ux0:data/silenthill"
 #endif
 #ifdef SH_IOS
 /* ios_paths.m — Documents is the one directory Files.app exposes, so it is
@@ -300,6 +308,41 @@ static void Pc_CopyFile(const char* src, const char* dst)
     fclose(in);
     fclose(out);
 }
+
+#ifdef SH_VITA
+/* The port's shipped assets travel inside the VPK (app0:, read-only) and the
+ * game reads them relative to the data root, so copy across whatever is
+ * missing. Never overwrites: a replaced font or language pack stays. */
+static void Vita_StageTree(const char* src, const char* dst)
+{
+    DIR*           d = opendir(src);
+    struct dirent* e;
+
+    if (d == NULL)
+        return;
+
+    mkdir(dst, 0777);
+
+    while ((e = readdir(d)) != NULL)
+    {
+        char        s[512], t[512];
+        struct stat st;
+
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+            continue;
+
+        snprintf(s, sizeof(s), "%s/%s", src, e->d_name);
+        snprintf(t, sizeof(t), "%s/%s", dst, e->d_name);
+
+        if (stat(s, &st) == 0 && S_ISDIR(st.st_mode))
+            Vita_StageTree(s, t);
+        else if (!Pc_FileExists(t))
+            Pc_CopyFile(s, t);
+    }
+
+    closedir(d);
+}
+#endif
 
 /* Write a documented starter config when none exists.
  *
@@ -932,7 +975,7 @@ static void ParseArgs(int argc, char* argv[])
     }
 }
 
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(SH_VITA)
 /* The same job as Ios_EnsureModFolders, in C because nothing here needs the
  * platform: the data root is already the working directory by this point, so
  * every relative path the loose-file loader uses resolves under it.
@@ -1054,6 +1097,20 @@ int main(int argc, char* argv[])
             return 1;
         }
     }
+#endif
+
+#ifdef SH_VITA
+    /* A Vita app starts in app0:, the read-only mounted VPK, so config.cfg,
+     * saves and the log cannot be written next to the binary. */
+    if ((mkdir(SH_VITA_DATA_ROOT, 0777) != 0 && errno != EEXIST) || chdir(SH_VITA_DATA_ROOT) != 0)
+    {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "Could not enter the game data directory (%s) - the disc image "
+                     "and config.cfg cannot be found.", SH_VITA_DATA_ROOT);
+        return 1;
+    }
+    Vita_StageTree("app0:assets/gamedata", "gamedata");
+    Vita_StageTree("app0:assets/licenses", "licenses");
 #endif
 
 #ifdef SH_IOS
@@ -1209,7 +1266,7 @@ int main(int argc, char* argv[])
                g_PcConfig.residentTextures, g_PcConfig.globalCharaPool);
     }
 
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(SH_VITA)
     /* After the config load so a failure has somewhere to be logged, and
      * well before the first file request reaches the loose-file loader. */
     Pc_EnsureModFolders();
@@ -1505,7 +1562,18 @@ int main(int argc, char* argv[])
 
     SH_LOG("PsyCross initialized. Window: %dx%d", windowWidth, windowHeight);
 
-#if defined(__ANDROID__) || defined(SH_IOS)
+#ifdef SH_VITA
+    /* The heap / vitaGL pool split (vita_sdlgl_shim.c) is tuned from this line. */
+    {
+        SceKernelFreeMemorySizeInfo mem;
+        mem.size = sizeof(mem);
+        if (sceKernelGetFreeMemorySize(&mem) == 0)
+            SH_LOG("Vita free memory after GL init: user %d KB, CDRAM %d KB, phycont %d KB",
+                   mem.size_user / 1024, mem.size_cdram / 1024, mem.size_phycont / 1024);
+    }
+#endif
+
+#if defined(__ANDROID__) || defined(SH_IOS) || defined(SH_VITA)
     /* On desktop the config IS the window size, so the five per-poly visibility
      * bounds that divide by g_PcConfig.windowWidth/Height agree with what is on
      * screen. Neither mobile target has any say in it — the surface size comes
@@ -1853,6 +1921,13 @@ int main(int argc, char* argv[])
                      "  On My iPhone > Silent Hill\n\n"
                      "Copy your own disc rip (a .bin file) into the gamedata\n"
                      "folder there, or just drop it in that folder directly.\n\n"
+                     "USA, PAL and NTSC-J discs all work, and the file can keep\n"
+                     "whatever name it has. No .cue file is needed.");
+#elif defined(SH_VITA)
+            snprintf(msg, sizeof(msg),
+                     "No Silent Hill disc image was found.\n\n"
+                     "Copy your own disc rip (a .bin file) into:\n"
+                     "  " SH_VITA_DATA_ROOT "/gamedata/\n\n"
                      "USA, PAL and NTSC-J discs all work, and the file can keep\n"
                      "whatever name it has. No .cue file is needed.");
 #else
