@@ -632,7 +632,9 @@ static void overlay_gl_init(void)
         "}\n";
     static const char* fs_src =
         "in vec2 v_uv;\n"
+        "#ifndef PSYX_FRAGCOLOR_BUILTIN\n"
         "out vec4 fragColor;\n"
+        "#endif\n"
         "uniform sampler2D u_tex;\n"
         "void main() {\n"
         "    fragColor = texture(u_tex, v_uv);\n"
@@ -791,7 +793,9 @@ static void overlay_gl_init(void)
             "void main() { v_col = a_col; gl_Position = vec4(a_pos, 0.0, 1.0); }\n";
         static const char* lfs_src =
                 "in vec3 v_col;\n"
+            "#ifndef PSYX_FRAGCOLOR_BUILTIN\n"
             "out vec4 fragColor;\n"
+            "#endif\n"
             "void main() { fragColor = vec4(v_col, 1.0); }\n";
         GLuint lvs = glCreateShader(GL_VERTEX_SHADER);
         GLuint lfs = glCreateShader(GL_FRAGMENT_SHADER);

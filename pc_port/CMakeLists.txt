@@ -476,6 +476,7 @@ add_custom_target(gen_build_info ALL
         -DOUT_FILE=${CMAKE_CURRENT_BINARY_DIR}/sh_build_info.h
         -DVER_FILE=${CMAKE_CURRENT_BINARY_DIR}/sh_version.h
         -DGIT_DIR=${DECOMP_DIR}
+        -DALWAYS_STAMP=$<BOOL:${VITA}>
         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/gen_build_info.cmake
     BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/sh_build_info.h ${CMAKE_CURRENT_BINARY_DIR}/sh_version.h
     COMMENT "Generating sh_build_info.h + sh_version.h"
@@ -732,7 +733,8 @@ elseif(VITA)
     # vitaGL + vitaShaRK (runtime GLSL compile via SceShaccCg), then the stubs
     # SDL2's Vita backend needs. Order matters: static archives, stubs last.
     target_sources(SilentHillPC PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/vita_port/vita_sdlgl_shim.c)
+        ${CMAKE_CURRENT_SOURCE_DIR}/vita_port/vita_sdlgl_shim.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/vita_port/vita_touch_buttons.c)
     # vita-elf-create appends the import/export tables after the code segment,
     # and the data segment is 64 KB aligned, so whether they fit depended on the
     # code size ("segment 1 overlaps"). The vitasdk linker script reserves this.

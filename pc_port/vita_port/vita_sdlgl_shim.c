@@ -2,7 +2,24 @@
 /* vita_sdlgl_shim.c - vitaGL implementations behind vita_sdlgl_shim.h. */
 #if defined(__vita__)
 #include "vita_sdlgl_shim.h"
+#include <stdio.h>
 #include <string.h>
+#include <vitashark.h>
+
+extern FILE* g_ShDebugLog;
+
+/* vitaGL compiles GLSL inside glLinkProgram (VGL_MODE_POSTPONED) and crashes on
+ * the NULL program a failed compile leaves, before any GL error reaches the
+ * caller. vitaShaRK's own log is the only place the reason is reported. */
+static void VitaGL_SharkLog(const char* msg, shark_log_level level, int line)
+{
+    static const char* const kLevel[] = { "info", "warning", "error" };
+    if (!g_ShDebugLog)
+        return;
+    fprintf(g_ShDebugLog, "[SHARK] %s (line %d): %s\n",
+            (unsigned)level < 3 ? kLevel[level] : "?", line, msg ? msg : "");
+    fflush(g_ShDebugLog);
+}
 
 /* newlib reserves its whole heap as one block at startup (default 128 MB);
  * vitaGL's RAM pool is then what is free minus ram_threshold below. The game's
@@ -19,8 +36,12 @@ SDL_GLContext VitaGL_CreateContext(SDL_Window* w)
     {
         /* ram_threshold: RAM vitaGL leaves free for the newlib heap.
          * Tuned later against real memory pressure (map .bss, VRAM tex). */
+        /* O3 + fast math. Precision and int shortcuts stay off: the CLUT/VRAM
+         * decode does exact index arithmetic in the fragment shader. */
+        vglSetupRuntimeShaderCompiler(SHARK_OPT_FAST, GL_TRUE, GL_FALSE, GL_FALSE);
         vglInitExtended(0, VITA_SCREEN_W, VITA_SCREEN_H,
                         16 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
+        shark_install_log_cb(VitaGL_SharkLog);
         s_vglReady = 1;
     }
     return (SDL_GLContext)(uintptr_t)1; /* any non-NULL handle */

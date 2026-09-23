@@ -46,6 +46,7 @@
 #ifdef SH_VITA
 #include <dirent.h>
 #include <psp2/kernel/sysmem.h>
+#include <psp2/power.h>
 /* The one place VitaShell and FTP users are told to put homebrew data. */
 #define SH_VITA_DATA_ROOT "ux0:data/silenthill"
 #endif
@@ -455,7 +456,13 @@ void SH_DebugLogInit(void)
              * diagnosis but it flushes every SH_DBG to disk, which halves
              * framerate under heavy per-frame logging (combat + map churn). */
             static char s_logBuf[64 * 1024];
+#ifdef SH_VITA
+            /* Vita has no crash handler to flush the buffer (pc_crash.c), so a
+             * crash left a 0-byte log. newlib honours _IOLBF. */
+            setvbuf(g_ShDebugLog, s_logBuf, _IOLBF, sizeof(s_logBuf));
+#else
             setvbuf(g_ShDebugLog, s_logBuf, _IOFBF, sizeof(s_logBuf));
+#endif
         }
     }
 }
@@ -1100,6 +1107,17 @@ int main(int argc, char* argv[])
 #endif
 
 #ifdef SH_VITA
+    /* The standard homebrew clocks; the default 333 MHz CPU left the game
+     * CPU-bound at ~10 fps. */
+    scePowerSetArmClockFrequency(444);
+    scePowerSetBusClockFrequency(222);
+    scePowerSetGpuClockFrequency(222);
+    scePowerSetGpuXbarClockFrequency(166);
+
+    /* The front-touch corners are pad buttons (vita_touch_buttons.c); SDL's
+     * touch-to-mouse would also click the menu under the finger. */
+    SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
+
     /* A Vita app starts in app0:, the read-only mounted VPK, so config.cfg,
      * saves and the log cannot be written next to the binary. */
     if ((mkdir(SH_VITA_DATA_ROOT, 0777) != 0 && errno != EEXIST) || chdir(SH_VITA_DATA_ROOT) != 0)

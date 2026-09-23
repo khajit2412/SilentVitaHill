@@ -15,11 +15,22 @@ static float PcCfg_ClampF(float v, float lo, float hi)
 
 
 s_PcConfig g_PcConfig = {
+#if defined(SH_VITA)
+    /* The screen: PsyCross takes the window size from SDL_GetWindowSize,
+     * which on Vita is whatever was asked for, not the 960x544 display. */
+    .windowWidth    = 960,
+    .windowHeight   = 544,
+#else
     .windowWidth    = 640,
     .windowHeight   = 480,
+#endif
     .fullscreen     = 0,
     .confineCursor  = 1, /* borderless/fullscreen pointer trap; alt-tab still releases it */
+#if defined(SH_VITA)
+    .disableCulling = 0, /* PSX culling: drawing everything costs the Vita draw calls */
+#else
     .disableCulling = 1,
+#endif
     .drawDistancePct = 100, /* 100 = vanilla ~61u; 200 doubles it (worth it with fog turned down) */
     .preloadChunks  = 1,
     .vsync          = 0,

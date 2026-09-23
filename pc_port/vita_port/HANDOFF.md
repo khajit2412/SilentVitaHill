@@ -50,9 +50,21 @@ Host needs llvm-nm + llvm-objcopy (static map symbol prefixing), python3.
    vita_sdlgl_shim.c; vitaGL's RAM pool is the remainder minus ram_threshold (16 MB). Both are
    guesses: tune from the "Vita free memory after GL init" log line on device.
    `-Wl,--defsym,__sce_headroom=0x2000` keeps vita-elf-create's "segment 1 overlaps" away.
-5. Controls: Vita pad/touch mapping (SDL gamecontroller works on Vita; rear touch for L2/R2).
-6. On-device: shader compile errors from vitaShaRK (needs libshacccg.suprx on the console),
-   performance (try 444 MHz via PSVshell), audio latency.
+5. Controls — partial. L2/R2 = front-touch top corners (vita_port/vita_touch_buttons.c, one
+   table; SDL touch-to-mouse is off on Vita). A proper remappable layout is still to do.
+6. On-device — boots to gameplay (2026-09-23, ~15-17 fps, CPU 444 MHz, culling on). Findings:
+   - vitaGL compiles GLSL inside glLinkProgram (VGL_MODE_POSTPONED) and crashes on a failed
+     compile; the reason only appears as [SHARK] lines (shark_install_log_cb in the shim).
+   - Its GLSL translator gives each varying a TEXCOORDn and fails past 10: four gte scalars share
+     `v_scalars` on Vita. `major` is a Cg keyword. No textureSize/textureLod (u_hiresSize +
+     texture2DLod), no gl_VertexID (fb-pack tri from a VBO), modern overlay/FMV shaders mapped to
+     ES 1.00 by PsyX_Shader_Preamble (PSYX_FRAGCOLOR_BUILTIN).
+   - Log is line-buffered on Vita (no crash handler to flush it); build stamp refreshes every build.
+   - vitaGL allocates per glBufferData: the 17 MB orphan per upload cost ~290 ms/frame. Vita now
+     uploads exactly the used vertices.
+   - SDL_GetWindowSize is the requested size, so Vita config defaults to 960x544.
+   - Now GPU-heavy (EndScene ~25 ms) with game logic ~18 ms. To try: render_scale, flashlight_mode,
+     `dream_blur = 0` (suspected cause of the stale splash in the title screen's left bar).
 
 ## Flashlight shadows on Vita
 vitaGL has no depth textures, CLAMP_TO_BORDER or glDrawBuffers, so the shadow pre-pass renders into

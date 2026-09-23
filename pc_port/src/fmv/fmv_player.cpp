@@ -242,7 +242,9 @@ static const char* s_fmvVertSrc =
 
 static const char* s_fmvFragSrc =
     "in vec2 v_uv;\n"
+    "#ifndef PSYX_FRAGCOLOR_BUILTIN\n"
     "out vec4 fragColor;\n"
+    "#endif\n"
     "uniform sampler2D s_texture;\n"
     "void main() {\n"
     "    fragColor = texture(s_texture, v_uv);\n"
