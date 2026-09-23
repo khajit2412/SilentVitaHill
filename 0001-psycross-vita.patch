@@ -1,0 +1,181 @@
+From ef61d6fd48da55780a8f438f41b6ad0bc3b7f089 Mon Sep 17 00:00:00 2001
+From: vita-port <vita@localhost>
+Date: Wed, 23 Sep 2026 07:54:00 +0000
+Subject: [PATCH] PS Vita: vitaGL/ES2 renderer target, GXM compat, RG8 VRAM
+
+---
+ CMakeLists.txt              |  6 ++++-
+ include/PsyX/PsyX_render.h  | 45 +++++++++++++++++++++++++++++++++++--
+ src/render/PsyX_backend.cpp |  3 +++
+ src/render/PsyX_render.cpp  | 14 ++++++++++++
+ 4 files changed, 65 insertions(+), 3 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index f06c985..323aa3f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -14,7 +14,7 @@ list(REMOVE_ITEM PSYCROSS_SRCS_CPP
+ # SDL2's audio sink, so the legacy AL backend leaves the build here (before
+ # add_library, or the removal would come too late to matter) and
+ # PsyX_SPUDispatch.cpp collapses onto the software one via PSYX_NO_OPENAL.
+-if(ANDROID OR IOS)
++if(ANDROID OR IOS OR VITA)
+ 	list(REMOVE_ITEM PSYCROSS_SRCS_CPP
+ 		"${CMAKE_CURRENT_SOURCE_DIR}/src/audio/PsyX_SPULegacy.cpp")
+ 	# PsyX_SPUSpatial.cpp routes the software SPU through OpenAL placement
+@@ -98,6 +98,10 @@ endif()
+ if(ANDROID)
+     target_compile_definitions(psycross_static PUBLIC PSYX_NO_OPENAL)
+     target_link_libraries(psycross_static GLESv3 EGL android log)
++elseif(VITA)
++    # Software SPU through SDL audio, same as the mobile targets; vitaGL is
++    # linked at the executable (link order matters with vitasdk stubs).
++    target_compile_definitions(psycross_static PUBLIC PSYX_NO_OPENAL)
+ elseif(IOS)
+     target_compile_definitions(psycross_static PUBLIC PSYX_NO_OPENAL)
+     # iOS reaches GLES through a framework, and has no EGL — SDL creates the
+diff --git a/include/PsyX/PsyX_render.h b/include/PsyX/PsyX_render.h
+index 47e9939..2c6bb45 100644
+--- a/include/PsyX/PsyX_render.h
++++ b/include/PsyX/PsyX_render.h
+@@ -31,6 +31,12 @@
+ #elif defined(__ANDROID__)
+ #   define RENDERER_OGLES
+ #   define OGLES_VERSION (3)
++#elif defined(__vita__)
++/* PS Vita through vitaGL: an ES 2.0-class GL over sceGxm. GLSL ES 1.00 is
++ * compiled on-device by vitaShaRK, so the legacy ES2 path is the one used. */
++#   define PSYX_VITA 1
++#   define RENDERER_OGLES
++#   define OGLES_VERSION (2)
+ #endif
+ 
+ #if defined(RENDERER_OGL) || defined(RENDERER_OGLES)
+@@ -66,6 +72,8 @@
+ #else
+ #   ifdef __EMSCRIPTEN__
+ #      include <GL/gl.h>
++#   elif defined(PSYX_VITA)
++#      include <vitaGL.h>
+ #   elif defined(PSYX_IOS)
+ /* Apple ships GLES under its own framework layout, not the Khronos paths. */
+ #      include <OpenGLES/ES3/gl.h>
+@@ -81,10 +89,41 @@
+ #endif
+ 
+ /* iOS has no EGL at all — context creation goes through EAGL, which SDL owns. */
+-#if !defined(PSYX_IOS)
++#if !defined(PSYX_IOS) && !defined(PSYX_VITA)
+ #   include <EGL/egl.h>
+ #endif
+ 
++#if defined(PSYX_VITA)
++/* vitaGL compatibility. Everything below is either a desktop-only diagnostic,
++ * an optional PC enhancement (MSAA, flashlight shadow maps), or a path that is
++ * already runtime-gated off when g_grIsGLES is set -- which it always is here.
++ * Anything that changes what the player SEES is listed as a known gap instead
++ * of being silently papered over. */
++
++/* MSAA is chosen once at vglInitExtended; s_internalSamples is 0 on GLES. */
++#   define glRenderbufferStorageMultisample(t,s,f,w,h) glRenderbufferStorage(t,f,w,h)
++
++/* KNOWN GAP: sceGxm has no constant blend colour, so glBlendColor cannot
++ * exist. PSX blend mode 3 (B + F/4) and the PC feedback-damp mode depend on
++ * it; GR_SetBlendMode takes an approximation on Vita (see PSYX_VITA there).
++ * Proper fix: scale the source colour in the fragment shader instead. */
++#   define glBlendColor(r,g,b,a)        ((void)0)
++#   define GL_CONSTANT_ALPHA            GL_SRC_ALPHA
++#   define GL_ONE_MINUS_CONSTANT_ALPHA  GL_ONE_MINUS_SRC_ALPHA
++
++/* Desktop-only branch of the shadow map (runtime !g_grIsGLES, never taken). */
++#   define GL_CLAMP_TO_BORDER           GL_CLAMP_TO_EDGE
++#   define GL_TEXTURE_BORDER_COLOR      0x1004
++#   define glTexParameterfv(t,p,v)      ((void)0)
++#   define glDrawBuffers(n,b)           ((void)0)
++
++/* Grey-frame / depth-bits diagnostics: PBO readback and attachment queries. */
++#   define GL_PIXEL_PACK_BUFFER         0x88EB
++#   define GL_PIXEL_PACK_BUFFER_BINDING 0x88ED
++#   define GL_DEPTH                     0x1801
++#   define GL_FRAMEBUFFER_ATTACHMENT_DEPTH_SIZE 0x8216
++#endif
++
+ /* Desktop-GL / ES 3.2 enums that Apple's ES 3.0 headers do not declare.
+  *
+  * The renderer decides between the desktop and the GLES spelling at RUNTIME
+@@ -196,7 +235,9 @@ extern unsigned int g_PsyX_DefaultFBO;
+ #if defined(RENDERER_OGL)
+ #	define VRAM_FORMAT            GL_RG
+ #	define VRAM_INTERNAL_FORMAT   GL_RG8
+-#elif defined(RENDERER_OGLES) && OGLES_VERSION >= 3
++#elif defined(RENDERER_OGLES) && (OGLES_VERSION >= 3 || defined(PSYX_VITA))
++/* Vita: vitaGL maps GL_RG8 to GXM's renderable U8U8, avoiding ES2's
++ * non-renderable LUMINANCE_ALPHA (the render-to-VRAM passes need it). */
+ #	define VRAM_FORMAT            GL_RG
+ #	define VRAM_INTERNAL_FORMAT   GL_RG8
+ #elif defined(RENDERER_OGLES)
+diff --git a/src/render/PsyX_backend.cpp b/src/render/PsyX_backend.cpp
+index fb37a93..972529d 100644
+--- a/src/render/PsyX_backend.cpp
++++ b/src/render/PsyX_backend.cpp
+@@ -20,6 +20,8 @@ PsyXGlCaps	g_grCaps            = { 1, 1, 1, 1, 1, 1, 1, 1 };
+ /* EGL, declared locally rather than vendoring Khronos headers: this needs nine
+  * entry points and a page of constants, all of which are ABI-frozen. Values are
+  * taken from ANGLE's own eglext_angle.h. */
++/* vitaGL.h already #defines these names for its own EGL shim. */
++#if !defined(__vita__)
+ typedef void*		EGLDisplay;
+ typedef void*		EGLSurface;
+ typedef void*		EGLContext;
+@@ -28,6 +30,7 @@ typedef void*		EGLNativeWindowType;
+ typedef int			EGLint;
+ typedef unsigned	EGLBoolean;
+ typedef unsigned	EGLenum;
++#endif
+ 
+ #define PSYX_EGL_NONE					0x3038
+ #define PSYX_EGL_FALSE					0
+diff --git a/src/render/PsyX_render.cpp b/src/render/PsyX_render.cpp
+index 3a16efa..585e63f 100644
+--- a/src/render/PsyX_render.cpp
++++ b/src/render/PsyX_render.cpp
+@@ -7129,8 +7129,10 @@ void GR_SwapWindow()
+ 		PsyX_Angle_Swap();
+ 	else
+ 	{
++#if !defined(PSYX_VITA) /* desktop diagnostic: PBO readback every frame */
+ 		GreyFrame_Present(g_internalFBO ? g_presentWidth : g_windowWidth,
+ 		                  g_internalFBO ? g_presentHeight : g_windowHeight);
++#endif
+ 		SDL_GL_SwapWindow(g_window);
+ 	}
+ #endif
+@@ -7334,6 +7336,17 @@ void GR_SetBlendMode(BlendMode blendMode)
+ 	case BM_SUBTRACT:
+ 		glBlendFunc(GL_ONE, GL_ONE);
+ 		break;
++#if defined(PSYX_VITA)
++	/* KNOWN GAP (no constant blend colour on GXM): mode 3 renders as plain
++	 * additive here, i.e. too bright; feedback damp draws without the trail.
++	 * Fix belongs in the fragment shader (scale src by 0.25 for this mode). */
++	case BM_ADD_QUATER_SOURCE:
++		glBlendFunc(GL_ONE, GL_ONE);
++		break;
++	case BM_CONSTANT_ALPHA:
++		glBlendFunc(GL_ONE, GL_ZERO);
++		break;
++#else
+ 	case BM_ADD_QUATER_SOURCE:
+ 		glBlendFunc(GL_CONSTANT_ALPHA, GL_ONE);
+ 		break;
+@@ -7341,6 +7354,7 @@ void GR_SetBlendMode(BlendMode blendMode)
+ 		glBlendColor(0.25f, 0.25f, 0.25f, g_PsxFeedbackDampBlend);
+ 		glBlendFunc(GL_CONSTANT_ALPHA, GL_ONE_MINUS_CONSTANT_ALPHA);
+ 		break;
++#endif
+ 	default:
+ 		break;
+ 	}
+-- 
+2.43.0
+
