@@ -1,0 +1,152 @@
+#include "game.h"
+#include "inline_no_dmpsx.h"
+
+#include <psyq/libpad.h>
+#include <psyq/strings.h>
+
+#include "bodyprog/bodyprog.h"
+#include "bodyprog/events/bgm.h"
+#include "bodyprog/item_screens.h"
+#include "bodyprog/math/math.h"
+#include "bodyprog/screen/screen_draw.h"
+#include "bodyprog/sound/sound_system.h"
+#include "main/fsqueue.h"
+
+// ========================================
+// BGM RELATED
+// ========================================
+
+void Bgm_PlayNewTrack(s32 bgmIdx) // 0x80087EA8
+{
+    if (!Bgm_ActiveBgmTrackCheck(bgmIdx))
+    {
+        return;
+    }
+
+    Bgm_TrackSet(bgmIdx);
+}
+
+void Bgm_CrossfadeToTrack(s32 bgmIdx) // 0x80087EDC
+{
+    if (Sd_AudioStreamingCheck() || !Fs_QueueChunksLoad())
+    {
+        return;
+    }
+
+    switch (g_SysWork.sysStateSteps[1])
+    {
+        case 0:
+            if (!Bgm_ActiveBgmTrackCheck(bgmIdx))
+            {
+                SysWork_StateStepSet(1, 3);
+                break;
+            }
+
+            g_SysWork.bgmStatusFlags |= BgmStatusFlag_RequestMute;
+            SysWork_StateStepIncrement(1);
+            break;
+
+        case 1:
+            g_SysWork.bgmStatusFlags |= BgmStatusFlag_RequestMute;
+            SD_Call(23);
+
+            SysWork_StateStepIncrement(1);
+            break;
+
+        case 2:
+            g_SysWork.bgmStatusFlags |= BgmStatusFlag_RequestMute;
+
+            if (!func_80045BC8())
+            {
+                Bgm_TrackSet(bgmIdx);
+
+                SysWork_StateStepIncrement(1);
+            }
+            break;
+
+        case 3:
+            SysWork_StateStepIncrement(0); // Resets `field_10` to 0.
+            break;
+    }
+}
+
+void Bgm_CrossfadeToSilence(void) // 0x80088028
+{
+    Bgm_CrossfadeToTrack(BgmTrackIdx_None);
+}
+
+void func_80088048(void) // 0x80088048
+{
+    if (Sd_AudioStreamingCheck())
+    {
+        return;
+    }
+
+    switch (g_SysWork.sysStateSteps[1])
+    {
+        case 0:
+            Bgm_AllLayersMute();
+            SD_Call(18);
+            SysWork_StateStepIncrement(1);
+            break;
+
+        case 1:
+            if (!func_80045BC8())
+            {
+                SysWork_StateStepIncrement(0); // Resets `field_10` to 0.
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
+void func_800880F0(bool arg0) // 0x800880F0
+{
+    if (Sd_AudioStreamingCheck())
+    {
+        return;
+    }
+
+    switch (g_SysWork.sysStateSteps[1])
+    {
+        case 0:
+            Bgm_AllLayersMute();
+
+            if (!arg0)
+            {
+#ifndef SH_PC_PORT
+                /* PSX SD_Call(22) is a blanket SfxStop. On PC the SPU→OpenAL
+                 * path stops in-progress samples instantly (PSX ADPCM has a
+                 * natural decay tail that makes the cutoff inaudible), which
+                 * kills the death scream / pickup voice mid-playback. Same
+                 * regression class as the map0_s00 death-zone fix in
+                 * map0_s00_2.c:1381. BGM mute (above) still runs. */
+                SD_Call(22);
+#else
+                /* ...but a loop never ends on its own, so with the blanket stop
+                 * gone an ambient bed (the bridge wind) kept playing across a
+                 * quickload. Stop only the looping voices: they are precisely
+                 * the ones that cannot finish by themselves, and the only ones
+                 * with no decay tail for the hard stop to truncate. */
+                extern void Pc_SpuStopLoopingVoices(void);
+                Pc_SpuStopLoopingVoices();
+#endif
+            }
+            else
+            {
+                SD_Call(23);
+            }
+
+            SysWork_StateStepIncrement(1);
+            break;
+
+        case 1:
+            if (!func_80045BC8())
+            {
+                SysWork_StateStepIncrement(0); // Resets `field_10` to 0.
+            }
+            break;
+    }
+}

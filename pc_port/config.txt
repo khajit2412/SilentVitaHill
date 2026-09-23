@@ -1,0 +1,83 @@
+# Silent Hill PC Port Configuration
+# Lines starting with # are comments
+
+# Rendering resolution
+width = 640
+height = 480
+
+# Fullscreen mode (0 = windowed, 1 = fullscreen)
+fullscreen = 0
+
+# VSync (0 = off/uncapped, 1 = on, -1 = adaptive vsync)
+vsync = 0
+
+# Target refresh rate in hz (0 = display default). Only applies in fullscreen mode.
+# Set to your monitor's refresh rate (e.g. 60, 144, 240) combined with vsync = 1.
+refresh_rate = 0
+
+# Gameplay FPS cap (0 = uncapped, 30 = PSX-accurate, 60 = smooth).
+# The PSX ran at 30fps (2 vblanks/frame). Set to 0 for uncapped or 60 for 60fps.
+# Toggle at runtime with numpad 0. Game physics use real elapsed time so any cap is safe.
+fps_cap = 30
+
+# Disable aggressive PSX view culling (0 = original culling, 1 = render all objects)
+# The original game aggressively culls objects based on view angle and position.
+# Disabling culling prevents objects like fences and trees from popping in/out.
+disable_culling = 1
+
+# Preload all IPD chunks at map init (0 = PSX streaming, 1 = load all at once)
+# The PSX streams 2-4 chunks from CD as the player moves. On PC, we can load
+# all chunks for the entire map at once, eliminating streaming delays and
+# ensuring all geometry is always available.
+preload_chunks = 1
+
+# Map overlay to load on New Game.
+# With DLL map overlays built (-DSH_BUILD_MAP_DLLS=ON), 31 maps have
+# full event/AI/NPC code. Without DLLs, only map0_s00 is fully compiled;
+# other maps load geometry (IPD chunks, fog, ambient) but use stub headers.
+#
+# Available maps:
+#   map0_s00  Old Silent Hill - intro sequence
+#   map0_s01  Old Silent Hill - cafe
+#   map0_s02  Old Silent Hill - bonus unlockable areas
+#   map1_s00  School - 1F, courtyard, basement
+#   map1_s01  School - 2F
+#   map1_s02  School Otherworld - 1F and courtyard
+#   map1_s03  School Otherworld - 2F and roof
+#   map1_s04  Unused
+#   map1_s05  School - boss fight (Split Head)
+#   map1_s06  School - 1F and basement after the boss
+#   map2_s00  Old Silent Hill - streets
+#   map2_s01  Church
+#   map2_s02  Central Silent Hill - streets
+#   map2_s03  Unused
+#   map2_s04  Police station (Central Silent Hill)
+#   map3_s00  Hospital - until Kaufmann meeting
+#   map3_s01  Hospital - 1F and basement after Kaufmann
+#   map3_s02  Hospital - antique shop cutscene
+#   map3_s03  Hospital Otherworld - 3F and 2F
+#   map3_s04  Hospital Otherworld - 1F
+#   map3_s05  Hospital Otherworld - basement
+#   map3_s06  Hospital - 1F after Otherworld
+#   map4_s00  Unused
+#   map4_s01  Green Lion Antiques (normal + Otherworld)
+#   map4_s02  Central Silent Hill Otherworld - streets
+#   map4_s03  Mall and boss fight
+#   map4_s04  Hospital - 1F (Lisa cutscene)
+#   map4_s05  Central SH Otherworld - Floatstinger boss
+#   map4_s06  Unused
+#   map5_s00  Sewers - lower and upper levels
+#   map5_s01  Resort Area
+#   map5_s02  Annie's Bar and Indian Runner (Resort Area)
+#   map5_s03  Norman's Motel (Resort Area)
+#   map6_s00  Resort Area Otherworld
+#   map6_s01  Boat at Lakeside Pier
+#   map6_s02  Lakeside Pier and Lighthouse
+#   map6_s03  Sewer to Lakeside Amusement Park
+#   map6_s04  Amusement Park - Cybil boss, Alessa kidnapping
+#   map6_s05  Unused
+#   map7_s00  Nowhere - hospital 1F, Lisa cutscene
+#   map7_s01  Nowhere
+#   map7_s02  Nowhere - Alessa vs. Dahlia cutscene
+#   map7_s03  Nowhere - final boss
+map = map0_s00

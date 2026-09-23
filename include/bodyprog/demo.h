@@ -1,0 +1,145 @@
+#ifndef _BODYPROG_DEMO_H
+#define _BODYPROG_DEMO_H
+
+// ======
+// ENUMS
+// ======
+
+/** @brief Demo states. */
+typedef enum _DemoState
+{
+    DemoState_Exit = -1,
+    DemoState_None = 0,
+    DemoState_Step = 1
+} e_DemoState;
+
+// ========
+// STRUCTS
+// ========
+
+/** @brief Initial demo game state data, stored inside `MISC/DEMO****.DAT` files. */
+typedef struct _DemoWork
+{
+    /* 0x0   */ s_OptionsConfig config;
+    /* 0x38  */ u8              unk_38[200];
+    /* 0x100 */ s_Savegame      savegame;
+    /* 0x37C */ u8              unk_37C[1148];
+    /* 0x7F8 */ u32             frameCount;
+    /* 0x7FC */ u16             randSeed;
+} s_DemoWork;
+STATIC_ASSERT_SIZEOF(s_DemoWork, 2048);
+
+/** @brief Per-frame demo data, stored inside `MISC/PLAY****.DAT` files. */
+typedef struct _DemoFrameData
+{
+    /* 0x0 */ s_AnalogController analogController;
+    /* 0x8 */ s8                 gameStateExpected; /** Expected value of `g_GameWork.gameState` before `analogController` is processed.
+                                                     * If it doesn't match,`Demo_Update` displays `STEP ERROR` and stops reading the demo.
+                                                     */
+    /* 0x9 */ u8                 videoPresentInterval;
+    /* 0xA */ s8                 unk_A[2];
+    /* 0xC */ u32                randSeed;
+} s_DemoFrameData;
+STATIC_ASSERT_SIZEOF(s_DemoFrameData, 16);
+
+/** @brief Associates a demo number/ID with `PLAY****.DAT/DEMO****.DAT` file IDs. */
+typedef struct _DemoFileInfo
+{
+    /* 0x0 */ s16 demoFileId;           /** `MISC/DEMO****.DAT`, initial gamestate for the demo and user config override. */
+    /* 0x2 */ s16 playFileId;           /** `MISC/PLAY****.DAT`, data of button presses/randseed for each frame. */
+    /* 0x4 */ s32 (*canPlayDemo)(void); /** Optional funcptr, returns whether this demo is eligible to be played (unused in retail demos). */
+} s_DemoFileInfo;
+STATIC_ASSERT_SIZEOF(s_DemoFileInfo, 8);
+
+// ========
+// GLOBALS
+// ========
+
+#ifdef SH_PC_PORT
+#include "psx_memory.h"
+#define DEMO_WORK() ((s_DemoWork*)PSX_ADDR(0x000FDE00))
+#else
+#define DEMO_WORK() ((s_DemoWork*)0x800FDE00)
+#endif
+
+/** `Demo_FrameCount` */
+extern s32 g_Demo_FrameCount;
+
+// TODO: Make local. Used in `Demo_Update`.
+extern char D_8002B2D8[]; // "STEP ERROR:[H:"
+extern char D_8002B2E8[]; // "]/[M:"
+extern char D_8002B2F0[]; // "]"
+
+extern s_DemoFrameData* g_Demo_PlayFileBufferPtr;
+extern s32              g_Demo_DemoId;
+extern u16              g_Demo_RandSeed;
+extern s32              g_Demo_DemoFileIdx;
+extern s32              g_Demo_PlayFileIdx;
+extern s32              __pad_bss_800C4848[2];
+extern s_OptionsConfig  g_Demo_OptionsConfigBackup;
+extern u32              g_Demo_PrevRandSeed;
+extern u32              g_Demo_RandSeedBackup;
+extern s_DemoFrameData* g_Demo_CurFrameData; // Current packet/frame in buffer.
+extern s32              g_Demo_DemoStep;
+extern s32              g_Demo_VideoPresentInterval;
+extern bool             g_Demo_IsLoadingChunks;
+
+// ==========
+// FUNCTIONS
+// ==========
+
+bool Demo_SequenceAdvance(s32 incrementAmount);
+
+void Demo_DemoDataRead(void);
+
+void Demo_PlayDataRead(void);
+
+s32 Demo_PlayFileBufferSetup(void);
+
+void Demo_DemoFileSavegameUpdate(void);
+
+void Demo_GameGlobalsUpdate(void);
+
+void Demo_GameGlobalsRestore(void);
+
+void Demo_GameRandSeedUpdate(void);
+
+void Demo_GameRandSeedRestore(void);
+
+void Demo_Start(void);
+
+void Demo_Stop(void);
+
+bool func_8008F434(s32 arg0);
+
+/** @brief Gets the active demo state.
+ *
+ * @param gameState Active game state (`e_GameState`).
+ * @return Active demo state `(e_DemoState`).
+ */
+s32 Demo_StateGet(s32 gameState);
+
+void Demo_ExitDemo(void);
+
+void func_8008F518(void);
+
+bool func_8008F520(void);
+
+/** Generates the backup random demo seed and stores it in `Demo_RandSeedBackup`. */
+void Demo_DemoRandSeedBackup(void);
+
+void Demo_DemoRandSeedRestore(void);
+
+void Demo_DemoRandSeedAdvance(void);
+
+bool Demo_Update(void);
+
+bool Demo_ControllerDataUpdate(void);
+
+bool Demo_PresentIntervalUpdate(void);
+
+bool Demo_GameRandSeedSet(void);
+
+bool func_8008F914(s32 posX, s32 posZ);
+
+#endif

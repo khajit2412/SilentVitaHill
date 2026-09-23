@@ -1,0 +1,162 @@
+#include "game.h"
+
+#include "bodyprog/bodyprog.h"
+#include "bodyprog/sound/sound_system.h"
+#include "bodyprog/screen/screen_draw.h"
+
+void Settings_ScreenAndVolUpdate(void) // 0x800333CC
+{
+    Screen_XyPositionSet(g_GameWork.config.screenPositionX, g_GameWork.config.screenPositionY);
+#ifdef SH_PC_PORT
+    /* PC: internal mixing is always Stereo -- the speaker layout (mono/quad/
+     * 5.1/7.1) is the launcher's audio_output, and collapsing to PSX Mono here
+     * would defeat the surround pipeline. The vanilla Monaural option is gone. */
+    SD_Call(AudioMode_Stereo);
+#else
+    SD_Call((g_GameWork.config.soundType != 0) ? AudioMode_Mono : AudioMode_Stereo);
+#endif
+    Sd_SetVolume(OPT_SOUND_VOLUME_MAX, g_GameWork.config.volumeBgm, g_GameWork.config.volumeSe);
+}
+
+void Settings_RestoreDefaults(void) // 0x8003342C
+{
+    g_GameWork.config.extraWeaponCtrl = 1;
+    g_GameWork.config.brightness      = 3;
+
+    Settings_RestoreControlDefaults(0);
+
+    g_GameWork.config.vibrationEnabled = OPT_VIBRATION_ENABLED;
+    g_GameWork.config.volumeBgm        = OPT_SOUND_VOLUME_MAX;
+    g_GameWork.config.volumeSe         = OPT_SOUND_VOLUME_MAX;
+
+    Settings_ScreenAndVolUpdate();
+
+    g_GameWork.config.extraBloodColor = 0;
+#ifdef SH_PC_PORT
+    {
+        extern unsigned char g_PcTrustedBloodColor;
+        g_PcTrustedBloodColor = 0; /* mirror for Map_EffectTexturesLoad re-apply (#41) */
+    }
+#endif
+}
+
+void Settings_RestoreControlDefaults(s32 configIdx) // 0x80033480
+{
+    u32  i;
+    u16* ptr;
+
+#if VERSION_IS(USA)
+    static const s_ControllerConfig DEFAULT_CONTROLLER_CONFIGS[3] = {
+        {
+            .enter      = ControllerFlag_Start | ControllerFlag_Cross,
+            .cancel     = ControllerFlag_Triangle | ControllerFlag_Circle | ControllerFlag_Square,
+            .skip       = ControllerFlag_Start,
+            .action     = ControllerFlag_Cross,
+            .aim        = ControllerFlag_R2,
+            .light      = ControllerFlag_Circle,
+            .run        = ControllerFlag_Square,
+            .view       = ControllerFlag_L2,
+            .stepLeft  = ControllerFlag_L1,
+            .stepRight = ControllerFlag_R1,
+            .pause     = ControllerFlag_Start,
+            .item      = ControllerFlag_Select,
+            .map       = ControllerFlag_Triangle,
+            .option    = ControllerFlag_None
+        },
+        {
+            .enter      = ControllerFlag_Start | ControllerFlag_Cross,
+            .cancel     = ControllerFlag_Triangle | ControllerFlag_Circle | ControllerFlag_Square,
+            .skip       = ControllerFlag_Start,
+            .action     = ControllerFlag_Cross,
+            .aim        = ControllerFlag_R1,
+            .light      = ControllerFlag_Circle,
+            .run        = ControllerFlag_Square,
+            .view       = ControllerFlag_L1,
+            .stepLeft  = ControllerFlag_L2,
+            .stepRight = ControllerFlag_R2,
+            .pause     = ControllerFlag_Start,
+            .item      = ControllerFlag_Select,
+            .map       = ControllerFlag_Triangle,
+            .option    = ControllerFlag_None
+        },
+        {
+            .enter      = ControllerFlag_Start | ControllerFlag_Cross,
+            .cancel     = ControllerFlag_Triangle | ControllerFlag_Circle | ControllerFlag_Square,
+            .skip       = ControllerFlag_Start,
+            .action     = ControllerFlag_Cross,
+            .aim        = ControllerFlag_R2,
+            .light      = ControllerFlag_Circle,
+            .run        = ControllerFlag_Square,
+            .view       = ControllerFlag_L2,
+            .stepLeft  = ControllerFlag_L1,
+            .stepRight = ControllerFlag_R1,
+            .pause     = ControllerFlag_Start,
+            .item      = ControllerFlag_Triangle,
+            .map       = ControllerFlag_Select,
+            .option    = ControllerFlag_None
+        }
+    };
+#elif VERSION_REGION_IS(NTSCJ)
+    static const s_ControllerConfig DEFAULT_CONTROLLER_CONFIGS[3] = {
+        {
+            .enter      = ControllerFlag_Start | ControllerFlag_Circle,
+            .cancel     = ControllerFlag_Cross,
+            .skip       = ControllerFlag_Start,
+            .action     = ControllerFlag_Circle,
+            .aim        = ControllerFlag_R2,
+            .light      = ControllerFlag_Square,
+            .run        = ControllerFlag_Cross,
+            .view       = ControllerFlag_L2,
+            .stepLeft  = ControllerFlag_L1,
+            .stepRight = ControllerFlag_R1,
+            .pause     = ControllerFlag_Start,
+            .item      = ControllerFlag_Select,
+            .map       = ControllerFlag_Triangle,
+            .option    = ControllerFlag_None
+        },
+        {
+            .enter      = ControllerFlag_Square | ControllerFlag_Circle | ControllerFlag_Start,
+            .cancel     = ControllerFlag_Cross,
+            .skip       = ControllerFlag_Start,
+            .action     = ControllerFlag_Square | ControllerFlag_Circle,
+            .aim        = ControllerFlag_R1,
+            .light      = ControllerFlag_Triangle,
+            .run        = ControllerFlag_Cross,
+            .view       = ControllerFlag_L1,
+            .stepLeft  = ControllerFlag_L2,
+            .stepRight = ControllerFlag_R2,
+            .pause     = ControllerFlag_None,
+            .item      = ControllerFlag_Start,
+            .map       = ControllerFlag_Select,
+            .option    = ControllerFlag_None
+        },
+        {
+            .enter      = ControllerFlag_Start | ControllerFlag_Circle,
+            .cancel     = ControllerFlag_Cross,
+            .skip       = ControllerFlag_Start,
+            .action     = ControllerFlag_Circle,
+            .aim        = ControllerFlag_R2,
+            .light      = ControllerFlag_Square,
+            .run        = ControllerFlag_Cross,
+            .view       = ControllerFlag_L2,
+            .stepLeft  = ControllerFlag_L1,
+            .stepRight = ControllerFlag_R1,
+            .pause     = ControllerFlag_Start,
+            .item      = ControllerFlag_Triangle,
+            .map       = ControllerFlag_Select,
+            .option    = ControllerFlag_None
+        }
+    };
+#endif
+
+    for (i = 0, ptr = &g_GameWorkPtr->config.controllerConfig; i < INPUT_ACTION_COUNT; i++, ptr++)
+    {
+        *ptr = (&DEFAULT_CONTROLLER_CONFIGS[configIdx].enter)[i];
+    }
+}
+
+const s32 pad_rodata_80025170[2] = {};
+
+void nullsub_800334C8(void) {} // 0x800334C8
+
+void func_800334D0(void) {} // 0x800334D0

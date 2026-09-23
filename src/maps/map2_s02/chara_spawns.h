@@ -1,0 +1,24 @@
+    // Chara_AirScreamer
+    {
+      { Q12(4.0f), Chara_None, Q8_ANGLE(180.0f), 9, GameDifficulty_Hard, Q12(96.0f) },
+      { Q12(-256.0f), Chara_None, Q8_ANGLE(180.0f), 10, GameDifficulty_Hard, Q12(-256.0f) },
+      { Q12(-117.0f), Chara_None, Q8_ANGLE(270.0f), 6, GameDifficulty_Easy, Q12(3.0f) },
+      { Q12(-123.0f), Chara_None, Q8_ANGLE(270.0f), 6, GameDifficulty_Hard, Q12(-3.0f) },
+      { Q12(33.0f), Chara_None, Q8_ANGLE(0.0f), 7, GameDifficulty_Easy, Q12(-13.0f) },
+      { Q12(-120.0f), Chara_None, Q8_ANGLE(0.0f), 7, GameDifficulty_Easy, Q12(-105.0f) },
+      { Q12(0.0f), Chara_None, Q8_ANGLE(0.0f), 6, GameDifficulty_Easy, Q12(-36.0f) },
+      { Q12(-11.5f), Chara_None, Q8_ANGLE(180.0f), 6, GameDifficulty_Easy, Q12(-110.0f) },
+      { Q12(-12.5f), Chara_None, Q8_ANGLE(180.0f), 6, GameDifficulty_Easy, Q12(-110.9f) },
+    },
+    // Chara_Groaner
+    {
+      { Q12(-104.0f), Chara_Romper, Q8_ANGLE(180.0f), 3, GameDifficulty_Easy, Q12(9.0f) },
+      { Q12(-95.0f), Chara_Romper, Q8_ANGLE(0.0f), 3, GameDifficulty_Easy, Q12(8.0f) },
+      { Q12(-112.0f), Chara_Romper, Q8_ANGLE(270.0f), 3, GameDifficulty_Normal, Q12(7.0f) },
+      { Q12(-14.0f), Chara_Romper, Q8_ANGLE(180.0f), 3, GameDifficulty_Easy, Q12(-71.0f) },
+      { Q12(-9.0f), Chara_Romper, Q8_ANGLE(135.0f), 3, GameDifficulty_Easy, Q12(-66.0f) },
+      { Q12(-60.0f), Chara_Groaner, Q8_ANGLE(0.0f), 3, GameDifficulty_Easy, Q12(-10.0f) },
+      { Q12(-60.0f), Chara_Groaner, Q8_ANGLE(180.0f), 3, GameDifficulty_Easy, Q12(-70.0f) },
+      { Q12(147.0f), Chara_Groaner, Q8_ANGLE(315.0f), 3, GameDifficulty_Easy, Q12(-20.0f) },
+      { Q12(142.0f), Chara_Groaner, Q8_ANGLE(45.0f), 3, GameDifficulty_Easy, Q12(-19.0f) },
+    },

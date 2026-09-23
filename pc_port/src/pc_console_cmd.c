@@ -1,0 +1,1867 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Interactive console command execution (see dbg_overlay.c for the input
+ * mode itself). Commands arrive as a single uppercase line ("GIVE SHOTGUN");
+ * output goes back through DbgOverlay_PushLine.
+ *
+ * Commands:
+ *   HELP                 - command list with descriptions
+ *   DEBUG [page]         - debug & cheat key reference (2 pages)
+ *   QUIT                 - exit the game
+ *   MAP                  - list all map names
+ *   MAP <name>           - new-game warp to a map (mirrors title.c auto-start)
+ *   GIVE <thing>         - HANDGUN / RIFLE / SHOTGUN / AMMO / HEALTH
+ *   NOCLIP               - toggle walking through walls (player only)
+ *   GOD [0|1]            - toggle/set Harry damage immunity
+ *   FMV                  - list all FMV names (numbered)
+ *   FMV <name|number>    - play an FMV (fades out, plays, fades back in)
+ *   FMV INTROn / ENDn    - alias for the nth intro (C*) / ending (Z*) movie
+ *   LOGA / LOGB          - stamp an incremental A#/B# position mark
+ *                          (Harry + camera pos/angles) into SilentHill.log;
+ *                          LOGA RESET / LOGB RESET restarts the counter
+ */
+#include "game.h"
+#include "pc_mod_registry.h"
+#include "bodyprog/bodyprog.h"
+#include "bodyprog/game_boot/game_boot.h"
+#include "bodyprog/game_boot/fs_chara_anim.h" /* g_CharaModelAnimsData (spawn anim-ready gate) */
+#include "bodyprog/events/player_pos_update.h"
+#include "bodyprog/chara/chara.h"
+#include "bodyprog/collision/collision.h"
+#include "bodyprog/math/math.h"
+#include "bodyprog/items.h"
+#include "bodyprog/savegame.h"
+#include "bodyprog/item_screens.h" /* GameEndingFlag_Ufo (HyperBlaster give-unlock) */
+#include "bodyprog/screen/screen_fade.h"
+#include "bodyprog/sound/sound_system.h" /* AMBSFX sweep: s_VabInfo / Sd_PlaySfx */
+#include "bodyprog/sound/sfx_id_enum.h"
+#include "sh_log.h"
+#include "map_registry.h"
+#include "dbg_overlay.h"
+#include "pc_config.h"
+
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+/* fmv_player.cpp */
+extern int         FMV_Play(int file_idx, int max_frames);
+extern int         FMV_GetCount(void);
+extern const char* FMV_GetName(int tableIdx);
+extern int         FMV_GetFileIdx(int tableIdx);
+
+/* Same toggle as debug key 0: player_control.c skips Collision_WallDetect and
+ * substitutes the floor surface directly, so Harry keeps walking on ground. */
+extern int g_DebugNoWallCollision;
+
+static void cprintf(const char* fmt, ...)
+{
+    /* The overlay wraps anything wider than the window, so this only needs to be
+     * big enough to hold a full wide-window line before wrapping. */
+    char line[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    DbgOverlay_PushLine(line);
+}
+
+static int inventory_has(s32 itemId)
+{
+    int i;
+    for (i = 0; i < INV_ITEM_COUNT_MAX; i++) {
+        if (g_SavegamePtr->items[i].id_0 == itemId)
+            return 1;
+    }
+    return 0;
+}
+
+void Pc_ConsoleApplyPendingFlags(void); /* public: re-apply console-set flags after a savegame reset (cmd_map + New Game boot) */
+
+static void cmd_map(const char* arg)
+{
+    int i, count = MapRegistry_Count();
+
+    if (!arg[0]) {
+        char line[256];
+        int  used = 0;
+        line[0] = '\0';
+        for (i = 0; i < count; i++) {
+            const char* nm = MapRegistry_GetName(i);
+            if (!nm) continue;
+            if (used + (int)strlen(nm) + 1 >= 200) {
+                DbgOverlay_PushLine(line);
+                line[0] = '\0';
+                used    = 0;
+            }
+            used += snprintf(line + used, sizeof(line) - used, "%s%s", used ? " " : "", nm);
+        }
+        if (used) DbgOverlay_PushLine(line);
+        return;
+    }
+
+    {
+        /* Registry names are lowercase; console input is uppercase. */
+        char lower[32];
+        int  mapId;
+        for (i = 0; arg[i] && i < (int)sizeof(lower) - 1; i++)
+            lower[i] = (char)tolower((unsigned char)arg[i]);
+        lower[i] = '\0';
+
+        mapId = MapRegistry_FindByName(lower);
+        if (mapId < 0) {
+            cprintf("Unknown map: %s", lower);
+            return;
+        }
+
+        /* Don't warp mid-session — just set the map config value so the next New Game
+         * starts on this map (same effect as the 4/5 debug keys). */
+        strncpy(g_PcConfig.mapName, lower, sizeof(g_PcConfig.mapName) - 1);
+        g_PcConfig.mapName[sizeof(g_PcConfig.mapName) - 1] = '\0';
+        {
+            const char* desc = MapRegistry_GetDescription((e_MapIdx)mapId);
+            if (desc && desc[0])
+                cprintf("map config set to %s - %s (loads on New Game)", lower, desc);
+            else
+                cprintf("map config set to %s (loads on New Game)", lower);
+        }
+    }
+}
+
+/* name -> inventory item. Guns additionally grant ammo (see cmd_give). Ammo and
+ * recovery items stack (always add `count`); unique items are only added when not
+ * already held, to avoid inventory duplicates. */
+typedef struct { const char* name; u8 id; u8 count; } s_GiveItem;
+static const s_GiveItem GIVE_ITEMS[] = {
+    /* melee weapons */
+    { "KNIFE",        InvItemId_KitchenKnife,   1 },
+    { "PIPE",         InvItemId_SteelPipe,      1 },
+    { "ROCKDRILL",    InvItemId_RockDrill,      1 },
+    { "HAMMER",       InvItemId_Hammer,         1 },
+    { "CHAINSAW",     InvItemId_Chainsaw,       1 },
+    { "KATANA",       InvItemId_Katana,         1 },
+    { "AXE",          InvItemId_Axe,            1 },
+    /* firearms (ammo added in cmd_give) */
+    { "HANDGUN",      InvItemId_Handgun,        1 },
+    { "RIFLE",        InvItemId_HuntingRifle,   1 },
+    { "SHOTGUN",      InvItemId_Shotgun,        1 },
+    { "HYPERBLASTER", InvItemId_HyperBlaster,   1 },
+    /* ammo */
+    { "HANDGUNAMMO",  InvItemId_HandgunBullets, 30 },
+    { "RIFLEAMMO",    InvItemId_RifleShells,    30 },
+    { "SHOTGUNAMMO",  InvItemId_ShotgunShells,  30 },
+    { "GASOLINE",     InvItemId_GasolineTank,    5 }, /* chainsaw / rock drill fuel */
+    { "GAS",          InvItemId_GasolineTank,    5 },
+    /* recovery */
+    { "HEALTHDRINK",  InvItemId_HealthDrink,    1 },
+    { "FIRSTAID",     InvItemId_FirstAidKit,    1 },
+    { "AMPOULE",      InvItemId_Ampoule,        1 },
+    /* story / ending items */
+    { "FLAUROS",         InvItemId_Flauros,          1 },
+    { "CHANNELINGSTONE", InvItemId_ChannelingStone,  1 },
+    { "PLASTICBOTTLE",   InvItemId_PlasticBottle,    1 },
+    { "AGLAOPHOTIS",     InvItemId_UnknownLiquid,    1 },
+    { "KAUFMANNKEY",     InvItemId_KaufmannKey,      1 },
+    { "RINGOFCONTRACT",  InvItemId_RingOfContract,   1 },
+    { "STONEOFTIME",     InvItemId_StoneOfTime,      1 },
+    { "AMULET",          InvItemId_AmuletOfSolomon,  1 },
+    { "CRESTOFMERCURY",  InvItemId_CrestOfMercury,   1 },
+    { "ANKH",            InvItemId_Ankh,             1 },
+    { "DAGGER",          InvItemId_DaggerOfMelchior, 1 },
+    { "DISK",            InvItemId_DiskOfOuroboros,  1 },
+    { "GOLDMEDALLION",   InvItemId_GoldMedallion,    1 },
+    { "SILVERMEDALLION", InvItemId_SilverMedallion,  1 },
+    { "LIGHTER",         InvItemId_Lighter,          1 },
+    { "VIDEOTAPE",       InvItemId_VideoTape,        1 },
+    { "CAMERA",          InvItemId_Camera,           1 },
+    { "CHEMICAL",        InvItemId_Chemical,         1 },
+    { "BLOODPACK",       InvItemId_BloodPack,        1 },
+};
+#define N_GIVE_ITEMS ((int)(sizeof(GIVE_ITEMS) / sizeof(GIVE_ITEMS[0])))
+
+static void give_item(u8 id, u8 count)
+{
+    int stackable = (id >= InvItemId_HealthDrink && id <= InvItemId_Ampoule) ||
+                    (id >= InvItemId_HandgunBullets);
+    if (stackable || !inventory_has(id))
+        Inventory_AddSpecialItem(id, count ? count : 1);
+}
+
+static void cmd_give(const char* arg)
+{
+    int k;
+
+    if (arg[0] == '\0') {
+        cprintf("give <item> - see 'help give' for the list");
+        return;
+    }
+    if (strcmp(arg, "HEALTH") == 0) {
+        g_SysWork.playerWork.player.health = Q12(100.0f);
+        cprintf("Health restored");
+        return;
+    }
+    if (strcmp(arg, "AMMO") == 0) {
+        give_item(InvItemId_HandgunBullets, 30);
+        give_item(InvItemId_RifleShells, 30);
+        give_item(InvItemId_ShotgunShells, 30);
+        cprintf("Given 30 of each ammo");
+        return;
+    }
+    if (strcmp(arg, "ALLWEAPONS") == 0) {
+        for (k = 0; k < N_GIVE_ITEMS; k++)
+            if (GIVE_ITEMS[k].id >= InvItemId_KitchenKnife &&
+                GIVE_ITEMS[k].id <= InvItemId_HyperBlaster)
+                give_item(GIVE_ITEMS[k].id, 1);
+        give_item(InvItemId_HandgunBullets, 60);
+        give_item(InvItemId_RifleShells, 60);
+        give_item(InvItemId_ShotgunShells, 60);
+        give_item(InvItemId_GasolineTank, 5); /* chainsaw / drill fuel */
+        g_SavegamePtr->clearGameEndings |= GameEndingFlag_Ufo; /* unlock HyperBlaster fire gate */
+        cprintf("Given all weapons + ammo + gas");
+        return;
+    }
+    for (k = 0; k < N_GIVE_ITEMS; k++) {
+        if (strcmp(arg, GIVE_ITEMS[k].name) == 0) {
+            give_item(GIVE_ITEMS[k].id, GIVE_ITEMS[k].count);
+            if (GIVE_ITEMS[k].id == InvItemId_Handgun)           give_item(InvItemId_HandgunBullets, 15);
+            else if (GIVE_ITEMS[k].id == InvItemId_HuntingRifle) give_item(InvItemId_RifleShells, 30);
+            else if (GIVE_ITEMS[k].id == InvItemId_Shotgun)      give_item(InvItemId_ShotgunShells, 30);
+            else if (GIVE_ITEMS[k].id == InvItemId_HyperBlaster) {
+                give_item(InvItemId_HandgunBullets, 30);
+                /* The HyperBlaster's aim/fire is hard-gated by
+                 * Inventory_HyperBlasterFunctionalTest: without the UFO-ending
+                 * unlock (or a Konami gun controller on port 2) it force-disables
+                 * aiming, so a console-given blaster can't fire at all. Grant the
+                 * unlock so it actually works. */
+                g_SavegamePtr->clearGameEndings |= GameEndingFlag_Ufo;
+            }
+            cprintf("Given %s", GIVE_ITEMS[k].name);
+            return;
+        }
+    }
+    cprintf("unknown item '%s' - see 'help give'", arg);
+}
+
+/* Ending-relevant event flags. The exact ending matrix isn't fully labelled in
+ * the decomp; these are the confirmed/strong candidates (Cybil saved = 445 from
+ * monster_cybil.c, Kaufmann key = 394, plus the 395-403 cluster read by the
+ * hospital/ending code). The ending is chosen when the FINAL BOSS is beaten, so
+ * set these BEFORE that fight, not during the ending cutscene. setflag accepts
+ * any flag number so nothing is locked out for experimentation. */
+/* `map` warps via GameBoot_SavegameInitialize, which bzero's the whole savegame
+ * (all event flags). To let "setending / setflag in the menu, then map to the
+ * ending" work, every flag the user sets is also remembered here and re-applied
+ * by cmd_map AFTER the savegame reset (and after MapLoad), just before gameplay
+ * starts — so the ending cutscene reads the intended flags. */
+#define MAX_PENDING_FLAGS 24
+static struct { int flag; int val; } s_pendingFlags[MAX_PENDING_FLAGS];
+static int s_pendingFlagCount = 0;
+
+static void pending_flag_set(int flag, int val)
+{
+    int i;
+    for (i = 0; i < s_pendingFlagCount; i++)
+        if (s_pendingFlags[i].flag == flag) { s_pendingFlags[i].val = val; return; }
+    if (s_pendingFlagCount < MAX_PENDING_FLAGS) {
+        s_pendingFlags[s_pendingFlagCount].flag = flag;
+        s_pendingFlags[s_pendingFlagCount].val  = val;
+        s_pendingFlagCount++;
+    }
+}
+
+void Pc_ConsoleApplyPendingFlags(void)
+{
+    int i;
+    for (i = 0; i < s_pendingFlagCount; i++) {
+        if (s_pendingFlags[i].val) Savegame_EventFlagSet(s_pendingFlags[i].flag);
+        else                       Savegame_EventFlagClear(s_pendingFlags[i].flag);
+    }
+}
+
+/* The SH1 ending is selected from two binary flags read by the map7_s03 ending
+ * code: 449 = Cybil saved (Aglaophotis on her in the map6_s04 boss) and 391 =
+ * "good path" (the map5_s03 Kaufmann subplot completed). The four combinations
+ * are Bad / Bad+ / Good / Good+ — see cmd_setending. The others below are the
+ * supporting/in-fight flags shown for reference. */
+#define ENDFLAG_CYBIL 449
+#define ENDFLAG_GOOD  391
+typedef struct { const char* label; int flag; } s_EndFlag;
+static const s_EndFlag ENDING_FLAGS[] = {
+    { "Cybil saved",   ENDFLAG_CYBIL },
+    { "Good path",     ENDFLAG_GOOD  },
+    { "Cybil(infight)", 445 },
+    { "Kaufmann key",  394 },
+    { "flag 397", 397 }, { "flag 398", 398 },
+};
+
+static void cmd_getflags(void)
+{
+    int k;
+    cprintf("Ending = Cybil(449) + Good(391). set BEFORE ending:");
+    for (k = 0; k < (int)(sizeof(ENDING_FLAGS) / sizeof(ENDING_FLAGS[0])); k++)
+        cprintf(" %3d %-13s = %d", ENDING_FLAGS[k].flag, ENDING_FLAGS[k].label,
+                Savegame_EventFlagGet(ENDING_FLAGS[k].flag) ? 1 : 0);
+    cprintf("setending bad|bad+|good|good+  | setflag <n> 0|1");
+}
+
+/* Set the two ending flags for a target ending. Must be done BEFORE the ending
+ * cutscene triggers (the ending reads them at the final boss / cutscene start;
+ * changing them mid-cutscene is too late). Does NOT advance story progress —
+ * you still have to reach the ending. */
+/* Forget the flags recorded by setflag/setending so they stop riding along on
+ * the next console `map` warp. Does NOT revert flags already written to the live
+ * savegame — load a save for that. */
+static void cmd_clearflags(void)
+{
+    s_pendingFlagCount = 0;
+    cprintf("cleared pending flags (live flags unchanged; load a save to reset)");
+}
+
+static void cmd_setending(const char* arg)
+{
+    int cybil, good;
+    if      (strcmp(arg, "BAD") == 0)                                 { cybil = 0; good = 0; }
+    else if (strcmp(arg, "BAD+") == 0  || strcmp(arg, "BADPLUS") == 0)  { cybil = 1; good = 0; }
+    else if (strcmp(arg, "GOOD") == 0)                                { cybil = 0; good = 1; }
+    else if (strcmp(arg, "GOOD+") == 0 || strcmp(arg, "GOODPLUS") == 0) { cybil = 1; good = 1; }
+    else { cprintf("usage: setending bad | bad+ | good | good+"); return; }
+
+    if (cybil) Savegame_EventFlagSet(ENDFLAG_CYBIL); else Savegame_EventFlagClear(ENDFLAG_CYBIL);
+    if (good)  Savegame_EventFlagSet(ENDFLAG_GOOD);  else Savegame_EventFlagClear(ENDFLAG_GOOD);
+    pending_flag_set(ENDFLAG_CYBIL, cybil);
+    pending_flag_set(ENDFLAG_GOOD,  good);
+    cprintf("ending '%s': Cybil(449)=%d Good(391)=%d", arg, cybil, good);
+    cprintf("persists across 'map' warp; set before the ending");
+}
+
+static void cmd_setflag(const char* arg)
+{
+    int n = -1, v = -1;
+    if (sscanf(arg, "%d %d", &n, &v) != 2 || n < 0 || n >= 52 * 32 ||
+        (v != 0 && v != 1)) {
+        cprintf("usage: setflag <number> 0|1");
+        return;
+    }
+    if (v) Savegame_EventFlagSet(n);
+    else   Savegame_EventFlagClear(n);
+    pending_flag_set(n, v);
+    cprintf("flag %d = %d", n, v);
+}
+
+/* Area maps are savegame BITS in paperMapFlags, not inventory items, so they
+ * cannot go through cmd_give's Inventory_AddSpecialItem path — hence a command
+ * of their own. Indices and names mirror e_PaperMapIdx (game.h). */
+static const char* const PAPER_MAP_NAMES[] = {
+    "OtherPlaces",    "OldTown",        "FogCentralTown", "AltCentralTown",
+    "ResortTown",     "FogSchoolBF",    "FogSchool1F",    "FogSchool2F",
+    "FogSchoolRF",    "AltSchoolBF",    "AltSchool1F",    "AltSchool2F",
+    "AltSchoolRF",    "FogSewer1F",     "FogSewer2F",     "AltSewer",
+    "FogHospitalBF",  "FogHospital1F",  "FogHospital2F",  "FogHospital3F",
+    "AltHospitalBF",  "AltHospital1F",  "AltHospital2F",  "AltHospital3F",
+};
+#define PAPER_MAP_COUNT ((int)(sizeof(PAPER_MAP_NAMES) / sizeof(PAPER_MAP_NAMES[0])))
+
+static void paper_map_grant(int idx)
+{
+    ((u32*)&g_SavegamePtr->paperMapFlags)[idx / 32] |= (u32)1 << (idx % 32);
+}
+
+/* The dispatcher hands `arg` over already upper-cased, so a name match has to
+ * fold the mixed-case table rather than strcmp it. */
+static int paper_map_name_eq(const char* upperArg, const char* name)
+{
+    int i;
+    for (i = 0; upperArg[i] != '\0' && name[i] != '\0'; i++) {
+        char c = name[i];
+        if (c >= 'a' && c <= 'z')
+            c = (char)(c - 'a' + 'A');
+        if (upperArg[i] != c)
+            return 0;
+    }
+    return upperArg[i] == '\0' && name[i] == '\0';
+}
+
+static void cmd_givemap(const char* arg)
+{
+    int idx, n;
+
+    if (strcmp(arg, "LIST") == 0) {
+        char line[256];
+        int  used = 0;
+        line[0] = '\0';
+        for (idx = 0; idx < PAPER_MAP_COUNT; idx++) {
+            if (used + (int)strlen(PAPER_MAP_NAMES[idx]) + 8 >= 200) {
+                DbgOverlay_PushLine(line);
+                line[0] = '\0';
+                used    = 0;
+            }
+            used += snprintf(line + used, sizeof(line) - used, "%s%d:%s%s",
+                             used ? " " : "", idx, PAPER_MAP_NAMES[idx],
+                             HAS_MAP(idx) ? "*" : "");
+        }
+        if (used) DbgOverlay_PushLine(line);
+        cprintf("givemap list - * = already held");
+        return;
+    }
+
+    if (strcmp(arg, "ALL") == 0) {
+        int added = 0;
+        for (idx = 0; idx < PAPER_MAP_COUNT; idx++) {
+            if (HAS_MAP(idx))
+                continue;
+            paper_map_grant(idx);
+            added++;
+        }
+        cprintf("gave %d map(s) - all areas", added);
+        return;
+    }
+
+    if (arg[0] == '\0') {
+        /* Default: whatever area Harry is standing in. Every map point carries a
+         * paperMapIdx, and unmapped areas all tag OtherPlaces, which has no map
+         * of its own to hand over. */
+        idx = (int)g_SavegamePtr->paperMapIdx;
+        if (idx == PaperMapIdx_OtherPlaces) {
+            cprintf("this area has no map of its own (Other Places)");
+            return;
+        }
+        if (idx < 0 || idx >= PAPER_MAP_COUNT) {
+            cprintf("area has no valid map (paperMapIdx %d)", idx);
+            return;
+        }
+    } else if (sscanf(arg, "%d", &n) == 1) {
+        if (n < 0 || n >= PAPER_MAP_COUNT) {
+            cprintf("map index out of range (0-%d)", PAPER_MAP_COUNT - 1);
+            return;
+        }
+        idx = n;
+    } else {
+        for (idx = 0; idx < PAPER_MAP_COUNT; idx++) {
+            if (paper_map_name_eq(arg, PAPER_MAP_NAMES[idx]))
+                break;
+        }
+        if (idx >= PAPER_MAP_COUNT) {
+            cprintf("unknown map '%s' - try 'givemap list'", arg);
+            return;
+        }
+    }
+
+    if (HAS_MAP(idx)) {
+        cprintf("already have %s (%d)", PAPER_MAP_NAMES[idx], idx);
+        return;
+    }
+    paper_map_grant(idx);
+    cprintf("gave map: %s (%d)", PAPER_MAP_NAMES[idx], idx);
+}
+
+/* help / debug reference pages. The in-game console viewport shows
+ * MAX_CONSOLE (20) lines and each line buffer is LINE_LEN (64) chars, so
+ * pages stay under ~16 lines of <=63 chars and longer lists split into
+ * numbered pages ("debug 2"). */
+static const char* const HELP_LINES[] = {
+    "Commands:",
+    " help [n]       command list",
+    " debug [n]      debug & cheat key reference",
+    " quit           exit the game",
+    " map            list all map names",
+    " map <name>     new-game warp to a map",
+    " give <item>    see 'help give' for the full list",
+    " givemap        area map for where Harry is standing",
+    " givemap list|all|<n|name>   list / grant all / grant one",
+    " getflags       show ending flags",
+    " setending <e>  bad | bad+ | good | good+",
+    " setflag <n> 0|1  set any event flag",
+    " kill           kill Harry (death animation)",
+    " killall        kill all nearby enemies",
+    " spawn list     list monsters loaded in this map",
+    " spawn <name>   spawn a monster in front of Harry",
+    " noclip         walk through walls (floor stays on)",
+    " god [0|1]      toggle/set damage immunity for Harry",
+    " invaspect 0|1  inventory item proportions: PSX | square",
+    " invscale <pct> inventory item vertical scale (def 125)",
+    " invcary <n>    carousel item Y offset (+down)",
+    " inveqy <n>     equipped item Y offset (+down)",
+    " invdim <pct>   off-center carousel dim strength",
+    " fmv            list movies (numbered)",
+    " fmv <name|#>   play a movie (also intro1-2, end1-5)",
+    " kf [n]         keyframe inspector: set/show frame (K key)",
+    " playas [name]  play as another character (bare = list)",
+    " minimapnomap [0|1]  minimap before the map is found: 0 hide, 1 empty panel",
+    " loga / logb    log Harry+camera pos/angles to SilentHill.log",
+    "Quick Save: F6   Quick Load: F8 (work outside console)",
+};
+
+static const char* const HELP_GIVE_PAGE1[] = {
+    "give <item> (page 1/2) - weapons, ammo, recovery:",
+    " knife pipe rockdrill hammer chainsaw katana axe",
+    " handgun rifle shotgun hyperblaster (guns add ammo)",
+    " ammo  handgunammo rifleammo shotgunammo",
+    " gasoline (chainsaw/drill fuel)",
+    " allweapons    all melee + guns + ammo + gas",
+    " health healthdrink firstaid ampoule",
+    "type 'help give 2' for story / ending items",
+};
+
+static const char* const HELP_GIVE_PAGE2[] = {
+    "give <item> (page 2/2) - story / ending items:",
+    " flauros channelingstone plasticbottle aglaophotis",
+    " kaufmannkey ringofcontract stoneoftime amulet",
+    " crestofmercury ankh dagger disk",
+    " goldmedallion silvermedallion lighter videotape",
+    " camera chemical bloodpack",
+};
+
+/* Up-shift (psx-units) for bottom-anchored message boxes. Was 35 to lift subtitles
+ * out of the 3D-world vertical-FOV bottom crop, but the UI now draws at full vertical
+ * ortho (g_PsxUIOrthoPass) so no compensation is needed — default 0. Console MSGSHIFT
+ * (read by text_draw.c) stays for fine-tuning. */
+int g_PsxMsgVShift = 0;
+
+/* Cutscene letterbox bar Y (centered coords): bars span +/-Outer (screen edge) to
+ * +/-Inner. Tunable via console BARY while the interlaced-buffer mapping is dialed in.
+ * Read by cutscene_border.c. */
+int g_PsxBarOuter = 112;
+int g_PsxBarInner = 96;
+
+static const char* const DEBUG_PAGE1[] = {
+    "Debug keys (page 1/2) - cheats & tools:",
+    " Esc     warm reset to the title screen",
+    " 0       noclip toggle (walk through walls)",
+    " 4 / 5   map config prev / next (loads on New Game)",
+    " 6       kill nearby enemies",
+    " 7       invincibility toggle",
+    " 8       +15 handgun bullets",
+    " 9       no-target toggle (enemies ignore Harry)",
+    " -       give Hunting Rifle + 30 shells (not in K view)",
+    " =       give Shotgun + 30 shells (not in K view)",
+    " '       collision visualizer panel",
+    " K       keyframe inspector; , . scrub (hold = faster)",
+    " - / =   in K view: cycle play-as character",
+    " [ / ]   drop A/B position markers into the log",
+    " ~       console open/close (game pauses; PgUp/PgDn scroll)",
+    "type DEBUG 2 for the camera keys",
+};
+
+static const char* const DEBUG_PAGE2[] = {
+    "Debug keys (page 2/2) - camera:",
+    " Num *        free debug camera on/off",
+    " Num 2        third-person chase cam (mouse look)",
+    " Num 8/5/4/6  fly forward / back / strafe left / right",
+    " Num 7 / 9    turn left / right",
+    " Num + / -    tilt up / down",
+    " PgUp / PgDn  move up / down",
+    " Num /        print camera coordinates to the log",
+    " (with debug cam OFF the same numpad keys nudge the",
+    "  normal game camera - live camera tuning aid)",
+    " Num 3        reset cam nudge / in-game rescue teleport",
+    " Num 0        raw cam mode (zero all nudges)",
+    " Num .        log Harry position (+fog toggle in cam)",
+};
+
+static void push_lines(const char* const* lines, int count)
+{
+    int i;
+    for (i = 0; i < count; i++)
+        DbgOverlay_PushLine(lines[i]);
+}
+
+/* FMV start is deferred so the screen can fade to black first, like the
+ * game's own movie transitions: cmd_fmv arms the pending index and starts a
+ * fade-out; Pc_ConsoleFmvUpdate (called every frame from MainLoop) blocks in
+ * FMV_Play once the fade lands, then fades back in. */
+static int s_pendingFmvFileIdx = -1;
+
+void Pc_ConsoleFmvUpdate(void)
+{
+    int fileIdx;
+
+    if (s_pendingFmvFileIdx < 0 || !ScreenFade_IsFinished())
+        return;
+
+    fileIdx             = s_pendingFmvFileIdx;
+    s_pendingFmvFileIdx = -1;
+    FMV_Play(fileIdx, 0);
+    ScreenFade_Start(true, true, false);
+}
+
+static void cmd_fmv(const char* arg)
+{
+    int i, count = FMV_GetCount();
+    int pick = -1;
+
+    if (!arg[0]) {
+        char line[64];
+        int  used = 0;
+        line[0] = '\0';
+        for (i = 0; i < count; i++) {
+            char entry[24];
+            snprintf(entry, sizeof(entry), "%d=%s", i + 1, FMV_GetName(i));
+            if (used + (int)strlen(entry) + 1 >= 60) {
+                DbgOverlay_PushLine(line);
+                line[0] = '\0';
+                used    = 0;
+            }
+            used += snprintf(line + used, sizeof(line) - used, "%s%s", used ? " " : "", entry);
+        }
+        if (used) DbgOverlay_PushLine(line);
+        DbgOverlay_PushLine("also: fmv <number>, intro1-2, end1-5");
+        return;
+    }
+
+    /* Plain number: 1-based position in the list above. */
+    {
+        int digits = 1;
+        for (i = 0; arg[i]; i++) {
+            if (!isdigit((unsigned char)arg[i])) {
+                digits = 0;
+                break;
+            }
+        }
+        if (digits)
+            pick = atoi(arg) - 1;
+    }
+
+    /* INTROn / ENDn aliases: nth movie whose filename starts with C (the
+     * intros) or Z (the endings block), in disc order. */
+    if (pick < 0 && (strncmp(arg, "INTRO", 5) == 0 || strncmp(arg, "END", 3) == 0)) {
+        char lead = (arg[0] == 'I') ? 'C' : 'Z';
+        int  n    = atoi(arg + ((lead == 'C') ? 5 : 3));
+        int  seen = 0;
+
+        for (i = 0; i < count && pick < 0; i++) {
+            if (FMV_GetName(i)[0] == lead && ++seen == n)
+                pick = i;
+        }
+        if (pick < 0) {
+            cprintf("No such %s", (lead == 'C') ? "intro" : "ending");
+            return;
+        }
+    }
+
+    /* Full filename. */
+    if (pick < 0) {
+        for (i = 0; i < count; i++) {
+            if (strcmp(arg, FMV_GetName(i)) == 0) {
+                pick = i;
+                break;
+            }
+        }
+    }
+
+    if (pick < 0 || pick >= count) {
+        cprintf("Unknown FMV: %s (try 'fmv' to list)", arg);
+        return;
+    }
+
+    cprintf("Playing %s...", FMV_GetName(pick));
+    s_pendingFmvFileIdx = FMV_GetFileIdx(pick);
+    ScreenFade_Start(true, false, false);
+}
+
+/* line is the uppercase console input ('_' typed via the - key). */
+/* Debug monster spawner. A map only keeps 3 enemy types resident at once (its
+ * charaGroupIds); Chara_Spawn assumes the model+anim+update-func are already
+ * loaded and does NOT load them, so spawning an off-map type gives an entity
+ * the radio pings but the draw path skips (registeredCharaModels[id]==NULL) —
+ * the classic "radio plays, monster invisible" bug. So SPAWN only offers types
+ * actually loaded for the current map (SPAWN LIST), guaranteeing visibility.
+ *
+ * `state` is the initial model.stateStep (== s_SpawnInfo.flags the room spawner
+ * uses): the enemy's spawn/active AI entry state. Defaults per category below;
+ * overridable via `SPAWN <name> <state>` when a monster wakes in a weird pose. */
+typedef struct { const char* name; u8 charaId; u8 state; } s_SpawnCharaEntry;
+static const s_SpawnCharaEntry SPAWN_CHARAS[] = {
+    { "AIRSCREAMER",     Chara_AirScreamer,     12 },
+    { "NIGHTFLUTTER",    Chara_NightFlutter,    12 },
+    { "GROANER",         Chara_Groaner,          3 }, /* Groaner_Init: st=3->Control_1 (active); any other st = stuck lying down (never re-checks) */
+    { "WORMHEAD",        Chara_Wormhead,         5 },
+    { "LARVALSTALKER",   Chara_LarvalStalker,    5 },
+    { "STALKER",         Chara_Stalker,          3 }, /* Stalker_Update: st=3->Control_4 (active); st=5->Control_1 = unposed/invisible */
+    { "GREYCHILD",       Chara_GreyChild,        3 }, /* also Stalker_Update (see STALKER) */
+    { "MUMBLER",         Chara_Mumbler,         17 },
+    { "HANGEDSCRATCHER", Chara_HangedScratcher,  7 },
+    { "CREEPER",         Chara_Creeper,          5 },
+    { "ROMPER",          Chara_Romper,           3 }, /* Romper_Init activates unconditionally; 3 matches native map spawn data */
+    { "CHICKEN",         Chara_Chicken,          5 },
+    { "SPLITHEAD",       Chara_SplitHead,        5 },
+    { "FLOATSTINGER",    Chara_Floatstinger,    12 },
+    { "PUPPETNURSE",     Chara_PuppetNurse,     17 },
+    { "BETANURSE",       Chara_DummyNurse,      17 }, /* TEST/PRS2.ILM beta nurse via the pool's DummyNurse retarget; runs the real PuppetNurse AI. In hospital maps the native DUMMY stub wins the slot (invisible) — test elsewhere. */
+    { "PUPPETDOCTOR",    Chara_PuppetDoctor,    17 },
+    { "DUMMYDOCTOR",     Chara_DummyDoctor,     17 },
+    { "TWINFEELER",      Chara_Twinfeeler,       3 },
+    { "BLOODSUCKER",     Chara_Bloodsucker,     17 },
+    { "INCUBUS",         Chara_Incubus,          3 },
+    { "UNKNOWN23",       Chara_Unknown23,        3 },
+    { "MONSTERCYBIL",    Chara_MonsterCybil,     3 },
+    { "LOCKERDEADBODY",  Chara_LockerDeadBody,   3 },
+    { "CYBIL",           Chara_Cybil,            3 },
+    { "ENDINGCYBIL",     Chara_EndingCybil,      3 },
+    { "CHERYL",          Chara_Cheryl,           1 },
+    { "CAT",             Chara_Cat,              3 },
+    { "DAHLIA",          Chara_Dahlia,           3 },
+    { "ENDINGDAHLIA",    Chara_EndingDahlia,     3 },
+    { "LISA",            Chara_Lisa,             3 },
+    { "BLOODYLISA",      Chara_BloodyLisa,       3 },
+    { "ALESSA",          Chara_Alessa,           3 },
+    { "GHOSTCHILDALESSA",Chara_GhostChildAlessa, 3 },
+    { "INCUBATOR",       Chara_Incubator,        3 },
+    { "BLOODYINCUBATOR", Chara_BloodyIncubator,  3 },
+    { "KAUFMANN",        Chara_Kaufmann,         3 },
+    { "ENDINGKAUFMANN",  Chara_EndingKaufmann,   3 },
+    { "FLAUROS",         Chara_Flauros,          3 },
+    { "LITTLEINCUBUS",   Chara_LittleIncubus,    3 },
+    { "GHOSTDOCTOR",     Chara_GhostDoctor,      3 },
+    { "PARASITE",        Chara_Parasite,         3 },
+};
+
+static const char* spawn_chara_name(s32 charaId)
+{
+    int i;
+    for (i = 0; i < (int)(sizeof(SPAWN_CHARAS) / sizeof(SPAWN_CHARAS[0])); i++) {
+        if (SPAWN_CHARAS[i].charaId == charaId)
+            return SPAWN_CHARAS[i].name;
+    }
+    return NULL;
+}
+
+/* A model is drawable only once its file finished streaming; bones need the
+ * anim slot. Both gate visibility, so require both before offering a spawn. */
+static int spawn_chara_model_ready(s32 charaId)
+{
+    s_CharaModel* m = g_WorldGfxWork.registeredCharaModels[charaId];
+    return m != NULL && m->isLoaded;
+}
+static int spawn_chara_anim_ready(s32 charaId)
+{
+    /* idx alone can be stale (vanilla never invalidates it; a failed pool
+     * load resets it, but belt-and-braces: the slot must actually hold a
+     * live ANM header or the spawn renders unposed/invisible). */
+    s8 idx = g_CharaAnimDataIdxs[charaId];
+    return idx != (s8)NO_VALUE &&
+           g_CharaModelAnimsData[idx].activeAnmHdr != NULL;
+}
+
+static void cmd_spawn(const char* arg);
+
+/* Quick options > Debug "Spawn" row: browse SPAWN_CHARAS and fire cmd_spawn
+ * for the pick, so the row and the console command are one code path. */
+int Pc_SpawnList_Count(void)
+{
+    return (int)(sizeof(SPAWN_CHARAS) / sizeof(SPAWN_CHARAS[0]));
+}
+
+const char* Pc_SpawnList_Name(int i)
+{
+    if (i < 0 || i >= Pc_SpawnList_Count()) return "";
+    return SPAWN_CHARAS[i].name;
+}
+
+int Pc_SpawnList_Ready(int i)
+{
+    if (i < 0 || i >= Pc_SpawnList_Count()) return 0;
+    return spawn_chara_model_ready(SPAWN_CHARAS[i].charaId) &&
+           spawn_chara_anim_ready(SPAWN_CHARAS[i].charaId);
+}
+
+void Pc_SpawnList_Spawn(int i)
+{
+    if (i < 0 || i >= Pc_SpawnList_Count()) return;
+    cmd_spawn(SPAWN_CHARAS[i].name);
+}
+
+static void cmd_spawn(const char* arg)
+{
+    char nm[32];
+    int  k;
+    const char* rest;
+    int  stateOverride;
+    int  i;
+    const s_SpawnCharaEntry* pick;
+    s_SubCharacter* hr;
+    s32  yaw, sn, cs, npcIdx;
+    q19_12 dist, posX, posZ;
+    s_CollisionSurface surf;
+    u32  state;
+
+    /* Global chara pool: repair mid-map evictions (cutscene Chara_Load with
+     * CHARA_FORCE_FREE_ALL NULLs native registrations) before gating. */
+    {
+        extern void Pc_CharaPool_Refresh(void);
+        Pc_CharaPool_Refresh();
+    }
+
+    if (arg[0] == '\0' || strcmp(arg, "LIST") == 0) {
+        extern int Pc_CharaPool_IsPoolModel(int charaId);
+        int any = 0;
+        cprintf("spawnable here:");
+        for (i = 0; i < (int)(sizeof(SPAWN_CHARAS) / sizeof(SPAWN_CHARAS[0])); i++) {
+            s32 id = SPAWN_CHARAS[i].charaId;
+            if (!spawn_chara_model_ready(id))
+                continue;
+            {
+                int anim = spawn_chara_anim_ready(id);
+                int ai   = g_MapOverlayHdr.charaUpdateFuncs[id] != NULL;
+                cprintf(" %s%s%s%s", SPAWN_CHARAS[i].name,
+                        Pc_CharaPool_IsPoolModel(id) ? " [pool]" : "",
+                        anim ? "" : " [no-anim]", ai ? "" : " [no-ai]");
+                any = 1;
+            }
+        }
+        if (!any)
+            cprintf(" (none)");
+        return;
+    }
+
+    /* Split "<NAME> [state]". */
+    for (k = 0; arg[k] && arg[k] != ' ' && k < (int)sizeof(nm) - 1; k++)
+        nm[k] = arg[k];
+    nm[k] = '\0';
+    rest = arg[k] ? arg + k + 1 : arg + k;
+    while (*rest == ' ') rest++;
+    stateOverride = (*rest) ? atoi(rest) : -1;
+
+    pick = NULL;
+    for (i = 0; i < (int)(sizeof(SPAWN_CHARAS) / sizeof(SPAWN_CHARAS[0])); i++) {
+        if (strcmp(nm, SPAWN_CHARAS[i].name) == 0) {
+            pick = &SPAWN_CHARAS[i];
+            break;
+        }
+    }
+    if (pick == NULL) {
+        cprintf("unknown: %s (try 'spawn list')", nm);
+        return;
+    }
+    if (!spawn_chara_model_ready(pick->charaId) || !spawn_chara_anim_ready(pick->charaId)) {
+        cprintf("%s not loaded in this map", nm);
+        cprintf("use 'spawn list' to see loaded types");
+        return;
+    }
+
+    /* Find a free NPC slot (mirrors Chara_Spawn's slot fill, minus the
+     * concurrent cap / dedup so a debug spawn always fires when a slot exists). */
+    npcIdx = -1;
+    for (i = 0; i < NPC_COUNT_MAX; i++) {
+        if (g_SysWork.npcs[i].model.charaId == Chara_None) {
+            npcIdx = i;
+            break;
+        }
+    }
+    if (npcIdx < 0) {
+        cprintf("no free NPC slot (max %d) - killall first", NPC_COUNT_MAX);
+        return;
+    }
+
+    hr   = &g_SysWork.playerWork.player;
+    yaw  = hr->rotation.vy;
+    sn   = Math_Sin(yaw);
+    cs   = Math_Cos(yaw);
+    dist = Q12(4.0f); /* a few units in front of Harry (clear of his own radius) */
+    posX = hr->position.vx + (s32)(((s64)dist * sn) >> 12);
+    posZ = hr->position.vz + (s32)(((s64)dist * cs) >> 12);
+
+    state = (stateOverride >= 0) ? (u32)stateOverride : pick->state;
+
+    memset(&g_SysWork.npcs[npcIdx], 0, sizeof(s_SubCharacter));
+    g_SysWork.npcs[npcIdx].model.charaId      = pick->charaId;
+    g_SysWork.npcs[npcIdx].model.controlState = 0;
+    g_SysWork.npcs[npcIdx].model.stateStep    = (u8)state;
+    g_SysWork.npcs[npcIdx].field_40           = (s8)npcIdx;
+    g_SysWork.npcs[npcIdx].position.vx        = posX;
+    g_SysWork.npcs[npcIdx].position.vz        = posZ;
+    Collision_SurfaceGet(&surf, posX, posZ);
+    g_SysWork.npcs[npcIdx].position.vy        = surf.groundHeight;
+    g_SysWork.npcs[npcIdx].rotation.vy        = (s16)((yaw + 0x800) & 0xFFF); /* face Harry (180deg) */
+    g_SysWork.npcs[npcIdx].model.anim.flags  |= AnimFlag_Visible;
+    SET_FLAG(&g_SysWork.npcFlags, npcIdx);
+    /* Match Game_NpcRoomInitSpawn: mark the spawn slot in field_228C too, so the
+     * despawn/dedup bookkeeping (CLEAR_FLAG on npc->field_40) stays consistent. */
+    SET_FLAG(g_SysWork.field_228C, npcIdx);
+    /* No savegame identity: killing this spawn must not dead-flag the native
+     * spawn row that happens to share field_40's value (npc_main.c guard). */
+    {
+        extern unsigned char g_PcNpcDebugSpawned[];
+        g_PcNpcDebugSpawned[npcIdx] = 1;
+    }
+
+    if (g_MapOverlayHdr.charaUpdateFuncs[pick->charaId] != NULL)
+        cprintf("spawned %s (state %d)", nm, (int)state);
+    else
+        cprintf("spawned %s (state %d, no AI in this map)", nm, (int)state);
+    /* Full diagnostic so an "invisible spawn" report is decisive: player vs spawn
+     * world pos (incl. collision groundHeight), and the three visibility gates
+     * (model streamed, anim slot, per-map AI update fn). */
+    SH_DBG("[SPAWN] %s id=%d npc[%d] st=%u player=(%d,%d,%d) spawn=(%d,%d,%d) model=%d animIdx=%d updFn=%d",
+           nm, (int)pick->charaId, (int)npcIdx, state,
+           FP_FROM(hr->position.vx, Q12_SHIFT), FP_FROM(hr->position.vy, Q12_SHIFT), FP_FROM(hr->position.vz, Q12_SHIFT),
+           FP_FROM(posX, Q12_SHIFT), FP_FROM(surf.groundHeight, Q12_SHIFT), FP_FROM(posZ, Q12_SHIFT),
+           spawn_chara_model_ready(pick->charaId), (int)g_CharaAnimDataIdxs[pick->charaId],
+           g_MapOverlayHdr.charaUpdateFuncs[pick->charaId] != NULL);
+}
+
+/* TEMP diagnostic (sewer-drip hunt): play samples from the currently-resident
+ * ambient VAB (SPU slot 2). Must be run while IN the map whose ambient bank you
+ * want to hear (e.g. the sewers). Slot-2 SFX ids each map to a (program, note) of
+ * that bank via g_Vab_InfoTable, so sweeping them plays every ambient sample.
+ *   AMBSFX          - play the NEXT slot-2 ambient id, print its id/prog/tone/note
+ *   AMBSFX <n>      - play a specific id (n>=1280) or index (n<1280 -> +1280)
+ *   AMBSFX PROG <p> - restart the sweep at the first id of program p
+ *   AMBSFX STOP     - stop all SFX (silence a stuck loop) */
+static void cmd_ambsfx(const char* arg)
+{
+    extern s_VabInfo g_Vab_InfoTable[];
+    extern u8        Sd_PlaySfx(u16 sfxId, s8 balance, u8 vol);
+    extern void      SD_Call(u32 cmd);
+
+    static s16 s_id       = -1;
+    static s16 s_sweepProg = -1; /* sticky program filter: PROG <n> sets it, bare AMBSFX keeps it */
+    s16        id;
+    u16        vp;
+
+    if (strcmp(arg, "STOP") == 0) {
+        SD_Call(16); /* Sd_AllSfxStop + Sd_LastSfxStop */
+        cprintf("ambsfx: stopped");
+        return;
+    }
+
+    /* ALL <p> — key EVERY slot-2 id of program p at once, so a multi-pitch drip
+     * bank plays layered (what the sewer ambience actually sounds like). */
+    if (strncmp(arg, "ALL", 3) == 0) {
+        int p = atoi(arg + 3);
+        int n = 0;
+        for (id = (s16)Sfx_Base; id < (s16)(Sfx_Base + 420); id++) {
+            vp = g_Vab_InfoTable[id - Sfx_Base].vab_progIdx_2;
+            if ((vp >> 8) == 2 && (int)(vp & 0xFF) == p) {
+                Sd_PlaySfx((u16)id, 0, 0);
+                n++;
+            }
+        }
+        cprintf("ambsfx: keyed %d ids of prog %d", n, p);
+        SH_DBG("[DRIPSWEEP] ALL prog=%d keyed=%d", p, n);
+        return;
+    }
+
+    if (arg[0] >= '0' && arg[0] <= '9') {
+        id = (s16)atoi(arg);
+        if (id < Sfx_Base) id = (s16)(id + Sfx_Base);
+    } else {
+        /* PROG <n> arms a STICKY program filter so a following bare AMBSFX walks
+         * only program n, one id at a time (PROG -1 clears it back to all progs).
+         * Previously the filter was local and lost on the next call, so stepping
+         * wandered straight out of the program you asked for. */
+        if (strncmp(arg, "PROG", 4) == 0) { s_sweepProg = (s16)atoi(arg + 4); s_id = -1; }
+        id = (s_id < 0) ? (s16)Sfx_Base : (s16)(s_id + 1);
+        while (id < (s16)(Sfx_Base + 420)) {
+            vp = g_Vab_InfoTable[id - Sfx_Base].vab_progIdx_2;
+            if ((vp >> 8) == 2 && (s_sweepProg < 0 || (int)(vp & 0xFF) == s_sweepProg))
+                break;
+            id++;
+        }
+        if (id >= (s16)(Sfx_Base + 420)) { s_id = -1; cprintf("ambsfx: end of prog %d (wrapped)", s_sweepProg); return; }
+    }
+
+    s_id = id;
+    vp   = g_Vab_InfoTable[id - Sfx_Base].vab_progIdx_2;
+    Sd_PlaySfx((u16)id, 0, 0);
+    cprintf("ambsfx id=%d slot=%d prog=%d tone=%d note=%d", id, vp >> 8, vp & 0xFF,
+            g_Vab_InfoTable[id - Sfx_Base].audioVabIdx,
+            g_Vab_InfoTable[id - Sfx_Base].noteIdx_4);
+    SH_DBG("[DRIPSWEEP] AMBSFX id=%d slot=%d prog=%d tone=%d note=%d", id, vp >> 8, vp & 0xFF,
+           g_Vab_InfoTable[id - Sfx_Base].audioVabIdx,
+           g_Vab_InfoTable[id - Sfx_Base].noteIdx_4);
+}
+
+/* Reinstates the old [ / ] A-B position markers (dropped in 712cd8d2c when those
+ * keys were repurposed for effect intensity) as LOGA / LOGB console commands.
+ * Counters are per-session so successive marks read A1, A2, ... in the log. The
+ * union of the two removed loggers: A/B counters from the [ ]/dbg_overlay markers
+ * plus camera pitch/yaw/lookAt/fov from the old 4/5 camera-position logger. */
+static void cmd_logmark(char letter, const char* arg)
+{
+    static int s_markA = 0, s_markB = 0;
+    extern e_MapIdx g_CurrentMapIdx;
+
+    int* count = (letter == 'A') ? &s_markA : &s_markB;
+    s_SubCharacter* hr = &g_SysWork.playerWork.player;
+    VECTOR3 hpos = hr->position;
+    VECTOR3 cpos = vcWork.cam_pos;
+    VECTOR3 look = vcWork.watch_tgt_pos;
+    int idx;
+
+    if (strcmp(arg, "RESET") == 0) {
+        *count = 0;
+        cprintf("log%c: counter reset", letter);
+        return;
+    }
+
+    /* SH_DBG is a no-op while the log is closed (enable_debug_log=0), which would
+     * silently drop the only durable copy of the mark. Warn instead of misleading. */
+    if (!g_ShDebugLog)
+        cprintf("log%c: WARNING enable_debug_log=0 - console only, not in SilentHill.log", letter);
+
+    idx = ++(*count);
+
+    SH_DBG("======== MARK-%c%d ========", letter, idx);
+    SH_DBG("  Map    : %s", MapRegistry_GetName(g_CurrentMapIdx));
+    SH_DBG("  Harry  : (%.3f, %.3f, %.3f)  raw(%d, %d, %d)  yaw=%d",
+           hpos.vx / 4096.0f, hpos.vy / 4096.0f, hpos.vz / 4096.0f,
+           (int)hpos.vx, (int)hpos.vy, (int)hpos.vz, (int)hr->rotation.vy);
+    SH_DBG("  Camera : (%.3f, %.3f, %.3f)  raw(%d, %d, %d)",
+           cpos.vx / 4096.0f, cpos.vy / 4096.0f, cpos.vz / 4096.0f,
+           (int)cpos.vx, (int)cpos.vy, (int)cpos.vz);
+    SH_DBG("  LookAt : (%.3f, %.3f, %.3f)  raw(%d, %d, %d)",
+           look.vx / 4096.0f, look.vy / 4096.0f, look.vz / 4096.0f,
+           (int)look.vx, (int)look.vy, (int)look.vz);
+    SH_DBG("  CamAng : pitch=%d yaw=%d roll=%d  fov=%d",
+           (int)vcWork.cam_mat_ang.vx, (int)vcWork.cam_mat_ang.vy,
+           (int)vcWork.cam_mat_ang.vz, (int)vcWork.geom_screen_dist);
+    SH_DBG("========================");
+
+    cprintf("%c%d H(%.1f,%.1f,%.1f) yaw=%d", letter, idx,
+            hpos.vx / 4096.0f, hpos.vy / 4096.0f, hpos.vz / 4096.0f,
+            (int)hr->rotation.vy);
+    cprintf("   C(%.1f,%.1f,%.1f) pitch=%d yaw=%d",
+            cpos.vx / 4096.0f, cpos.vy / 4096.0f, cpos.vz / 4096.0f,
+            (int)vcWork.cam_mat_ang.vx, (int)vcWork.cam_mat_ang.vy);
+}
+
+void Pc_ConsoleExec(const char* line)
+{
+    char cmd[48];
+    const char* arg;
+    int i;
+
+    /* Split first word / remainder. */
+    for (i = 0; line[i] && line[i] != ' ' && i < (int)sizeof(cmd) - 1; i++)
+        cmd[i] = line[i];
+    cmd[i] = '\0';
+    arg = line[i] ? line + i + 1 : line + i;
+    while (*arg == ' ') arg++;
+
+    if (cmd[0] == '\0') {
+        return;
+    } else if (strcmp(cmd, "QUIT") == 0) {
+        SH_DBG("[CONSOLE] quit");
+        exit(0);
+    } else if (strcmp(cmd, "HELP") == 0) {
+        if (strncmp(arg, "GIVE", 4) == 0) {
+            if (strstr(arg, "2"))
+                push_lines(HELP_GIVE_PAGE2, (int)(sizeof(HELP_GIVE_PAGE2) / sizeof(HELP_GIVE_PAGE2[0])));
+            else
+                push_lines(HELP_GIVE_PAGE1, (int)(sizeof(HELP_GIVE_PAGE1) / sizeof(HELP_GIVE_PAGE1[0])));
+        } else {
+            push_lines(HELP_LINES, (int)(sizeof(HELP_LINES) / sizeof(HELP_LINES[0])));
+            {
+                const char* mn; const char* mh; int k = 0;
+                if (Pc_ModConsole_List(&mn, &mh, 0))
+                    DbgOverlay_PushLine("-- mod commands --");
+                while (Pc_ModConsole_List(&mn, &mh, k++))
+                    cprintf(" %s%s%s", mn, (mh && mh[0]) ? " - " : "", (mh && mh[0]) ? mh : "");
+            }
+        }
+    } else if (strcmp(cmd, "GETFLAGS") == 0) {
+        cmd_getflags();
+    } else if (strcmp(cmd, "SETFLAG") == 0) {
+        cmd_setflag(arg);
+    } else if (strcmp(cmd, "SETENDING") == 0) {
+        cmd_setending(arg);
+    } else if (strcmp(cmd, "CLEARFLAGS") == 0) {
+        cmd_clearflags();
+    } else if (strcmp(cmd, "DEBUG") == 0) {
+        if (strcmp(arg, "2") == 0)
+            push_lines(DEBUG_PAGE2, (int)(sizeof(DEBUG_PAGE2) / sizeof(DEBUG_PAGE2[0])));
+        else
+            push_lines(DEBUG_PAGE1, (int)(sizeof(DEBUG_PAGE1) / sizeof(DEBUG_PAGE1[0])));
+    } else if (strcmp(cmd, "AMBSFX") == 0) {
+        cmd_ambsfx(arg);
+    } else if (strcmp(cmd, "LOGA") == 0) {
+        cmd_logmark('A', arg);
+    } else if (strcmp(cmd, "LOGB") == 0) {
+        cmd_logmark('B', arg);
+    } else if (strcmp(cmd, "MAP") == 0) {
+        cmd_map(arg);
+    } else if (strcmp(cmd, "GIVE") == 0) {
+        cmd_give(arg);
+    } else if (strcmp(cmd, "GIVEMAP") == 0) {
+        cmd_givemap(arg);
+    } else if (strcmp(cmd, "KILL") == 0) {
+        g_SysWork.playerWork.player.health = -Q12(1.0f);
+        cprintf("killed Harry");
+    } else if (strcmp(cmd, "KILLALL") == 0) {
+        s_SubCharacter* hr   = &g_SysWork.playerWork.player;
+        int             killed = 0;
+        int             i;
+        for (i = 0; i < NPC_COUNT_MAX; i++) {
+            s_SubCharacter* npc = &g_SysWork.npcs[i];
+            if (npc->model.charaId == Chara_None || npc->model.charaId == Chara_Harry ||
+                npc->health <= Q12(0.0f)) {
+                continue;
+            }
+            if (ABS(npc->position.vx - hr->position.vx) > Q12(50.0f) ||
+                ABS(npc->position.vz - hr->position.vz) > Q12(50.0f)) {
+                continue;
+            }
+            npc->damage.amount = Q12(99999.0f);
+            killed++;
+        }
+        cprintf("killed %d nearby enemies", killed);
+    } else if (strcmp(cmd, "SPAWN") == 0) {
+        cmd_spawn(arg);
+    } else if (strcmp(cmd, "UNLIMITED") == 0) {
+        extern int g_PcUnlimitedEnemies;
+        if (arg[0] == '1') g_PcUnlimitedEnemies = 1;
+        else if (arg[0] == '0') g_PcUnlimitedEnemies = 0;
+        else g_PcUnlimitedEnemies = !g_PcUnlimitedEnemies;
+        cprintf("unlimited enemies %s (cap now %d)", g_PcUnlimitedEnemies ? "ON" : "OFF", NPC_COUNT_MAX);
+    } else if (strcmp(cmd, "NOCLIP") == 0) {
+        g_DebugNoWallCollision = !g_DebugNoWallCollision;
+        cprintf("noclip %s", g_DebugNoWallCollision ? "ON" : "OFF");
+    } else if (strcmp(cmd, "GOD") == 0) {
+        extern int g_PcGodMode;
+        if (arg[0] == '1') g_PcGodMode = 1;
+        else if (arg[0] == '0') g_PcGodMode = 0;
+        else g_PcGodMode = !g_PcGodMode;
+        cprintf("god mode %s (no damage + health held full; same as debug key 7)", g_PcGodMode ? "ON" : "OFF");
+    } else if (strcmp(cmd, "INVASPECT") == 0) {
+        extern int g_PcInvAspectSquare;
+        if (arg[0] == '1') g_PcInvAspectSquare = 1;
+        else if (arg[0] == '0') g_PcInvAspectSquare = 0;
+        else g_PcInvAspectSquare = !g_PcInvAspectSquare;
+        cprintf("inventory item aspect: %s", g_PcInvAspectSquare ? "SQUARE (true proportions)" : "PSX-faithful");
+    } else if (strcmp(cmd, "INVSCALE") == 0) {
+        extern int g_PcInvAspectPct;
+        int v = atoi(arg);
+        if (v >= 50 && v <= 200) g_PcInvAspectPct = v;
+        cprintf("inventory item vertical scale: %d%% of square", g_PcInvAspectPct);
+    } else if (strcmp(cmd, "INVCARY") == 0) {
+        /* the console minus key types '_', so accept a leading '_' as '-'. */
+        extern int g_PcInvCarouselYOff;
+        if (arg[0]) g_PcInvCarouselYOff = (arg[0] == '_') ? -atoi(arg + 1) : atoi(arg);
+        cprintf("carousel item Y offset: %d (+ down)", g_PcInvCarouselYOff);
+    } else if (strcmp(cmd, "INVEQY") == 0) {
+        extern int g_PcInvEquipYOff;
+        if (arg[0]) g_PcInvEquipYOff = (arg[0] == '_') ? -atoi(arg + 1) : atoi(arg);
+        cprintf("equipped item Y offset: %d (+ down)", g_PcInvEquipYOff);
+    } else if (strcmp(cmd, "INVDIM") == 0) {
+        extern int g_PcInvDimStrength;
+        int v = atoi(arg);
+        if (v >= 0 && v <= 100) g_PcInvDimStrength = v;
+        cprintf("off-center carousel dim: %d%%", g_PcInvDimStrength);
+    } else if (strcmp(cmd, "BIGHEAD") == 0) {
+        extern int g_PcBigHead;
+        if (arg[0]) g_PcBigHead = atoi(arg) ? 1 : 0;
+        cprintf("big head mode: %s", g_PcBigHead ? "ON" : "OFF");
+    } else if (strcmp(cmd, "CROSSHAIRSIZE") == 0) {
+        if (arg[0]) {
+            float v = (float)atof(arg);
+            if (v < 25.0f) v = 25.0f;
+            if (v > 125.0f) v = 125.0f;
+            g_PcConfig.crosshairSize = v;
+            {
+                char buf[16];
+                snprintf(buf, sizeof(buf), "%d", (int)(v + 0.5f));
+                PcConfig_SaveKeyValue("crosshair_size", buf);
+            }
+        }
+        cprintf("crosshair size: %d%% (25..125)", (int)(g_PcConfig.crosshairSize + 0.5f));
+    } else if (strcmp(cmd, "OBST") == 0) {
+        extern int g_PcObstacleCollision;
+        if (arg[0]) g_PcObstacleCollision = atoi(arg) ? 1 : 0;
+        cprintf("round-obstacle (ptr_18) collision: %s", g_PcObstacleCollision ? "ON" : "OFF (sprint-through)");
+    } else if (strcmp(cmd, "COLLSCOPE") == 0) {
+        extern int g_PcChunkCollisionLocalScope;
+        if (arg[0]) g_PcChunkCollisionLocalScope = atoi(arg) ? 1 : 0;
+        cprintf("preload collision local-cell scope: %s", g_PcChunkCollisionLocalScope ? "ON (vanilla window)" : "OFF (all chunks)");
+    } else if (strcmp(cmd, "ALPHA") == 0) {
+        extern int g_PcSlopeAlphaFix;
+        if (arg[0]) g_PcSlopeAlphaFix = atoi(arg) ? 1 : 0;
+        cprintf("slope-alpha invisible-wall fix: %s", g_PcSlopeAlphaFix ? "ON (capped)" : "OFF (original)");
+    } else if (strcmp(cmd, "VFOV") == 0) {
+        extern float g_PsxWorldVScale;
+        if (arg[0]) g_PsxWorldVScale = (float)atof(arg);
+        cprintf("world vertical FOV scale: %.3f (1.0=off; vertical crop/zoom of the world)", g_PsxWorldVScale);
+    } else if (strcmp(cmd, "CUTFOV") == 0) {
+        /* EXPLICIT cutscene vertical scale override; 0 (default) = cutscenes
+         * follow the gameplay vfov crop. Defaulting this to 1.0 once shipped a
+         * squished-cutscene release -- it is a live-tuning knob only. */
+        extern float g_PsxCutsceneVScale;
+        if (arg[0]) g_PsxCutsceneVScale = (float)atof(arg);
+        cprintf("cutscene vscale override: %.3f (0=follow vfov, the default)", g_PsxCutsceneVScale);
+    } else if (strcmp(cmd, "HFOV") == 0) {
+        /* 3D-world horizontal scale (Hor+ only). 1.0 = current behaviour; >1 = wider
+         * models, <1 = narrower. Pure tuning/preference knob, default neutral. */
+        extern float g_PsxWorldHScale;
+        if (arg[0]) g_PsxWorldHScale = (float)atof(arg);
+        cprintf("world horizontal scale: %.3f (1.0=off; >1 wider models, <1 narrower; all 3D modes)", g_PsxWorldHScale);
+    } else if (strcmp(cmd, "VCROPANCHOR") == 0) {
+        /* Where the vfov crop sits: 0 = keep the top rows (default, today's
+         * framing), 0.5 = centred like an overscan crop, 1 = keep the bottom. */
+        extern float g_PsxWorldVCropAnchor;
+        if (arg[0]) g_PsxWorldVCropAnchor = (float)atof(arg);
+        if (g_PsxWorldVCropAnchor < 0.0f) g_PsxWorldVCropAnchor = 0.0f;
+        if (g_PsxWorldVCropAnchor > 1.0f) g_PsxWorldVCropAnchor = 1.0f;
+        cprintf("vfov crop anchor: %.2f (0=top/default, 0.5=centred, 1=bottom)", g_PsxWorldVCropAnchor);
+    } else if (strcmp(cmd, "PAR") == 0) {
+        /* PsyCross pixel-aspect compensation (320x224 shown as 4:3 -> 15/14).
+         * Live for A/B only; main_pc.c bakes the correct value at boot. */
+        extern float g_PsxPixelAspect;
+        if (arg[0]) g_PsxPixelAspect = (float)atof(arg);
+        cprintf("pixel aspect compensation: %.4f (15/14 = 1.0714 is the 4:3 picture; 1.0 = square pixels)", g_PsxPixelAspect);
+    } else if (strcmp(cmd, "CRTASPECT") == 0) {
+        /* Trim on the 4:3 CRT picture (display_aspect = crt). 1.0 = textbook
+         * 4:3. The target assumes the 224-line frame fills the screen height,
+         * but a console puts 224 active lines inside a 240-line window and sets
+         * overscan differently, so the truth is a few percent either way. Judge
+         * it on Harry, not on a corridor: below 1.0 makes him taller/thinner. */
+        extern float g_PsxCrtAspectTrim;
+        if (arg[0]) g_PsxCrtAspectTrim = (float)atof(arg);
+        if (g_PsxCrtAspectTrim < 0.5f) g_PsxCrtAspectTrim = 0.5f;
+        if (g_PsxCrtAspectTrim > 1.5f) g_PsxCrtAspectTrim = 1.5f;
+        cprintf("crt aspect trim: %.4f (1.0 = 4:3; lower = taller/thinner figures)",
+                g_PsxCrtAspectTrim);
+    } else if (strcmp(cmd, "CAMSNAP") == 0) {
+        extern void Pc_CamSnapDump(void);
+        Pc_CamSnapDump();
+    } else if (strcmp(cmd, "VSHIFT") == 0) {
+        extern float g_PsxWorldVShift;
+        if (arg[0]) g_PsxWorldVShift = (float)atof(arg);
+        cprintf("world vertical view shift: %.1f psx-units (+ = view up; 0=off)", g_PsxWorldVShift);
+    } else if (strcmp(cmd, "DRAWDIST") == 0) {
+        /* Live version of the config-only draw_distance_pct. Read every frame by
+         * the five SH_FAR_BASE sites and the chunk material window, so setting it
+         * takes effect immediately. 200 cap: past ~210 the Q8 view Z wraps. */
+        if (arg[0]) {
+            int v = atoi(arg);
+            g_PcConfig.drawDistancePct = (v < 25) ? 25 : ((v > 200) ? 200 : v);
+        }
+        cprintf("draw distance: %d%% (25..200; config key draw_distance_pct)", g_PcConfig.drawDistancePct);
+    } else if (strcmp(cmd, "FOGDIST") == 0) {
+        /* Push the fog planes out (or in). Indoors the fog is BLACK, so this is
+         * also the "see further in the sewers" knob: the wall of black is the fog
+         * far plane. Re-applies immediately via the remembered raw distances. */
+        extern int  g_PcFogDistScalePct;
+        extern void Pc_FogDistanceReapply(void);
+        if (arg[0]) {
+            int v = atoi(arg);
+            g_PcFogDistScalePct = (v < 50) ? 50 : ((v > 400) ? 400 : v);
+            Pc_FogDistanceReapply();
+        }
+        cprintf("fog distance: %d%% (50..400; 100=stock)", g_PcFogDistScalePct);
+    } else if (strcmp(cmd, "BRIGHT") == 0) {
+        /* Whole-image brightness, the same value the launcher's brightness
+         * setting drives (config key brightness). Applied in the post shader,
+         * so it works everywhere including menus. */
+        extern float g_cfg_brightness;
+        if (arg[0]) {
+            float v = (float)atof(arg);
+            if (v < 0.2f) v = 0.2f;
+            if (v > 4.0f) v = 4.0f;
+            g_cfg_brightness = v;
+        }
+        cprintf("brightness: %.2f (0.2..4.0; 1.0=stock; config key brightness)", g_cfg_brightness);
+    } else if (strcmp(cmd, "SHADOWRES") == 0) {
+        /* Flashlight shadow-map resolution. The target is rebuilt on the next
+         * frame that needs it, so this takes effect immediately. Clamped to
+         * 256..8192 inside GR_EnsureShadowTarget. */
+        extern int g_PsyX_ShadowMapSize;
+        if (arg[0]) g_PsyX_ShadowMapSize = atoi(arg);
+        cprintf("flashlight shadow map: %dx%d (256..8192; default 1024)",
+                g_PsyX_ShadowMapSize, g_PsyX_ShadowMapSize);
+    } else if (strcmp(cmd, "CUTSHIFT") == 0) {
+        extern float g_PsxCutsceneVShift;
+        if (arg[0]) g_PsxCutsceneVShift = (float)atof(arg);
+        cprintf("cutscene vertical view shift: %.1f psx-units (+ = view up; 0=off)", g_PsxCutsceneVShift);
+    } else if (strcmp(cmd, "MSGSHIFT") == 0) {
+        extern int g_PsxMsgVShift;
+        if (arg[0]) g_PsxMsgVShift = atoi(arg);
+        cprintf("message box up-shift: %d psx-units (compensates the VFOV bottom crop)", g_PsxMsgVShift);
+    } else if (strcmp(cmd, "BARY") == 0) {
+        extern int g_PsxBarOuter, g_PsxBarInner;
+        if (arg[0]) { g_PsxBarOuter = atoi(arg); g_PsxBarInner = g_PsxBarOuter - 16; }
+        cprintf("letterbox bar Y: outer=%d inner=%d (raise until bars hit the screen edges)", g_PsxBarOuter, g_PsxBarInner);
+    } else if (strcmp(cmd, "FOGSTR") == 0) {
+        /* World fog density multiplier. The PSX layered a 2nd semi-transparent fog
+         * poly the PC port drops, so the single-pass shader fog reads thinner ("filter"
+         * look); >1.0 deepens it toward the oppressive PSX wall. 1.0 = native (default).
+         * Live-tune vs DuckStation, then we can bake a value as the default. */
+        extern float g_PsyX_FogStrength;
+        if (arg[0]) g_PsyX_FogStrength = (float)atof(arg);
+        cprintf("world fog strength: %.2f (1.0=native PC fog; >1 deepens toward PSX)", g_PsyX_FogStrength);
+    } else if (strcmp(cmd, "WELD") == 0) {
+        extern float g_pgxpWeldPx;
+        if (arg[0]) g_pgxpWeldPx = (float)atof(arg);
+        cprintf("PGXP seam weld radius: %.2f px (0=off)", g_pgxpWeldPx);
+    } else if (strcmp(cmd, "WELDW") == 0) {
+        extern float g_pgxpWeldWRatio;
+        if (arg[0]) g_pgxpWeldWRatio = (float)atof(arg);
+        cprintf("PGXP weld depth ratio: %.3f", g_pgxpWeldWRatio);
+    } else if (strcmp(cmd, "WEATHERHZ") == 0) {
+        if (arg[0]) g_PcConfig.weatherSimHz = (atoi(arg) == 30) ? 30 : 60;
+        cprintf("Weather (rain/snow) simulation: %d Hz%s", g_PcConfig.weatherSimHz,
+                g_PcConfig.weatherSimHz == 30 ? " (original console cadence)" : " (per rendered frame)");
+    } else if (strcmp(cmd, "VOIDPROBE") == 0) {
+        /* One-shot: the renderer prints the clear bytes, the fog uniform and a
+         * colour histogram of the top rows of the scene target and of the window
+         * on the next frame. Stand looking at the far void with a lamp post in
+         * view and run it. */
+        extern int   g_PsxVoidProbeArmed;
+        extern float g_PsyX_FogColor[3];
+        extern int   g_cfg_psxDither, g_cfg_tonemap, g_cfg_postProcess;
+        g_PsxVoidProbeArmed = 1;
+        /* cprintf only reaches the overlay; the log is what gets sent back. */
+        SH_DBG("[VOIDPROBE] armed: background2dColor=(%d,%d,%d) shaderFog=(%.2f,%.2f,%.2f)/255 psxDither=%d tonemap=%d post=%d fogStrength=%.3f gameState=%d sysState=%d",
+               g_GameWork.background2dColor.r, g_GameWork.background2dColor.g, g_GameWork.background2dColor.b,
+               g_PsyX_FogColor[0] * 255.0f, g_PsyX_FogColor[1] * 255.0f, g_PsyX_FogColor[2] * 255.0f,
+               g_cfg_psxDither, g_cfg_tonemap, g_cfg_postProcess, g_PcConfig.fogStrength,
+               (int)g_GameWork.gameState, (int)g_SysWork.sysState);
+        cprintf("[VOIDPROBE] armed -- readback lands in the log on the next frame");
+    } else if (strcmp(cmd, "PGXPEDGE") == 0) {
+        extern float g_PgxpEdgeMax;
+        if (arg[0]) g_PgxpEdgeMax = (float)atof(arg);
+        cprintf("PGXP off-screen position clamp: %.0f psx-units (higher = less edge warp)", g_PgxpEdgeMax);
+    } else if (strcmp(cmd, "PGXPDEPTH") == 0) {
+        extern int g_PgxpUseUnquantizedDepth;
+        if (arg[0] == '1') g_PgxpUseUnquantizedDepth = 1;
+        else if (arg[0] == '0') g_PgxpUseUnquantizedDepth = 0;
+        else g_PgxpUseUnquantizedDepth = !g_PgxpUseUnquantizedDepth;
+        cprintf("PGXP unquantized-depth W (distance-seam fix): %s", g_PgxpUseUnquantizedDepth ? "ON" : "OFF");
+    } else if (strcmp(cmd, "PGXPDEPTHSTATS") == 0) {
+        /* Opt-in [PGXPDEPTH] diagnostics dump (60-frame cadence, PGXP on). */
+        extern int g_PsxPgxpDepthStats;
+        if (arg[0] == '1') g_PsxPgxpDepthStats = 1;
+        else if (arg[0] == '0') g_PsxPgxpDepthStats = 0;
+        else g_PsxPgxpDepthStats = !g_PsxPgxpDepthStats;
+        cprintf("PGXP depth-channel stats dump: %s", g_PsxPgxpDepthStats ? "ON" : "OFF");
+#if defined(SH_RETROACHIEVEMENTS)
+    } else if (strcmp(cmd, "RAWHY") == 0) {
+        /* Dump an achievement's conditions + the values we return, to SilentHill.log. */
+        extern int Pc_Ra_Why(const char*);
+        int n = Pc_Ra_Why(arg);
+        cprintf(n ? "Dumped %d achievement trigger(s) to the log" : "No match (or no set loaded)", n);
+    } else if (strcmp(cmd, "RATOAST") == 0) {
+        /* Preview the achievement popup without earning anything. */
+        extern void Pc_RaToast_Show(const char*, const char*, const char*, unsigned);
+        extern int  Pc_Ra_PreviewFirst(void);
+        /* Prefer a real achievement (badge art included) when a set is loaded. */
+        if (arg[0] || !Pc_Ra_PreviewFirst())
+        {
+            Pc_RaToast_Show(arg[0] ? arg : "Welcome to Silent Hill",
+                            "Find the flashlight and survive your first encounter "
+                            "with the creatures in the alley.",
+                            "", 10);
+            cprintf("Achievement toast preview (placeholder art)");
+        }
+        else
+        {
+            cprintf("Achievement toast preview (real achievement + badge)");
+        }
+/* RAWHY/RATOAST reach into pc_retroachievements.c, which compiles to nothing
+ * when the rcheevos build is off (Android: no libcurl), so the commands go with
+ * it rather than leaving undefined references at link. */
+#endif
+    } else if (strcmp(cmd, "PGXPWORLDDEPTH") == 0) {
+        /* Depth-channel kill-switch: OFF suppresses FLAT world promotion
+         * (GL_ALWAYS painter + viewZ flat depth), dropping depth behavior
+         * back to bucket+painter instantly. */
+        extern int g_PsxPgxpWorldDepth;
+        if (arg[0] == '1') g_PsxPgxpWorldDepth = 1;
+        else if (arg[0] == '0') g_PsxPgxpWorldDepth = 0;
+        else g_PsxPgxpWorldDepth = !g_PsxPgxpWorldDepth;
+        cprintf("PGXP world depth channel: %s", g_PsxPgxpWorldDepth ? "ON" : "OFF");
+    } else if (strcmp(cmd, "PGXPWALLBIAS") == 0) {
+        /* Writer-side far-push margin M (SZ units) on world geometry. */
+        extern int g_PsxPgxpWorldFarBias;
+        if (arg[0]) g_PsxPgxpWorldFarBias = atoi(arg);
+        cprintf("PGXP world far-bias M: %d SZ units", g_PsxPgxpWorldFarBias);
+    } else if (strcmp(cmd, "PGXPNEARCLIP") == 0) {
+        extern int g_PsxPgxpNearClip;
+        if (arg[0] == '1') g_PsxPgxpNearClip = 1;
+        else if (arg[0] == '0') g_PsxPgxpNearClip = 0;
+        else g_PsxPgxpNearClip = !g_PsxPgxpNearClip;
+        cprintf("PGXP near-plane clipping (close-camera warp fix): %s", g_PsxPgxpNearClip ? "ON" : "OFF");
+    } else if (strcmp(cmd, "PGXPNEARZ") == 0) {
+        /* Clipper divides by this and uses it as the clip verts' W — keep >= 1. */
+        extern float g_PgxpNearZ;
+        if (arg[0]) { g_PgxpNearZ = (float)atof(arg); if (g_PgxpNearZ < 1.0f) g_PgxpNearZ = 1.0f; }
+        cprintf("PGXP near-clip plane depth: %.1f gte-units", g_PgxpNearZ);
+    } else if (strcmp(cmd, "TXNHOLD") == 0) {
+        /* Minimum load-screen frames. 60 is retail's literal constant. */
+        extern s32 g_PcTxnHoldFrames;
+        if (arg[0]) g_PcTxnHoldFrames = atoi(arg);
+        cprintf("load-screen minimum: %d frames (%.2f s); retail constant is 60",
+                (int)g_PcTxnHoldFrames, (float)g_PcTxnHoldFrames / 60.0f);
+    } else if (strcmp(cmd, "TXNFADE") == 0) {
+        /* Door out-fade length in seconds. Retail's was however long the CD read
+         * took, so there is no constant to match. */
+        extern s32 g_PcTxnFadeTimestep;
+        if (arg[0]) {
+            float secs = (float)atof(arg);
+            if (secs < 0.05f) secs = 0.05f;
+            g_PcTxnFadeTimestep = (s32)(4096.0f / secs);
+        }
+        cprintf("door out-fade: %.2f s", 4096.0f / (float)g_PcTxnFadeTimestep);
+    } else if (strcmp(cmd, "FASTLOAD") == 0) {
+        /* Blocking loads otherwise advance one queue state per vblank and copy
+         * one 2048 byte sector per call -- ~120 KiB/s regardless of the storage,
+         * which is the multi-second black hold on a door. */
+        extern int g_PcFastBlockingLoads;
+        if (arg[0] == '1') g_PcFastBlockingLoads = 1;
+        else if (arg[0] == '0') g_PcFastBlockingLoads = 0;
+        else g_PcFastBlockingLoads = !g_PcFastBlockingLoads;
+        cprintf("fast blocking loads: %s", g_PcFastBlockingLoads ? "ON (disk speed)" : "OFF (PSX CD pace)");
+    } else if (strcmp(cmd, "LOADPACE") == 0) {
+        /* Harry-running loading screen: one step of Harry and the blur every N
+         * vblanks, each capped at 1/30 s, which is what turns his run into the
+         * console's jog. 2 (30 fps, full speed) is the default; 0 or 1
+         * steps every frame at full speed. The load itself is never slowed. */
+        extern s32 g_PcLoadScreenPaceVblanks;
+        if (arg[0]) g_PcLoadScreenPaceVblanks = atoi(arg);
+        if (g_PcLoadScreenPaceVblanks < 0)  g_PcLoadScreenPaceVblanks = 0;
+        if (g_PcLoadScreenPaceVblanks > 12) g_PcLoadScreenPaceVblanks = 12;
+        if (g_PcLoadScreenPaceVblanks <= 1)
+            cprintf("loading screen pace: every frame, full speed");
+        else
+            cprintf("loading screen pace: a step every %d vblanks (%.0f fps), Harry at %.0f%% speed",
+                    (int)g_PcLoadScreenPaceVblanks, 60.0 / g_PcLoadScreenPaceVblanks,
+                    100.0 * (g_PcLoadScreenPaceVblanks > 2 ? 2.0 : (double)g_PcLoadScreenPaceVblanks) / g_PcLoadScreenPaceVblanks);
+    } else if (strcmp(cmd, "LOADMIN") == 0) {
+        /* Minimum time the Harry-running loading screen stays up, in seconds.
+         * The load finishes underneath; the new area waits before its music
+         * starts. 0 = no minimum. Persists to config.cfg. */
+        extern s32 g_PcLoadScreenMinVblanks;
+        if (arg[0]) {
+            float v = (float)atof(arg);
+            if (v < 0.0f)  v = 0.0f;
+            if (v > 10.0f) v = 10.0f;
+            g_PcConfig.loadScreenMin = v;
+            g_PcLoadScreenMinVblanks = (s32)(v * 60.0f + 0.5f);
+            {
+                char buf[16];
+                snprintf(buf, sizeof(buf), "%.1f", v);
+                PcConfig_SaveKeyValue("load_screen_min", buf);
+            }
+        }
+        cprintf("loading screen minimum: %.1f s", g_PcLoadScreenMinVblanks / 60.0);
+    } else if (strcmp(cmd, "FBEXACT") == 0) {
+        /* Loading-screen trail and door fade: 1 = pixel-exact store (lossless,
+         * sharp store, persistence set by FBDAMP), 0 = the old filtered loop
+         * whose gain is FBDAMP's first number. Bare toggles. */
+        extern int g_PsxFeedbackExact;
+        if (arg[0] == '0' || arg[0] == '1')
+            g_PsxFeedbackExact = (arg[0] == '1');
+        else
+            g_PsxFeedbackExact = !g_PsxFeedbackExact;
+        cprintf("loading trail: %s", g_PsxFeedbackExact ? "sharp (pixel-exact store)" : "soft (old filtered store)");
+    } else if (strcmp(cmd, "FBDAMP") == 0) {
+        /* Gain of the framebuffer-feedback loop that produces the door out-fade
+         * and the loading-screen trail. 0.65 = shipped; ~0.996 (255/256) is
+         * retail-length decay but diverged to a grey field last time it was
+         * tried, so it is tunable here rather than baked in. */
+        /* Second argument is the gain for a BLENDING reader (the dream
+         * overlays), which is unity by default because the overlay's own 50/50
+         * composite is already the decay hardware relies on. */
+        extern float g_PsxFeedbackDamp;
+        extern float g_PsxFeedbackDampBlend;
+        if (arg[0]) g_PsxFeedbackDamp = (float)atof(arg);
+        {
+            const char* second = arg;
+            while (*second && *second != ' ') second++;
+            while (*second == ' ') second++;
+            if (*second) g_PsxFeedbackDampBlend = (float)atof(second);
+        }
+        cprintf("framebuffer feedback damp: %.4f opaque (loading trail), %.4f blended (dream overlays)",
+                g_PsxFeedbackDamp, g_PsxFeedbackDampBlend);
+    } else if (strcmp(cmd, "CULL") == 0) {
+        /* Retail gates each chunk's model buffers on a baked per-subcell PVS
+         * slice plus a frustum test; disable_culling skips both (exterior maps).
+         * Live toggle so a suspected leaked prim can be A/B'd on the spot
+         * instead of editing config.cfg and reloading the map. */
+        if (arg[0] == '1') g_PcConfig.disableCulling = 0;
+        else if (arg[0] == '0') g_PcConfig.disableCulling = 1;
+        else g_PcConfig.disableCulling = !g_PcConfig.disableCulling;
+        cprintf("chunk visibility culling: %s (disable_culling=%d)",
+                g_PcConfig.disableCulling ? "OFF (draw everything)" : "ON (retail PVS + frustum)",
+                g_PcConfig.disableCulling);
+    } else if (strcmp(cmd, "POLYSIZECULL") == 0) {
+        /* PSX GPU parity: hardware rejects triangles whose screen bbox exceeds
+         * 1023x511; drawing them is the wedge-poly corruption. Off = A/B the
+         * old behavior (and an escape hatch if a load-bearing oversize quad
+         * turns up, e.g. the flashlight glow-mask borders). */
+        extern int g_PsxPolySizeCull;
+        if (arg[0] == '1') g_PsxPolySizeCull = 1;
+        else if (arg[0] == '0') g_PsxPolySizeCull = 0;
+        else g_PsxPolySizeCull = !g_PsxPolySizeCull;
+        g_PcConfig.psxPolySizeCull = g_PsxPolySizeCull;
+        PcConfig_SaveKeyValue("psx_poly_size_cull", g_PsxPolySizeCull ? "1" : "0");
+        cprintf("PSX oversize-poly cull (bbox >1023x511 rejected): %s", g_PsxPolySizeCull ? "ON" : "OFF");
+    } else if (strcmp(cmd, "PGXPFARW") == 0) {
+        /* Beyond this view depth (SZ units, 256 = 1 world unit) perspective
+         * interpolation fades to affine — kills the distant grazing-angle
+         * texture shimmer with PGXP on. 0 = pure PGXP at any distance. */
+        extern float g_PgxpFarWClamp;
+        if (arg[0]) { g_PgxpFarWClamp = (float)atof(arg); if (g_PgxpFarWClamp < 0.0f) g_PgxpFarWClamp = 0.0f; }
+        cprintf("PGXP far-W clamp (affine beyond ~%.0fu): %.0f sz (0=off)",
+                g_PgxpFarWClamp / 256.0f, g_PgxpFarWClamp);
+    } else if (strcmp(cmd, "ADD") == 0) {
+        /* Debug-isolate the additive (BM_ADD) render layer to diagnose the map7_s03
+         * pre/during/post-fight fire-and-lightning. 0 = drop all additive splits
+         * (does the fire/lightning vanish? -> it's additive geometry), 1 = normal,
+         * 2 = additive drawn depth-tested (does the under-floor lightning get
+         * occluded by the floor? -> the bug is the disabled depth test). */
+        extern int g_PsxDbgAddMode;
+        if (arg[0]) g_PsxDbgAddMode = atoi(arg);
+        cprintf("additive layer: mode %d (0=skip, 1=normal, 2=depth-tested)", g_PsxDbgAddMode);
+    } else if (strcmp(cmd, "FMV") == 0) {
+        cmd_fmv(arg);
+    } else if (strcmp(cmd, "PGXP") == 0) {
+        extern int g_PsxUsePgxp;
+        if (arg[0] == '1') g_PsxUsePgxp = 1;
+        else if (arg[0] == '0') g_PsxUsePgxp = 0;
+        else g_PsxUsePgxp = !g_PsxUsePgxp; /* bare "pgxp" toggles */
+        g_PcConfig.usePgxp = g_PsxUsePgxp ? 1 : 0;
+        PcConfig_SaveKeyValue("use_pgxp", g_PsxUsePgxp ? "1" : "0");
+        cprintf("PGXP %s (perspective-correct, WIP)", g_PsxUsePgxp ? "ON" : "OFF");
+    } else if (strcmp(cmd, "WORLDDEPTH") == 0) {
+        /* worlddepth 0|1 -- depth function for static opaque world under PGXP.
+         * 1 = GL_ALWAYS (paint order alone decides), 0 = GL_LEQUAL (a nearer
+         * coplanar face wins whatever order it was drawn in). Live toggle for the
+         * central Silent Hill road flicker. */
+        extern int g_PsxWorldDepthAlways;
+        if (arg[0] == '1') g_PsxWorldDepthAlways = 1;
+        else if (arg[0] == '0') g_PsxWorldDepthAlways = 0;
+        else g_PsxWorldDepthAlways = !g_PsxWorldDepthAlways;
+        cprintf("world depth: %s", g_PsxWorldDepthAlways ? "ALWAYS (paint order)" : "LEQUAL (nearer wins)");
+    } else if (strcmp(cmd, "FLMODE") == 0) {
+        /* flmode 0..3 | classic | classicshadows | modern | modernshadows */
+        int mode = g_PcConfig.flashlightMode;
+        if (arg[0] >= '0' && arg[0] <= '3' && arg[1] == '\0') mode = arg[0] - '0';
+        else if (strcmp(arg, "CLASSIC") == 0) mode = 0;
+        else if (strcmp(arg, "CLASSICSHADOWS") == 0) mode = 1;
+        else if (strcmp(arg, "MODERN") == 0) mode = 2;
+        else if (strcmp(arg, "MODERNSHADOWS") == 0) mode = 3;
+        else if (arg[0] != '\0') { cprintf("usage: flmode <0-3|classic|classicshadows|modern|modernshadows>"); return; }
+        Pc_FlashlightModeApply(mode, 1);
+        cprintf("Flashlight: %s", Pc_FlashlightModeLabel(g_PcConfig.flashlightMode));
+    } else if (strcmp(cmd, "SHADOWS") == 0) {
+        /* Toggles shadows WITHIN the current flashlight mode. Classic + Shadows
+         * without shadows is just Classic, so 1<->0 and 3<->2. */
+        int on;
+        int mode = g_PcConfig.flashlightMode;
+        if (arg[0] == '1') on = 1;
+        else if (arg[0] == '0') on = 0;
+        else on = !(mode == 1 || mode == 3); /* bare "shadows" toggles */
+        if (mode == 0 || mode == 1) mode = on ? 1 : 0;
+        else                        mode = on ? 3 : 2;
+        Pc_FlashlightModeApply(mode, 1);
+        cprintf("Flashlight: %s", Pc_FlashlightModeLabel(g_PcConfig.flashlightMode));
+    } else if (strcmp(cmd, "SHADOWBIAS") == 0) {
+        extern float g_PsyX_FlashlightShadowBias;
+        if (arg[0] != '\0') g_PsyX_FlashlightShadowBias = (float)atof(arg);
+        cprintf("shadow bias = %.5f", g_PsyX_FlashlightShadowBias);
+    } else if (strcmp(cmd, "SHADOWSTRENGTH") == 0) {
+        extern float g_PsyX_FlashlightShadowStrength;
+        if (arg[0] != '\0') g_PsyX_FlashlightShadowStrength = (float)atof(arg);
+        cprintf("shadow strength = %.3f (1=full/default, lower=softer)", g_PsyX_FlashlightShadowStrength);
+    } else if (strcmp(cmd, "SHADOWFADE") == 0) {
+        extern float g_PsyX_FlashlightShadowFadeDist;
+        if (arg[0] != '\0') g_PsyX_FlashlightShadowFadeDist = (float)atof(arg);
+        cprintf("shadow contact-fade = %.1f (0=off; >0 = view units behind occluder)", g_PsyX_FlashlightShadowFadeDist);
+    } else if (strcmp(cmd, "SHADOWNORMAL") == 0) {
+        extern float g_PsyX_FlashlightShadowNormalOffset;
+        if (arg[0] != '\0') g_PsyX_FlashlightShadowNormalOffset = (float)atof(arg);
+        cprintf("shadow normal-offset = %.5f (0=off)", g_PsyX_FlashlightShadowNormalOffset);
+    } else if (strcmp(cmd, "SHADOWFPSDROP") == 0) {
+        extern float g_PsyX_FlashlightShadowFpsDrop;
+        if (arg[0] != '\0') g_PsyX_FlashlightShadowFpsDrop = (float)atof(arg);
+        cprintf("FPS shadow-light drop = %.1f", g_PsyX_FlashlightShadowFpsDrop);
+    } else if (strcmp(cmd, "FLASHLIGHT") == 0 || strcmp(cmd, "FL") == 0 ||
+               strcmp(cmd, "WORLDLIGHT") == 0 || strcmp(cmd, "WL") == 0) {
+        extern int g_PcFlashlightColorActive, g_PcWorldLightColorActive;
+        extern unsigned char g_PcFlashlightColorR, g_PcFlashlightColorG, g_PcFlashlightColorB;
+        extern unsigned char g_PcWorldLightColorR, g_PcWorldLightColorG, g_PcWorldLightColorB;
+        int isWorld = (cmd[0] == 'W');
+        const char* label = isWorld ? "world light" : "flashlight";
+        int* active = isWorld ? &g_PcWorldLightColorActive : &g_PcFlashlightColorActive;
+        unsigned char* cr = isWorld ? &g_PcWorldLightColorR : &g_PcFlashlightColorR;
+        unsigned char* cg = isWorld ? &g_PcWorldLightColorG : &g_PcFlashlightColorG;
+        unsigned char* cb = isWorld ? &g_PcWorldLightColorB : &g_PcFlashlightColorB;
+        struct { const char* name; unsigned char r, g, b; } presets[] = {
+            { "RED",    255,   0,   0 },
+            { "GREEN",    0, 255,   0 },
+            { "BLUE",     0,   0, 255 },
+            { "YELLOW", 255, 255,   0 },
+            { "CYAN",     0, 255, 255 },
+            { "PURPLE", 255,   0, 255 },
+            { "MAGENTA",255,   0, 255 },
+            { "ORANGE", 255, 128,   0 },
+            { "PINK",   255, 128, 192 },
+            { "WHITE",  255, 255, 255 },
+        };
+        if (strcmp(arg, "DEFAULT") == 0 || strcmp(arg, "OFF") == 0 || arg[0] == '\0') {
+            *active = 0;
+            cprintf("%s color: default", label);
+        } else {
+            int found = 0, k;
+            for (k = 0; k < (int)(sizeof(presets) / sizeof(presets[0])); k++) {
+                if (strcmp(arg, presets[k].name) == 0) {
+                    *cr = presets[k].r; *cg = presets[k].g; *cb = presets[k].b;
+                    *active = 1;
+                    cprintf("%s color: %s", label, presets[k].name);
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found)
+                cprintf("unknown color '%s' (red/green/blue/yellow/cyan/purple/orange/pink/white/default)", arg);
+        }
+    } else if (strcmp(cmd, "ADSR") == 0) {
+        extern void PsyX_SPUAL_SetAdsrEnabled(int on);
+        extern int  PsyX_SPUAL_GetAdsrEnabled(void);
+        int on = (arg[0] == '1') ? 1 : (arg[0] == '0') ? 0 : !PsyX_SPUAL_GetAdsrEnabled();
+        PsyX_SPUAL_SetAdsrEnabled(on);
+        cprintf("ADSR envelope %s (default on; config key adsr)", on ? "ON" : "OFF");
+    } else if (strcmp(cmd, "AUDIOOUT") == 0) {
+        /* Speaker layout. Applies LIVE via alcResetDeviceSOFT (mix format
+         * renegotiated, sources keep playing) and persists to config.cfg.
+         * No-arg reports the achieved layout — trust that over the request:
+         * a 5.1 ask on a stereo endpoint silently degrades. */
+        extern int PsyX_SPUAL_ApplyOutputMode(int mode);
+        extern int PsyX_SPUAL_GetOutputMode(void);
+        extern int PsyX_SPUAL_GetSurroundActive(void);
+        static const char* const kSpkUp[] = { "AUTO", "STEREO", "QUAD", "51", "71", "HRTF" };
+        static const char* const kSpk[]   = { "auto", "stereo", "quad", "51", "71", "hrtf" };
+        static const char* const kSpkUi[] = { "auto", "stereo", "quad", "5.1", "7.1", "hrtf" };
+        if (arg[0] != '\0') {
+            int mode = -1, k;
+            for (k = 0; k < 6; k++) {
+                if (strcmp(arg, kSpkUp[k]) == 0)
+                    mode = k;
+            }
+            /* No bare-digit aliases: "5" would read as 5.1 but mean HRTF. */
+            if (mode < 0) {
+                cprintf("usage: AUDIOOUT auto|stereo|quad|51|71|hrtf");
+            } else {
+                int live = PsyX_SPUAL_ApplyOutputMode(mode);
+                g_PcConfig.audioOutput = mode;
+                PcConfig_SaveKeyValue("audio_output", kSpk[mode]);
+                if (!live)
+                    cprintf("saved; this OpenAL build can't switch live - restart the game");
+            }
+        }
+        cprintf("speaker layout: %s active (requested %s)%s", kSpkUi[PsyX_SPUAL_GetOutputMode()],
+                kSpkUi[g_PcConfig.audioOutput],
+                PsyX_SPUAL_GetSurroundActive() ? " [surround routing ON]" : "");
+    } else if (strcmp(cmd, "MINIMAPNOMAP") == 0) {
+        /* Config-only minimap_show_without_map: with minimap_require_map on,
+         * 1 draws an empty panel with Harry's arrow before the area map is
+         * found (the old behaviour), 0 hides the minimap. Bare toggles.
+         * Persists to config.cfg. */
+        if (arg[0] == '0' || arg[0] == '1')
+            g_PcConfig.minimapShowWithoutMap = (arg[0] == '1');
+        else
+            g_PcConfig.minimapShowWithoutMap = !g_PcConfig.minimapShowWithoutMap;
+        PcConfig_SaveKeyValue("minimap_show_without_map",
+                              g_PcConfig.minimapShowWithoutMap ? "1" : "0");
+        cprintf("minimap before the map is found: %s",
+                g_PcConfig.minimapShowWithoutMap ? "empty panel + arrow" : "hidden");
+    } else if (strcmp(cmd, "DREAMBLUR") == 0) {
+        /* The dream/ghosting screen blur (Lisa, after Split Head, the
+         * otherworld rooms): full-screen prims sampling the previous frame out
+         * of the PSX display buffers. 0 leaves only the loading-screen trail,
+         * which uses the same store and has always been on. Bare toggles.
+         * Persists to config.cfg. */
+        {
+            extern int g_cfg_dreamFeedback;
+
+            if (arg[0] == '0' || arg[0] == '1')
+                g_PcConfig.dreamBlur = (arg[0] == '1');
+            else
+                g_PcConfig.dreamBlur = !g_PcConfig.dreamBlur;
+
+            g_cfg_dreamFeedback = g_PcConfig.dreamBlur;
+            PcConfig_SaveKeyValue("dream_blur", g_PcConfig.dreamBlur ? "1" : "0");
+            cprintf("dream screen blur: %s", g_PcConfig.dreamBlur ? "on" : "off");
+        }
+    } else if (strcmp(cmd, "FOV") == 0) {
+        /* First-person FOV (degrees, horizontal on the 4:3 frame). Same value
+         * as the launcher slider / PC options row; persists to config.cfg.
+         * `fov default` restores the game's native projection (71.1 = H 224). */
+        if (arg[0] != '\0') {
+            float v;
+            if (strcmp(arg, "DEFAULT") == 0 || strcmp(arg, "default") == 0)
+                v = 71.1f;
+            else
+                v = (float)atof(arg);
+            if (v < 55.0f)  v = 55.0f;
+            if (v > 110.0f) v = 110.0f;
+            g_PcConfig.fpsFov = v;
+            {
+                char buf[16];
+                snprintf(buf, sizeof(buf), "%.1f", v);
+                PcConfig_SaveKeyValue("fps_fov", buf);
+            }
+        }
+        cprintf("first-person FOV %.1f deg (71.1 = original; applies in FPS gameplay only)",
+                g_PcConfig.fpsFov);
+    } else if (strcmp(cmd, "TPSFOV") == 0) {
+        /* Thirdperson / Over-the-Shoulder FOV. Same value as the launcher slider;
+         * persists to config.cfg. The Classic cameras are never affected. */
+        if (arg[0] != '\0') {
+            float v;
+            if (strcmp(arg, "DEFAULT") == 0 || strcmp(arg, "default") == 0)
+                v = 71.1f;
+            else
+                v = (float)atof(arg);
+            if (v < 55.0f)  v = 55.0f;
+            if (v > 110.0f) v = 110.0f;
+            g_PcConfig.tpsFov = v;
+            {
+                char buf[16];
+                snprintf(buf, sizeof(buf), "%.1f", v);
+                PcConfig_SaveKeyValue("tps_fov", buf);
+            }
+        }
+        cprintf("thirdperson FOV %.1f deg (71.1 = the game's own FOV; applies in TPS/OTS gameplay only)",
+                g_PcConfig.tpsFov);
+    } else if (strcmp(cmd, "TPSAIMZOOM") == 0) {
+        /* How far the TPS/OTS camera dollies in while aiming, 0-200% of the zoom
+         * range. 100 (default) = the old full zoom, 200 = a deeper 2x zoom, 0 =
+         * no zoom (what the old tps_aim_zoom = 0 checkbox did). */
+        if (arg[0] != '\0') {
+            float v = (float)atof(arg);
+            if (v < 0.0f)   v = 0.0f;
+            if (v > 200.0f) v = 200.0f;
+            g_PcConfig.tpsAimZoom = v;
+            {
+                char buf[16];
+                snprintf(buf, sizeof(buf), "%.0f", v);
+                PcConfig_SaveKeyValue("tps_aim_zoom_amount", buf);
+            }
+        }
+        cprintf("TPS/OTS aim zoom %.0f%% (100 = original full zoom, 200 = 2x zoom, 0 = none)",
+                g_PcConfig.tpsAimZoom);
+    } else if (strcmp(cmd, "TPSOTSAIM") == 0) {
+        int on = (arg[0] == '1') ? 1 : (arg[0] == '0') ? 0 : !g_PcConfig.tpsOtsAim;
+        g_PcConfig.tpsOtsAim = on;
+        PcConfig_SaveKeyValue("tps_ots_aim", on ? "1" : "0");
+        cprintf("OTS aiming in thirdperson %s (default on; camera eases over the shoulder while aiming)",
+                on ? "ON" : "OFF");
+    } else if (strcmp(cmd, "CAMCOLLIDE") == 0) {
+        int on = (arg[0] == '1') ? 1 : (arg[0] == '0') ? 0 : !g_PcConfig.tpsCameraCollision;
+        g_PcConfig.tpsCameraCollision = on;
+        PcConfig_SaveKeyValue("tps_camera_collision", on ? "1" : "0");
+        cprintf("thirdperson camera collision %s (off = the camera may pass through walls)",
+                on ? "ON" : "OFF");
+    } else if (strcmp(cmd, "REVSCALE") == 0) {
+        extern void  PsyX_SPUAL_SetReverbDepthScale(float scale);
+        extern float PsyX_SPUAL_GetReverbDepthScale(void);
+        if (arg[0] != '\0') {
+            float s = (float)atof(arg);
+            if (s < 0.0f) s = 0.0f;
+            if (s > 8.0f) s = 8.0f;
+            PsyX_SPUAL_SetReverbDepthScale(s);
+        }
+        cprintf("reverb depth->wet scale %.2f (persist via config reverb_scale)",
+                PsyX_SPUAL_GetReverbDepthScale());
+    } else if (strcmp(cmd, "KF") == 0 || strcmp(cmd, "KEYFRAME") == 0) {
+        extern int g_DebugAnimKfView;
+        extern int g_DebugAnimKf;
+        extern int g_DebugAnimKfMax;
+        int maxKf = g_DebugAnimKfMax > 0 ? g_DebugAnimKfMax - 1 : 0;
+        if (arg[0] != '\0') {
+            int v = atoi(arg);
+            if (v < 0) v = 0;
+            g_DebugAnimKf     = v;
+            g_DebugAnimKfView = 1; /* setting a frame implies viewing it */
+            cprintf("keyframe %d (max %d) - K toggles, , . step", g_DebugAnimKf, maxKf);
+        } else {
+            cprintf("keyframe %d / %d (view %s)", g_DebugAnimKf, maxKf,
+                    g_DebugAnimKfView ? "ON" : "OFF");
+        }
+    } else if (strcmp(cmd, "PLAYAS") == 0) {
+        extern int         Pc_PlayAs_SetByName(const char* name, int save);
+        extern int         Pc_PlayAs_Current(void);
+        extern const char* Pc_PlayAs_Label(int idx);
+        if (arg[0] != '\0') {
+            if (Pc_PlayAs_SetByName(arg, 1)) {
+                cprintf("playing as %s", Pc_PlayAs_Label(Pc_PlayAs_Current()));
+            } else {
+                extern int         Pc_PlayAs_Count(void);
+                extern const char* Pc_PlayAs_Name(int idx);
+                int _i;
+                cprintf("unknown character. playas <name>:");
+                for (_i = 0; _i < Pc_PlayAs_Count(); _i += 4) {
+                    char _line[80];
+                    int  _j, _n = 0;
+                    _line[0] = '\0';
+                    for (_j = _i; _j < _i + 4 && _j < Pc_PlayAs_Count(); _j++)
+                        _n += snprintf(_line + _n, sizeof(_line) - _n, "%s%s",
+                                       _n ? " " : "  ", Pc_PlayAs_Name(_j));
+                    cprintf("%s", _line);
+                }
+            }
+        } else {
+            cprintf("playing as %s (playas <name> to change)", Pc_PlayAs_Label(Pc_PlayAs_Current()));
+        }
+    } else if (strcmp(cmd, "FLINTENSITY") == 0 || strcmp(cmd, "FLINT") == 0) {
+        extern float g_PsyX_FlashlightIntensity, g_PsyX_FlashlightIntensityFps;
+        extern int   g_PcFpsCam;
+        /* Tune the active set: FPS mode has its own flashlight brightness. */
+        float* pv = g_PcFpsCam ? &g_PsyX_FlashlightIntensityFps : &g_PsyX_FlashlightIntensity;
+        const char* pkey = g_PcFpsCam ? "flashlight_intensity_fps" : "flashlight_intensity";
+        if (arg[0] != '\0') {
+            char buf[16];
+            float v = (float)atof(arg);
+            if (v < 0.0f) v = 0.0f;
+            if (v > 3.0f) v = 3.0f;
+            *pv = v;
+            snprintf(buf, sizeof(buf), "%.2f", v);
+            PcConfig_SaveKeyValue(pkey, buf);
+        }
+        cprintf("flashlight intensity%s: %.2f (0..3)", g_PcFpsCam ? " (fps)" : "", *pv);
+    } else if (strcmp(cmd, "POSTINTENSITY") == 0 || strcmp(cmd, "POSTINT") == 0) {
+        extern float g_cfg_postProcessIntensity;
+        if (arg[0] != '\0') {
+            char buf[16];
+            float v = (float)atof(arg);
+            if (v < 0.0f) v = 0.0f;
+            if (v > 1.0f) v = 1.0f;
+            g_cfg_postProcessIntensity = v;
+            snprintf(buf, sizeof(buf), "%.2f", v);
+            PcConfig_SaveKeyValue("post_process_intensity", buf);
+        }
+        cprintf("post-process intensity: %.2f (0..1)", g_cfg_postProcessIntensity);
+    } else if (strcmp(cmd, "TMINTENSITY") == 0 || strcmp(cmd, "TMINT") == 0) {
+        extern float g_cfg_tonemapIntensity;
+        if (arg[0] != '\0') {
+            char buf[16];
+            float v = (float)atof(arg);
+            if (v < 0.0f) v = 0.0f;
+            if (v > 1.0f) v = 1.0f;
+            g_cfg_tonemapIntensity = v;
+            snprintf(buf, sizeof(buf), "%.2f", v);
+            PcConfig_SaveKeyValue("tonemap_intensity", buf);
+        }
+        cprintf("tonemap intensity: %.2f (0..1)", g_cfg_tonemapIntensity);
+    } else if (strcmp(cmd, "XAVOLUME") == 0 || strcmp(cmd, "XAVOL") == 0) {
+        extern float g_PcXaVolume;
+        if (arg[0] != '\0') {
+            float pct = (float)atof(arg);
+            if (pct < 0.0f)   pct = 0.0f;
+            if (pct > 100.0f) pct = 100.0f;
+            PcConfig_ApplyXaVolume(pct / 100.0f);
+        }
+        cprintf("xa (fmv/voice) volume: %.0f%% (0..100)", g_PcXaVolume * 100.0f);
+    } else if (Pc_ModConsole_Dispatch(cmd, arg)) {
+        /* handled by a mod-registered command */
+    } else {
+        DbgOverlay_PushLine("Command not found!");
+    }
+}
+
+/* Exported for mod command handlers (pc_mod_registry.h). */
+void Pc_Console_Print(const char* text)
+{
+    if (text) DbgOverlay_PushLine(text);
+}

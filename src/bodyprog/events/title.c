@@ -1,0 +1,1275 @@
+#include "game.h"
+#ifdef SH_PC_PORT
+#include "sh_log.h"
+#include <stdio.h>
+#include <stdlib.h> /* exit() for the port's main-menu Exit row */
+#include "psx_memory.h"
+#include "pc_config.h"
+#include "map_registry.h"
+#include "lang_text.h" /* menu translations + width for recentred entries */
+#include "main/fileinfo.h" /* g_GameRegion: PAL repositions the achievements hint */
+#endif
+
+#include <psyq/libetc.h>
+#include <psyq/libpad.h>
+#include <psyq/strings.h>
+
+#include "bodyprog/bodyprog.h"
+#include "bodyprog/game_boot/game_boot.h"
+#include "bodyprog/memcard.h"
+#include "bodyprog/screen/screen_data.h"
+#include "bodyprog/screen/screen_draw.h"
+#include "bodyprog/text/text_draw.h"
+#include "bodyprog/math/math.h"
+#include "bodyprog/sound/sound_system.h"
+#include "main/fsqueue.h"
+
+/* Each of these is called earlier in this file than it is defined. Without a
+ * prototype the call creates an implicit `int f()` declaration that then
+ * conflicts with the real definition -- GCC tolerates that, Clang (the Android
+ * NDK compiler) rejects it. */
+void func_8003B560(void);
+void MainMenu_FogUpdate(void);
+
+#ifdef SH_PC_PORT
+/* Forward declarations for static functions used before definition */
+static void MainMenu_MainTextDraw(void);
+static void MainMenu_AchievementHintDraw(void);
+static void MainMenu_DifficultyTextDraw(s32 idx);
+static void MainMenu_BackgroundDraw(void);
+static void func_8003BCF4(void);
+#endif
+#include "main/rng.h"
+#include "screens/stream/stream.h"
+
+/* Called above their definitions. Without a prototype in scope Clang
+ * synthesises `int f()` at the call site and then rejects the real
+ * definition as a conflicting type; GCC only warns. */
+void func_8003B560(void);
+
+void MainMenu_FogUpdate(void);
+
+#define MAIN_MENU_FOG_COUNT 21
+
+#ifndef PAD_HACK_IGNORE
+    const s32 pad_rodata_8002547C = 0;
+#endif
+
+// ========================================
+// STATIC VARIABLES
+// ========================================
+
+static s32 g_MainMenuState              = 0;
+static s32 g_MainMenu_SelectedEntry     = MainMenuEntry_Start;
+#ifdef SH_PC_PORT
+/* The port adds an Exit row, always available alongside Option. */
+#define MAINMENU_BASE_ENTRY_FLAGS ((1 << MainMenuEntry_Start) | (1 << MainMenuEntry_Option) | (1 << MainMenuEntry_Exit))
+#else
+#define MAINMENU_BASE_ENTRY_FLAGS ((1 << MainMenuEntry_Start) | (1 << MainMenuEntry_Option))
+#endif
+
+static u32 g_MainMenu_VisibleEntryFlags = MAINMENU_BASE_ENTRY_FLAGS;
+
+// ========================================
+// GLOBAL VARIABLES
+// ========================================
+
+s8  g_Demo_ReproducedCount = 0;
+s8* D_800BCDE0;
+
+// ========================================
+// CORE
+// ========================================
+
+void GameState_MainMenu_Update(void) // 0x8003AB28
+{
+#ifdef SH_PC_PORT
+    /* The old "auto-start" block that lived here ran the entire boot pipeline
+     * (savegame init, map DLL load, STREAM.BIN load, FS wait, memcard disable)
+     * on the first menu frame for any non-map0_s00 config — but never switched
+     * g_GameWork.gameState, so the menu kept displaying over a half-booted
+     * map. Mostly invisible because New Game re-initializes everything, but
+     * maps whose load path differs (map4_s00) crashed at the menu. The config
+     * map must have NO effect until New Game selects it (title.c New Game
+     * path below). */
+#endif
+    #define MAIN_MENU_GAME_STATE_COUNT 5
+
+    s32 NEXT_GAME_STATES[MAIN_MENU_GAME_STATE_COUNT] =
+    {
+        GameState_LoadSavegameScreen,
+        GameState_AutoLoadSavegame,
+        GameState_MovieOpening,
+        GameState_OptionScreen,
+        GameState_MovieIntro
+    };
+
+    bool        playInGameDemo;
+    s32         prevGameDifficultyIdx;
+    s32         nextGameDifficultyIdx;
+    e_GameState prevState;
+    static s32  newGameSelectedDifficultyIdx = 1;
+    static s32  prevSavegameCount            = 0;
+#ifdef SH_PC_PORT
+    extern int  Pc_RaBrowser_IsOpen(void);
+    bool        browserOpen                  = false;
+#endif
+#ifdef SH_PC_PORT
+    /* skip_intros=2 drives the stock New Game path rather than duplicating it:
+     * arm on the first menu frame, synthesise START, then NORMAL, then retarget
+     * the hand-off past the opening movie. Consumed at hand-off so a later warm
+     * boot back to the title behaves normally. */
+    static s32  skipToGameStep = 0;
+
+    if (skipToGameStep == 0 && g_PcConfig.skipIntros >= 2)
+    {
+        skipToGameStep = 1;
+    }
+#endif
+
+    func_80033548();
+
+    // After staying idle in the title screen for some time, this checks if the intro FMV or a
+    // demo gameplay segment should be played. If the next value from `g_Demo_ReproducedCount`
+    // is a value divisible by 3, the intro FMV will play. Otherwise, it defaults to a gameplay demo.
+#ifdef SH_PC_PORT
+    /* The whole demo pipeline is wired on PC -- Demo_ControllerDataUpdate is
+     * already spliced between Joy_ReadP1 and Joy_ControllerDataUpdate
+     * (game_main.c), the PSX vblank-derived dt is used instead of the port's
+     * wall-clock one while SysFlag_DemoActive is set (game_main.c), and
+     * PsyCross reports idle pads as 0xFFFF so the any-button exit works. Left
+     * off historically because it had never been exercised; config-gated so it
+     * can be turned off without a rebuild. */
+    /* Read before playInGameDemo so the achievement panel suppresses the whole
+     * attract pipeline: reflects last frame's state, which is enough because the
+     * idle counter is also pinned below. */
+    browserOpen = Pc_RaBrowser_IsOpen();
+
+    /* Neither the gameplay demo nor the intro FMV may take the screen while the
+     * achievement panel is up -- the player is reading, not idle. */
+    playInGameDemo = g_PcConfig.attractDemos && !browserOpen &&
+                     (((g_Demo_ReproducedCount + 1) % 3) != 0);
+#else
+    playInGameDemo = ((g_Demo_ReproducedCount + 1) % 3) != 0;
+#endif
+
+    if (g_GameWork.gameStateSteps[0] == 0)
+    {
+        g_MainMenuState = 0;
+
+        if (playInGameDemo)
+        {
+            g_SysWork.processFlags = ProcessFlag_BootDemo;
+        }
+        else
+        {
+            g_GameWork.gameStateSteps[0] = 1;
+        }
+    }
+
+    switch (g_MainMenuState)
+    {
+        case MenuState_Start:
+            g_GameWork.background2dColor.r = 0;
+            g_GameWork.background2dColor.g = 0;
+            g_GameWork.background2dColor.b = 0;
+            Screen_RectInterlacedClear(0, 32, SCREEN_WIDTH, FRAMEBUFFER_HEIGHT_INTERLACED, 0, 0, 0);
+            Screen_Init(SCREEN_WIDTH, true);
+
+            g_IntervalVBlanks    = 1;
+            ScreenFade_Start(true, true, false);
+            g_ScreenFadeTimestep = Q12(2.0f);
+            g_MainMenuState++;
+
+        case MenuState_Main:
+            if (playInGameDemo)
+            {
+                GameBoot_GameStartup();
+
+                if (g_GameWork.gameStateSteps[0] == 1 && g_SysWork.counters_1C[1] == 0)
+                {
+                    g_Demo_ReproducedCount++;
+                }
+
+                if (g_GameWork.gameState == GameState_MainLoadScreen)
+                {
+                    g_Demo_ReproducedCount++;
+                }
+            }
+
+            g_MainMenu_VisibleEntryFlags = MAINMENU_BASE_ENTRY_FLAGS;
+
+            if (g_GameWork.autosave.playerHealth > Q12(0.0f))
+            {
+                g_MainMenu_VisibleEntryFlags = (1 << MainMenuEntry_Continue) | MAINMENU_BASE_ENTRY_FLAGS;
+            }
+
+            // Memory card present and savegames exist.
+            if (g_MemCard_SavegameCount > 0)
+            {
+                g_MainMenu_VisibleEntryFlags |= (1 << MainMenuEntry_Load) | (1 << MainMenuEntry_Continue);
+
+                if (prevSavegameCount < g_MemCard_SavegameCount && g_MainMenu_SelectedEntry != MainMenuEntry_Load)
+                {
+                    g_MainMenu_SelectedEntry = MainMenuEntry_Continue;
+                }
+            }
+            // No savegames exist, but did previously (e.g. memory card removed before player death).
+            else if (prevSavegameCount > 0)
+            {
+                while(!(g_MainMenu_VisibleEntryFlags & (1 << g_MainMenu_SelectedEntry)))
+                {
+                    g_MainMenu_SelectedEntry++;
+                }
+            }
+
+            g_MainMenu_VisibleEntryFlags |= g_MainMenu_VisibleEntryFlags << MainMenuEntry_Count;
+
+            if (g_Controller0->pulsedBtnFlags & (ControllerFlag_LStickUp | ControllerFlag_LStickDown))
+            {
+                SD_Call(Sfx_MenuMove);
+                g_GameWork.gameState = GameState_MainMenu;
+
+                if (g_GameWork.gameStateSteps[0] != 1)
+                {
+                    g_GameWork.gameStateSteps[0] = 1;
+                    Fs_QueueReset();
+                }
+            }
+
+#ifdef SH_PC_PORT
+            /* Achievement browser: the Map button has no meaning on the title
+             * screen, so it opens the list here. While the panel is up it owns
+             * the pad -- the flags are cleared so the menu underneath does not
+             * also move its selection or start a game.
+             *
+             * Deliberately does NOT return: the menu's own drawing (background,
+             * entry text and the mouse cursor) lives past the end of this
+             * switch, and returning here left the whole screen black behind the
+             * panel with no cursor. Everything below reads the flags this just
+             * zeroed, so falling through is inert. */
+            {
+                extern void Pc_RaBrowser_Open(void);
+                extern int  Pc_RaBrowser_IsOpen(void);
+                extern void Pc_RaBrowser_Update(int closeRequested, int up, int down, int confirm);
+
+                if (Pc_RaBrowser_IsOpen())
+                {
+                    /* Resolved here, against the player's own bindings, so the
+                     * browser needs no knowledge of the controller config. */
+                    u16 closeBtns = g_GameWorkPtr->config.controllerConfig.cancel |
+                                    g_GameWorkPtr->config.controllerConfig.map;
+                    Pc_RaBrowser_Update(
+                        (g_Controller0->clickedBtnFlags & closeBtns) != 0,
+                        (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickUp) != 0,
+                        (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickDown) != 0,
+                        (g_Controller0->clickedBtnFlags &
+                         (g_GameWorkPtr->config.controllerConfig.enter |
+                          g_GameWorkPtr->config.controllerConfig.action)) != 0);
+                    browserOpen = true;
+                }
+                else if (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.map)
+                {
+                    Pc_RaBrowser_Open();
+                    browserOpen = true;
+                }
+#if defined(SH_IOS) || defined(__ANDROID__)
+                /* Tap the hint to open it. The zone is the bottom-left corner
+                 * rather than the text's own rectangle: the string layer works
+                 * in its own coordinate space (Gfx_StringSetPosition subtracts
+                 * a 50%/47% origin and the title screen's Y runs past the 240
+                 * the touch overlay uses), so reconstructing the glyph bounds
+                 * here would be a guess dressed up as a measurement.
+                 *
+                 * Being larger than the words is the right error anyway -- it is
+                 * a fingertip target, and nothing else on the title screen lives
+                 * in this corner. The menu column is centred. */
+                else if (g_PcConfig.retroAchievements)
+                {
+                    extern int Pc_MouseCursor_LeftClicked(void);
+                    extern int Pc_MouseCursor_ViewportPos(float*, float*);
+
+                    float tapX = 0.0f, tapY = 0.0f;
+
+                    if (Pc_MouseCursor_LeftClicked() &&
+                        Pc_MouseCursor_ViewportPos(&tapX, &tapY) &&
+                        tapX < 0.34f && tapY > 0.80f)
+                    {
+                        Pc_RaBrowser_Open();
+                        browserOpen = true;
+                    }
+                }
+#endif
+                if (browserOpen)
+                {
+                    /* Clear the DERIVED per-frame events only.
+                     *
+                     * heldBtnFlags must NOT be cleared: Joy_ControllerDataUpdate
+                     * keeps last frame's value as prevBtnsHeld and derives
+                     * clicked = ~prev & held from it. Zeroing it made every
+                     * frame look like a fresh press, so a held button "clicked"
+                     * continuously (Enter flickering a detail card open and
+                     * shut) and pulseTicks reset every frame, which pinned
+                     * pulsed to clicked and raced the list past at frame rate. */
+                    g_Controller0->clickedBtnFlags   = 0;
+                    g_Controller0->pulsedBtnFlags    = 0;
+                    g_Controller0->releasedBtnFlags  = 0;
+                    g_Controller0->pulsedGuiBtnFlags = 0;
+                }
+            }
+#endif
+
+            if (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickUp)
+            {
+                g_MainMenu_SelectedEntry += MainMenuEntry_Count;
+                while(!(g_MainMenu_VisibleEntryFlags & (1 << --g_MainMenu_SelectedEntry)));
+            }
+
+            if (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickDown)
+            {
+                while(!(g_MainMenu_VisibleEntryFlags & (1 << ++g_MainMenu_SelectedEntry)));
+            }
+
+            // Wrap selection.
+            g_MainMenu_SelectedEntry %= MainMenuEntry_Count;
+
+#ifdef SH_PC_PORT
+            /* Mouse: hover a visible row to select it, left-click to confirm.
+             * Suppressed while the achievement panel is up — it reads the mouse
+             * directly, and this block would otherwise keep re-selecting menu
+             * rows (and synthesising Enter) under the panel. */
+            if (!browserOpen)
+            {
+                extern int Pc_MouseCursor_MenuRowHover(int, int, int, unsigned int, int*);
+                extern int Pc_MouseCursor_Moved(void);
+                int mcClicked = 0;
+                int mcRow     = Pc_MouseCursor_MenuRowHover(184, 20, MainMenuEntry_Count,
+                                                            g_MainMenu_VisibleEntryFlags, &mcClicked);
+                if (mcRow >= 0)
+                {
+                    if (mcClicked)
+                    {
+                        g_MainMenu_SelectedEntry = mcRow;
+                        g_Controller0->clickedBtnFlags |= g_GameWorkPtr->config.controllerConfig.enter;
+                    }
+                    else if (Pc_MouseCursor_Moved() && (s32)g_MainMenu_SelectedEntry != mcRow)
+                    {
+                        g_MainMenu_SelectedEntry = mcRow;
+                        SD_Call(Sfx_MenuMove);
+                    }
+                }
+            }
+#endif
+
+#ifdef SH_PC_PORT
+            if (skipToGameStep == 1)
+            {
+                g_MainMenu_SelectedEntry        = MainMenuEntry_Start;
+                g_Controller0->clickedBtnFlags |= g_GameWorkPtr->config.controllerConfig.enter;
+                skipToGameStep                  = 2;
+            }
+#endif
+
+            if (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.enter)
+            {
+                g_GameWork.gameState = GameState_MainMenu;
+
+                if (g_GameWork.gameStateSteps[0] != 1)
+                {
+                    g_GameWork.gameStateSteps[0] = 1;
+                    Fs_QueueReset();
+                }
+
+                ScreenFade_Start(true, false, false);
+                g_MainMenuState++;
+
+                if (g_MainMenu_SelectedEntry < (u32)MainMenuEntry_Start) // TODO: Odd cast.
+                {
+                    SD_Call(Sfx_MenuStartGame);
+                }
+                else
+                {
+                    SD_Call(Sfx_MenuConfirm);
+                }
+
+                switch (g_MainMenu_SelectedEntry)
+                {
+                    case MainMenuEntry_Continue:
+                        if (g_GameWork.autosave.playerHealth > Q12(0.0f))
+                        {
+                            g_GameWork.savegame = g_GameWork.autosave;
+                        }
+                        else
+                        {
+                            GameFs_SaveLoadBinLoad();
+                        }
+
+                        GameBoot_PlayerInit();
+                        g_SysWork.processFlags = ProcessFlag_Continue;
+                        GameBoot_MapLoad(g_SavegamePtr->mapIdx);
+                        break;
+
+                    case MainMenuEntry_Load:
+                        GameFs_SaveLoadBinLoad();
+                        break;
+
+                    case MainMenuEntry_Start:
+                        ScreenFade_Reset();
+                        g_MainMenuState = MenuState_DifficultySelector;
+                        break;
+
+                    case MainMenuEntry_Option:
+                        GameFs_OptionBinLoad();
+                        break;
+
+#ifdef SH_PC_PORT
+                    /* Retail leaves this slot dead (never made visible, empty
+                     * handler). The port shows it as Exit and quits here, the
+                     * same way the console QUIT command and the debug overlay
+                     * close the game — exit() runs the registered teardown. */
+                    case MainMenuEntry_Exit:
+                        SH_DBG("[MENU] Exit selected — closing game");
+                        if (g_ShDebugLog)
+                            fflush(g_ShDebugLog);
+                        exit(0);
+                        break;
+#else
+                    case MainMenuEntry_Extra: // @unused See `e_MainMenuEntry`.
+                        break;
+#endif
+                }
+            }
+
+            prevSavegameCount = g_MemCard_SavegameCount;
+
+        default:
+            break;
+
+        case MenuState_DifficultySelector:
+            if (playInGameDemo)
+            {
+                GameBoot_GameStartup();
+
+                if (g_GameWork.gameStateSteps[0] == 1 && g_SysWork.counters_1C[1] == 0)
+                {
+                    g_Demo_ReproducedCount++;
+                }
+
+                if (g_GameWork.gameState == GameState_MainLoadScreen)
+                {
+                    g_Demo_ReproducedCount++;
+                }
+            }
+
+#ifdef SH_PC_PORT
+            /* Mouse: hover EASY/NORMAL/HARD to select, left-click to confirm.
+             * Injected before the input handling below so a click behaves like a
+             * real Cross press (rows at y = 204 + i*20; see MainMenu_DifficultyTextDraw). */
+            {
+                extern int Pc_MouseCursor_MenuRowHover(int, int, int, unsigned int, int*);
+                extern int Pc_MouseCursor_Moved(void);
+                extern int Pc_MouseCursor_RightClicked(void);
+                int mcClicked = 0;
+                int mcRow     = Pc_MouseCursor_MenuRowHover(204, 20, 3, ~0u, &mcClicked);
+                if (mcRow >= 0)
+                {
+                    if (mcClicked)
+                    {
+                        newGameSelectedDifficultyIdx = mcRow;
+                        g_Controller0->clickedBtnFlags |= g_GameWorkPtr->config.controllerConfig.enter;
+                    }
+                    else if (Pc_MouseCursor_Moved() && newGameSelectedDifficultyIdx != mcRow)
+                    {
+                        newGameSelectedDifficultyIdx = mcRow;
+                        SD_Call(Sfx_MenuMove);
+                    }
+                }
+                else if (Pc_MouseCursor_LeftClicked())
+                {
+                    /* A click that lands on no row backs out. Cancel already had
+                     * a mouse route (right-click), but touch has no second
+                     * button -- so on a touchscreen this screen could only be
+                     * left by starting a game. Empty space is free here: the
+                     * three rows above are the only thing a tap can hit. */
+                    g_Controller0->clickedBtnFlags |= g_GameWorkPtr->config.controllerConfig.cancel;
+                }
+                if (Pc_MouseCursor_RightClicked())
+                {
+                    g_Controller0->clickedBtnFlags |= g_GameWorkPtr->config.controllerConfig.cancel;
+                }
+            }
+#endif
+
+            if (g_Controller0->pulsedBtnFlags & (ControllerFlag_LStickUp | ControllerFlag_LStickDown) ||
+                g_Controller0->clickedBtnFlags & (g_GameWorkPtr->config.controllerConfig.enter |
+                                                 g_GameWorkPtr->config.controllerConfig.cancel))
+            {
+                g_GameWork.gameState = GameState_MainMenu;
+
+                if (g_GameWork.gameStateSteps[0] != 1)
+                {
+                    g_GameWork.gameStateSteps[0] = 1;
+                    Fs_QueueReset();
+                }
+            }
+
+            // Scroll game difficulty options.
+            if (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickUp)
+            {
+                prevGameDifficultyIdx = 2;
+                if (newGameSelectedDifficultyIdx > 0)
+                {
+                    prevGameDifficultyIdx = newGameSelectedDifficultyIdx - 1;
+                }
+                newGameSelectedDifficultyIdx = prevGameDifficultyIdx;
+            }
+            if (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickDown)
+            {
+                nextGameDifficultyIdx = 0;
+                if (newGameSelectedDifficultyIdx < 2)
+                {
+                    nextGameDifficultyIdx = newGameSelectedDifficultyIdx + 1;
+                }
+                newGameSelectedDifficultyIdx = nextGameDifficultyIdx;
+            }
+
+            // Play scroll sound.
+            if (g_Controller0->pulsedBtnFlags & (ControllerFlag_LStickUp | ControllerFlag_LStickDown))
+            {
+                SD_Call(Sfx_MenuMove);
+            }
+
+            // Select game difficulty.
+#ifdef SH_PC_PORT
+            /* After the scroll/mouse handling above, so a stray cursor hover
+             * cannot override NORMAL on the frame the confirm is synthesised. */
+            if (skipToGameStep == 2)
+            {
+                newGameSelectedDifficultyIdx    = 1;
+                g_Controller0->clickedBtnFlags |= g_GameWorkPtr->config.controllerConfig.enter;
+                skipToGameStep                  = 3;
+            }
+#endif
+            if (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.enter)
+            {
+
+#ifdef SH_PC_PORT
+                {
+                    int mapId = MapRegistry_FindByName(g_PcConfig.mapName);
+                    if (mapId < 0) mapId = 0;
+                    GameBoot_SavegameInitialize(mapId, newGameSelectedDifficultyIdx - 1);
+
+                    /* Randomizer: start the run here, after the savegame wipe and
+                     * before GameBoot_MapLoad, so its per-map hook sees a live run
+                     * on the very first area. No-op unless the mode is enabled. */
+                    {
+                        extern void Pc_Rando_OnNewGame(void);
+                        Pc_Rando_OnNewGame();
+                    }
+
+                    /* Gameplay plugins: same timing rationale as the randomizer
+                     * hook above. No-op with zero plugins loaded. */
+                    {
+                        extern void Pc_Plugins_OnNewGame(void);
+                        Pc_Plugins_OnNewGame();
+                    }
+                }
+#else
+                GameBoot_SavegameInitialize(0, newGameSelectedDifficultyIdx - 1);
+#endif
+                GameBoot_PlayerInit();
+
+                g_SysWork.processFlags = ProcessFlag_NewGame;
+
+
+#ifdef SH_PC_PORT
+                GameBoot_MapLoad(g_SavegamePtr->mapIdx);
+                /* Re-apply console-set flags (setending/setflag) wiped by the
+                 * savegame init above, so they persist into a New Game boot to a
+                 * config-selected map (e.g. ending testing). No-op unless the
+                 * console set any. */
+                {
+                    extern void Pc_ConsoleApplyPendingFlags(void);
+                    Pc_ConsoleApplyPendingFlags();
+                }
+#else
+                GameBoot_MapLoad(MapOverlayId_MAP0_S00);
+#endif
+                GameFs_StreamBinLoad();
+                SD_Call(Sfx_MenuStartGame);
+                ScreenFade_Start(true, false, false);
+                g_MainMenuState     = 4;
+            }
+            // Cancel.
+            else if (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.cancel)
+            {
+                SD_Call(Sfx_MenuCancel);
+                g_MainMenuState = 1;
+            }
+            break;
+
+        case MenuState_LoadGame:
+        case MenuState_NewGameStart:
+            if (ScreenFade_IsFinished())
+            {
+                Screen_Refresh(SCREEN_WIDTH, 0);
+                Fs_QueueWaitForEmpty();
+
+                if (g_GameWork.autosave.playerHealth > Q12(0.0f))
+                {
+                    NEXT_GAME_STATES[1] = GameState_MainLoadScreen;
+                }
+
+                if (g_MainMenu_SelectedEntry == MainMenuEntry_Start)
+                {
+                    Chara_PositionSet(&g_MapOverlayHdr.mapPoints[0]);
+                }
+
+#ifdef SH_PC_PORT
+                /* GameState_MovieOpening only plays the opening movie and then
+                 * hands off to GameState_MainLoadScreen, so retargeting drops the
+                 * movie and nothing else. NEXT_GAME_STATES is a plain local, so
+                 * this lasts one frame. */
+                if (skipToGameStep == 3)
+                {
+                    NEXT_GAME_STATES[MainMenuEntry_Start] = GameState_MainLoadScreen;
+                    skipToGameStep                        = 4;
+                }
+#endif
+
+                MemCard_SysDisable();
+
+                prevState                       = g_GameWork.gameState;
+                g_GameWork.gameStateSteps[0] = prevState;
+                g_GameWork.gameState        = NEXT_GAME_STATES[g_MainMenu_SelectedEntry];
+                g_SysWork.counters_1C[0]        = 0;
+                g_GameWork.gameStatePrev    = prevState;
+                g_GameWork.gameStateSteps[0] = 0;
+                g_SysWork.counters_1C[1]        = 0;
+                g_GameWork.gameStateSteps[1] = 0;
+                g_GameWork.gameStateSteps[2] = 0;
+                SysWork_StateSetNext(SysState_Gameplay);
+            }
+            break;
+    }
+
+    if (g_Controller0->heldBtnFlags != 0)
+    {
+        g_SysWork.counters_1C[1] = 0;
+    }
+
+#ifdef SH_PC_PORT
+    /* Hold the idle timer at zero while the panel is up. Scrolling a list is not
+     * idling, and at 1740 this loads STREAM.BIN and cuts to the intro movie. */
+    if (browserOpen)
+    {
+        g_SysWork.counters_1C[1] = 0;
+    }
+#endif
+
+    if (!playInGameDemo)
+    {
+        switch (g_GameWork.gameStateSteps[0])
+        {
+            case 1:
+                if (g_SysWork.counters_1C[1] > 1740)
+                {
+                    GameFs_StreamBinLoad();
+                    g_GameWork.gameStateSteps[0]++;
+                }
+                break;
+
+            case 2:
+                if (Fs_QueueGetLength() == 0)
+                {
+                    g_Demo_ReproducedCount++;
+
+                    g_GameWork.background2dColor.r = 0;
+                    g_GameWork.background2dColor.g = 0;
+                    g_GameWork.background2dColor.b = 0;
+
+                    Game_StateSetNext(GameState_MovieIntro);
+                }
+                break;
+        }
+    }
+
+    if (g_GameWork.gameState == GameState_MainMenu)
+    {
+#ifdef SH_PC_PORT
+        /* Skip-to-game passes through the menu for a couple of frames; drawing
+         * it would flash the title art before the fade into gameplay. Both calls
+         * below are draw-only (func_8003B560 is a nullsub), so nothing is lost. */
+        if (skipToGameStep != 0 && skipToGameStep < 4)
+        {
+            return;
+        }
+#endif
+
+        MainMenu_BackgroundDraw();
+        func_8003B560();
+
+        if (g_MainMenuState < 3)
+        {
+            MainMenu_MainTextDraw();
+#ifdef SH_PC_PORT
+            MainMenu_AchievementHintDraw();
+            /* The achievement panel draws its own pointer over the top, so the
+             * game's would just be a second cursor tracking the same mouse
+             * underneath it. */
+            if (!browserOpen)
+            { extern void Pc_MouseCursor_Draw(void); Pc_MouseCursor_Draw(); }
+#endif
+            return;
+        }
+
+        MainMenu_DifficultyTextDraw(newGameSelectedDifficultyIdx);
+#ifdef SH_PC_PORT
+        if (!browserOpen)
+        { extern void Pc_MouseCursor_Draw(void); Pc_MouseCursor_Draw(); }
+#endif
+        return;
+    }
+    else
+    {
+#ifdef SH_PC_PORT
+        {
+            RECT clearRect;
+            /* Original writes to PSX scratch: 0x200000 -> x=0,y=32; 0x01C00140 -> w=320,h=448 */
+            setRECT(&clearRect, 0, 32, 320, 448);
+            ClearImage2(&clearRect, 0u, 0u, 0u);
+        }
+#else
+        *(s32*)0x1F800000 = 0x200000;
+        *(s32*)0x1F800004 = 0x01C00140;
+        ClearImage2((RECT*)0x1F800000, 0u, 0u, 0u);
+#endif
+        Screen_Init(SCREEN_WIDTH, false);
+        return;
+    }
+
+    #undef MAIN_MENU_GAME_STATE_COUNT
+}
+
+void MainMenu_SelectedOptionIdxReset(void) // 0x8003B550
+{
+    g_MainMenu_SelectedEntry = MainMenuEntry_Continue;
+}
+
+void func_8003B560(void) {} // 0x8003B560
+
+#ifdef SH_PC_PORT
+/* Bottom-left hint naming the button that opens the achievement browser.
+ *
+ * Drawn through the game's own text system rather than a GL overlay, which buys
+ * three things: the game's glyphs, and a coordinate space that is already mapped
+ * into the picture area -- so pillarboxing and widescreen are handled by the
+ * same path every other menu string goes through, with nothing to get wrong
+ * here. */
+static void MainMenu_AchievementHintDraw(void)
+{
+    /* Authoring space on this screen runs y -112 (top) .. 336 (bottom), x 0 ..
+     * 320; the menu column sits at x158, y184..264.
+     *
+     * Y sits BELOW the copyright line baked into the title art, which lands
+     * around y286 -- drawing there put the hint straight through it. The band
+     * under it is empty, so this is the one clean strip left at the bottom.
+     *
+     * EUR's copyright comes from Pc_TitleLogoDrawEur's strips instead and lands
+     * at ~y306-318, straight through the US position. 320 is as low as the band
+     * allows -- the glyphs end at the y336 bottom edge. */
+    #define ACH_HINT_POS_X 18
+    #define ACH_HINT_POS_Y ((g_GameRegion == Region_EUR) ? 320 : 310)
+
+    extern const char* PcConfig_BindName(unsigned short, int, int, int);
+    extern int         Pc_ControllerAttached(void);
+
+    char        line[64];
+    char        bind[40];
+    const char* key;
+    const char* pad;
+    s32         i;
+    u16         mapBtn;
+
+    if (!g_PcConfig.retroAchievements)
+    {
+        return;
+    }
+
+    /* Whatever the player bound Map to -- the browser opens on that, so the
+     * hint has to read it rather than assume a key. Scheme 0 (classic): the
+     * title screen has no camera mode to disagree about. */
+#if defined(SH_IOS) || defined(__ANDROID__)
+    /* No bind prefix on a touch build. "[M] Achievements" names a key this
+     * device does not have, and the line is the label of something you tap --
+     * so it should read as one. Opened by the tap zone in
+     * GameState_MainMenu_Update, which covers this corner. */
+    (void)key; (void)pad; (void)bind; (void)i; (void)mapBtn;
+    Gfx_StringSetPosition(ACH_HINT_POS_X, ACH_HINT_POS_Y);
+    Gfx_StringDraw("Achievements", DEFAULT_MAP_MESSAGE_LENGTH);
+    return;
+#else
+    mapBtn = g_GameWorkPtr->config.controllerConfig.map;
+    key    = PcConfig_BindName(mapBtn, 0, 0, 0);
+    pad    = PcConfig_BindName(mapBtn, 1, 0, 0);
+
+    if (Pc_ControllerAttached() && pad[0] != '\0' && key[0] != '\0')
+    {
+        snprintf(bind, sizeof(bind), "%s/%s", key, pad);
+    }
+    else if (Pc_ControllerAttached() && pad[0] != '\0')
+    {
+        snprintf(bind, sizeof(bind), "%s", pad);
+    }
+    else if (key[0] != '\0')
+    {
+        snprintf(bind, sizeof(bind), "%s", key);
+    }
+    else
+    {
+        return; /* unbound — a hint naming no button helps nobody */
+    }
+
+    snprintf(line, sizeof(line), "[%s]_Achievements", bind);
+
+    /* The renderer prints '_' as a space, so a bind whose own name contains a
+     * real space ("Left Shift") has to be converted or the words run together. */
+    for (i = 0; line[i] != '\0'; i++)
+    {
+        if (line[i] == ' ')
+        {
+            line[i] = '_';
+        }
+    }
+
+    Gfx_StringSetPosition(ACH_HINT_POS_X, ACH_HINT_POS_Y);
+    Gfx_StringDraw(line, DEFAULT_MAP_MESSAGE_LENGTH);
+#endif
+}
+#endif
+
+static void MainMenu_MainTextDraw(void) // 0x8003B568
+{
+    #define COLUMN_POS_X 158
+    #define COLUMN_POS_Y 184
+    #define STR_OFFSET_Y 20
+
+    static const char* MAIN_MENU_ENTRY_STRINGS[] = {
+        "LOAD",
+        "CONTINUE",
+        "START",
+        "OPTION",
+#ifdef SH_PC_PORT
+        "EXIT" /* PC port: quits the game. Reuses the unused Extra slot. */
+#else
+        "EXTRA" /** @unused See `e_MainMenuEntry`. */
+#endif
+    };
+    static const u8 STR_OFFSETS_X[] = { 29, 50, 32, 39, 33 }; // @unused Element at index 4. See `g_MainMenu_VisibleEntryFlags`.
+
+    s32 i;
+
+    // Draw selection strings.
+    for (i = 0; i < MainMenuEntry_Count; i++)
+    {
+        // Check entry visibility flag.
+        if (!(g_MainMenu_VisibleEntryFlags & (1 << i)))
+        {
+            continue;
+        }
+
+#ifdef SH_PC_PORT
+        /* Translated entries have different widths — recentre from the
+         * actual string ('[' is 6px wide); untranslated keeps the constant. */
+        {
+            const char* tr   = Pc_LangMenuText(MAIN_MENU_ENTRY_STRINGS[i]);
+            /* STR_OFFSETS_X holds hand-measured centres for the retail rows, so
+             * keep using them when the text is untranslated. The port's Exit row
+             * has no authored offset (index 4's was for "EXTRA"), so centre it
+             * from the measured width in every language, English included. */
+            s32         offX = (tr == MAIN_MENU_ENTRY_STRINGS[i] && i != MainMenuEntry_Exit)
+                                   ? STR_OFFSETS_X[i]
+                                   : ((Pc_LangMenuTextWidth(tr) + 6) >> 1);
+            Gfx_StringSetPosition(COLUMN_POS_X - offX, COLUMN_POS_Y + (i * STR_OFFSET_Y));
+        }
+#else
+        Gfx_StringSetPosition(COLUMN_POS_X - STR_OFFSETS_X[i], COLUMN_POS_Y + (i * STR_OFFSET_Y));
+#endif
+        Gfx_StringSetColor(StringColorId_White);
+
+        if (i == g_MainMenu_SelectedEntry)
+        {
+            Gfx_StringDraw("[", DEFAULT_MAP_MESSAGE_LENGTH);
+        }
+        else
+        {
+            Gfx_StringDraw("_", DEFAULT_MAP_MESSAGE_LENGTH);
+        }
+
+        Gfx_StringDraw(MAIN_MENU_ENTRY_STRINGS[i], DEFAULT_MAP_MESSAGE_LENGTH);
+
+        if (i == g_MainMenu_SelectedEntry)
+        {
+            Gfx_StringDraw("]", DEFAULT_MAP_MESSAGE_LENGTH);
+        }
+
+        Gfx_StringDraw("\n", DEFAULT_MAP_MESSAGE_LENGTH);
+    }
+}
+
+static void MainMenu_DifficultyTextDraw(s32 idx) // 0x8003B678
+{
+    #define DIFFICULTY_MENU_SELECTION_COUNT 3
+    #define COLUMN_POS_X                    158
+    #define COLUMN_POS_Y                    204
+    #define STR_OFFSET_Y                    20
+
+    static const char* DIFFICULTY_MENU_ENTRY_STRINGS[] = {
+        "EASY",
+        "NORMAL",
+        "HARD"
+    };
+    static const u8 STR_OFFSETS_X[] = { 28, 43, 30 };
+
+    s32 i;
+
+    // Draw selection strings.
+    for (i = 0; i < DIFFICULTY_MENU_SELECTION_COUNT; i++)
+    {
+#ifdef SH_PC_PORT
+        {
+            const char* tr   = Pc_LangMenuText(DIFFICULTY_MENU_ENTRY_STRINGS[i]);
+            s32         offX = (tr == DIFFICULTY_MENU_ENTRY_STRINGS[i])
+                                   ? STR_OFFSETS_X[i]
+                                   : ((Pc_LangMenuTextWidth(tr) + 6) >> 1);
+            Gfx_StringSetPosition(COLUMN_POS_X - offX, COLUMN_POS_Y + (i * STR_OFFSET_Y));
+        }
+#else
+        Gfx_StringSetPosition(COLUMN_POS_X - STR_OFFSETS_X[i], COLUMN_POS_Y + (i * STR_OFFSET_Y));
+#endif
+        Gfx_StringSetColor(StringColorId_White);
+
+        if (i == idx)
+        {
+            Gfx_StringDraw("[", DEFAULT_MAP_MESSAGE_LENGTH);
+        }
+        else
+        {
+            Gfx_StringDraw("_", DEFAULT_MAP_MESSAGE_LENGTH);
+        }
+
+        Gfx_StringDraw(DIFFICULTY_MENU_ENTRY_STRINGS[i], DEFAULT_MAP_MESSAGE_LENGTH);
+
+        if (i == idx)
+        {
+            Gfx_StringDraw("]", DEFAULT_MAP_MESSAGE_LENGTH);
+        }
+
+        Gfx_StringDraw("\n", DEFAULT_MAP_MESSAGE_LENGTH);
+    }
+}
+
+#ifdef SH_PC_PORT
+#include "main/fileinfo.h"                    /* g_GameRegion */
+#include "bodyprog/screen/background_draw.h"  /* g_Screen_BackgroundImgGamma */
+
+/* PAL title compose, mirroring the retail SLES draw (decrypted EUR bodyprog
+ * 0x8003B0D0): the PAL TITLE_E.TIM is only a 4bpp 320x96 logo+copyright
+ * block, drawn as SPRT strips over the black clear with the shared fog on
+ * top — there is no full-screen title picture on the PAL disc. Strip layout
+ * is retail-exact (logo rows 0..79 at y=-120 in two 256+64 strips, split at
+ * the tpage boundary); the copyright band (rows 80..95) sits 32 lines above
+ * the bottom edge like retail (their 512-line space put it at y=224, our
+ * 448-line display puts it at y=192). Loaded at (896,0) via the EUR
+ * g_TitleImg desc patch in font_region.c. */
+static void Pc_TitleLogoDrawEur(void)
+{
+    extern s32 g_Pc2dBackgroundActive;
+
+    static const struct { s16 x, y; u8 u, v, tpageCol; s16 w, h; } STRIPS[4] = {
+        { -160, -120, 0, 0,  14, 256, 80 }, /* logo left */
+        {   96, -120, 0, 0,  15,  64, 80 }, /* logo right */
+        { -160,  192, 0, 80, 14, 256, 16 }, /* copyright left */
+        {   96,  192, 0, 80, 15,  64, 16 }, /* copyright right */
+    };
+
+    GsOT*     ot     = (GsOT*)&g_OtTags1[g_ActiveBufferIdx + 1][0];
+    PACKET*   packet = GsOUT_PACKET_P;
+    s32       i;
+
+    g_Pc2dBackgroundActive = 2; /* keep the black clear (no fog-color override) */
+
+    for (i = 0; i < 4; i++)
+    {
+        SPRT*     sprt = (SPRT*)packet;
+        DR_TPAGE* tPage;
+
+        addPrimFast(ot, sprt, 4);
+        setRGBC0(sprt, g_Screen_BackgroundImgGamma, g_Screen_BackgroundImgGamma,
+                 g_Screen_BackgroundImgGamma, PRIM_RECT | RECT_TEXTURE);
+        setWH(sprt, STRIPS[i].w, STRIPS[i].h);
+        setXY0Fast(sprt, STRIPS[i].x, STRIPS[i].y);
+        *((u32*)&sprt->u0) = STRIPS[i].u + (STRIPS[i].v << 8) +
+                             (getClut(g_TitleImg.clutX, g_TitleImg.clutY) << 16);
+
+        packet += sizeof(SPRT);
+        tPage   = (DR_TPAGE*)packet;
+        setDrawTPage(tPage, 0, 1, getTPage(0, 0, STRIPS[i].tpageCol << 6, 0));
+        AddPrim(ot, tPage);
+        packet += sizeof(DR_TPAGE);
+    }
+
+    GsOUT_PACKET_P              = packet;
+    g_SysWork.bgmStatusFlags   |= BgmStatusFlag_Pause;
+    g_Screen_BackgroundImgGamma = Q8(0.5f);
+}
+#endif
+
+static void MainMenu_BackgroundDraw(void) // 0x8003B758
+{
+    if (g_SysWork.sysState == SysState_Gameplay)
+    {
+        SysWork_StateSetNext(SysState_OptionsMenu);
+        func_8003BCF4();
+    }
+
+#ifdef SH_PC_PORT
+    if (g_GameRegion == Region_EUR)
+    {
+        Pc_TitleLogoDrawEur();
+    }
+    else
+#endif
+    Screen_BackgroundImgDraw(&g_TitleImg);
+    MainMenu_FogUpdate();
+}
+
+// ========================================
+// FOG
+// ========================================
+
+// Could this be an image or an embed texture instead?
+static u32 D_800A9AAC[256] = {
+    0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000,
+    0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000,
+    0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000,
+    0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000,
+    0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000,
+    0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000,
+    0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000,
+    0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000,
+    0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A000000, 0x3A010101,
+    0x3A020202, 0x3A040403, 0x3A050505, 0x3A070706, 0x3A080807, 0x3A0A0A09, 0x3A0C0B0A, 0x3A0D0D0B,
+    0x3A0F0E0D, 0x3A10100E, 0x3A12120F, 0x3A131311, 0x3A151512, 0x3A171613, 0x3A181815, 0x3A1A1916,
+    0x3A1B1B17, 0x3A1D1C19, 0x3A1E1E1A, 0x3A20201C, 0x3A22211D, 0x3A23231E, 0x3A252420, 0x3A262621,
+    0x3A282722, 0x3A292924, 0x3A2B2A25, 0x3A2D2C26, 0x3A2E2D28, 0x3A302F29, 0x3A31312A, 0x3A33322C,
+    0x3A34342D, 0x3A36352E, 0x3A383730, 0x3A393831, 0x3A3B3A32, 0x3A3C3B34, 0x3A3E3D35, 0x3A403F37,
+    0x3A413F37, 0x3A424038, 0x3A434139, 0x3A444139, 0x3A45423A, 0x3A46433B, 0x3A47443B, 0x3A48443C,
+    0x3A49453D, 0x3A4A463D, 0x3A4B463E, 0x3A4C473F, 0x3A4D483F, 0x3A4E4940, 0x3A504941, 0x3A514A42,
+    0x3A524B42, 0x3A534C43, 0x3A544C44, 0x3A554D44, 0x3A564E45, 0x3A574E46, 0x3A584F46, 0x3A595047,
+    0x3A5A5148, 0x3A5B5148, 0x3A5C5249, 0x3A5D534A, 0x3A5F544B, 0x3A60544C, 0x3A61554D, 0x3A62564D,
+    0x3A63574E, 0x3A64574F, 0x3A655850, 0x3A665950, 0x3A685951, 0x3A695A52, 0x3A6A5B53, 0x3A6B5C53,
+    0x3A6C5C54, 0x3A6D5D55, 0x3A6E5E56, 0x3A6F5E56, 0x3A705F57, 0x3A716058, 0x3A726059, 0x3A736159,
+    0x3A74625A, 0x3A75635B, 0x3A77635C, 0x3A78645C, 0x3A79655D, 0x3A7A655E, 0x3A7B665F, 0x3A7C675F,
+    0x3A7D6860, 0x3A7E6861, 0x3A7F6962, 0x3A806A62, 0x3A816A63, 0x3A826B64, 0x3A836C65, 0x3A856D66,
+    0x3A806D67, 0x3A806E68, 0x3A816F68, 0x3A827069, 0x3A83706A, 0x3A84716B, 0x3A85726C, 0x3A86736D,
+    0x3A87746E, 0x3A88756E, 0x3A89766F, 0x3A897770, 0x3A8A7871, 0x3A8B7872, 0x3A8C7973, 0x3A8D7A74,
+    0x3A8E7B74, 0x3A8F7C75, 0x3A907D76, 0x3A917E77, 0x3A927F78, 0x3A928079, 0x3A93807A, 0x3A94817A,
+    0x3A95827B, 0x3A96837C, 0x3A97847D, 0x3A98857E, 0x3A99867F, 0x3A9A8780, 0x3A9B8881, 0x3A9C8982,
+    0x3A9C8A83, 0x3A9D8B84, 0x3A9E8C85, 0x3A9F8D86, 0x3AA08E87, 0x3AA08F88, 0x3AA18F89, 0x3AA2908A,
+    0x3AA3918B, 0x3AA4928C, 0x3AA4938D, 0x3AA5948E, 0x3AA6958F, 0x3AA7968F, 0x3AA79790, 0x3AA89891,
+    0x3AA99892, 0x3AAA9993, 0x3AAB9A94, 0x3AAB9B95, 0x3AAC9C96, 0x3AAD9D97, 0x3AAE9E98, 0x3AAF9F99,
+    0x3AAFA09A, 0x3AB0A19B, 0x3AB1A29C, 0x3AB2A29D, 0x3AB3A39E, 0x3AB3A49F, 0x3AB4A59F, 0x3AB5A6A0,
+    0x3AB6A7A1, 0x3AB6A8A2, 0x3AB7A9A3, 0x3AB8AAA4, 0x3AB9ABA5, 0x3ABAABA6, 0x3ABAACA7, 0x3ABBADA8,
+    0x3ABCAEA9, 0x3ABDAFAA, 0x3ABEB0AB, 0x3ABEB1AC, 0x3ABFB2AD, 0x3AC0B3AE, 0x3AC1B4AF, 0x3AC2B5B0
+};
+
+static void func_8003B7BC(void) // 0x8003B7BC
+{
+    // Can't be `s32*` since 462 doesn't divide by 4, so guessing `s8`.
+#ifdef SH_PC_PORT
+    s8* s0 = (s8*)PSX_ADDR(0x001E2432);
+#else
+    s8* s0 = 0x801E2432;
+#endif
+
+    memset(s0, 0, 462);
+    D_800BCDE0 = s0;
+}
+
+static u32 func_8003B7FC(s32 idx) // 0x8003B7FC
+{
+    u8  idx0 = D_800BCDE0[idx];
+    u32 val  = D_800A9AAC[idx0];
+
+    if (idx < 210)
+    {
+        return 0x3A000000;
+    }
+
+    return val;
+}
+
+static PACKET* MainMenu_FogPacketGet(GsOT* ot, PACKET* packet) // 0x8003B838
+{
+    s32      yOffset;
+    s32      i;
+    s32      j;
+    s32      color0;
+    s32      color2;
+    s32      color3;
+    s32      color1;
+    POLY_G4* poly;
+
+    for (i = 10; i < MAIN_MENU_FOG_COUNT; i++)
+    {
+        color1 = func_8003B7FC(MAIN_MENU_FOG_COUNT * (i - 1));
+        color3 = func_8003B7FC(MAIN_MENU_FOG_COUNT * i);
+
+        for (j = 1; j < MAIN_MENU_FOG_COUNT; j++)
+        {
+            color2 = color3;
+            color0 = color1;
+
+            color1 = func_8003B7FC(j + (MAIN_MENU_FOG_COUNT * (i - 1)));
+            color3 = func_8003B7FC(j + (MAIN_MENU_FOG_COUNT * i));
+
+            poly = packet;
+            setPolyG4(poly);
+
+            yOffset = (i - 1) * 24;
+
+            setXY4(poly,
+                   -176 + (16 * j), yOffset - 208,
+                   -160 + (16 * j), yOffset - 208,
+                   -176 + (16 * j), yOffset - 184,
+                   -160 + (16 * j), yOffset - 184);
+
+            *((u32*)&poly->r0) = color0;
+            *((u32*)&poly->r1) = color1;
+            *((u32*)&poly->r2) = color2;
+            *((u32*)&poly->r3) = color3;
+
+            addPrim(ot, poly);
+            packet += sizeof(POLY_G4);
+        }
+    }
+
+    return packet;
+}
+
+static void MainMenu_FogDraw(void) // 0x8003BA08
+{
+    PACKET*   packet;
+    GsOT_TAG* tag;
+
+    tag    = g_OrderingTable2[g_ActiveBufferIdx].org;
+    packet = MainMenu_FogPacketGet(&tag[6], GsOUT_PACKET_P);
+    SetDrawMode((DR_MODE*)packet, 0, 1, 42, NULL);
+    addPrim(&tag[6], packet);
+    GsOUT_PACKET_P = packet + sizeof(DR_MODE);
+}
+
+static void MainMenu_FogRandomize(void) // 0x8003BAC4
+{
+    s32 idx;
+    s32 i;
+    s32 val;
+    s8* ptr;
+    u8* ptr1;
+    s8* ptr2;
+
+    static q19_12 randAngle = Q12_ANGLE(0.0f);
+
+    ptr   = D_800BCDE0;
+    ptr1  = ptr + 441;
+    randAngle += Rng_GenerateInt(4, 11u);
+    val   = Q12_MULT(Math_Sin(randAngle), 10) - 122;
+    ptr2  = ptr + 461;
+
+    for (i = 20; i >= 0; i--)
+    {
+        *ptr2-- = val;
+    }
+
+    for (i = 0; i < 16; i++)
+    {
+        idx       = Rng_GenerateInt(0, MAIN_MENU_FOG_COUNT - 1);
+        ptr1[idx] = NO_VALUE;
+    }
+
+    for (i = 0; i < 9; i++)
+    {
+        idx       = Rng_GenerateInt(0, MAIN_MENU_FOG_COUNT - 1);
+        ptr1[idx] = 0;
+    }
+}
+
+static void MainMenu_FogScatter(void) // 0x8003BBF4
+{
+    s32 i;
+    s32 j;
+    s32 val;
+    u8* ptr;
+
+    MainMenu_FogRandomize();
+
+    for (i = 0; i < MAIN_MENU_FOG_COUNT; i++)
+    {
+        ptr = &D_800BCDE0[i * MAIN_MENU_FOG_COUNT];
+
+        for (j = 0; j < MAIN_MENU_FOG_COUNT; j++)
+        {
+            val   = ptr[j + MAIN_MENU_FOG_COUNT];
+            val  += ptr[j - 1];
+            val  += ptr[j];
+            val  += ptr[j + 1];
+            val >>= 2;
+            val--;
+
+            if (val <= 0)
+            {
+                ptr[j] = 0;
+            }
+            else
+            {
+                ptr[j] = val;
+            }
+        }
+    }
+}
+
+void MainMenu_FogUpdate(void) // 0x8003BC8C
+{
+    static s32 fogCount = 0;
+
+#ifdef SH_PC_PORT
+    if (D_800BCDE0 == NULL) {
+        /* Fog buffer not initialized - skip fog update to avoid NULL deref */
+        fogCount++;
+        return;
+    }
+#endif
+
+    if (fogCount == ((fogCount / 5) * 5))
+    {
+        MainMenu_FogScatter();
+    }
+
+    fogCount++;
+    MainMenu_FogDraw();
+}
+
+static void func_8003BCF4(void) // 0x8003BCF4
+{
+    s32 i;
+
+    func_8003B7BC();
+
+    for (i = 0; i < 30; i++)
+    {
+        MainMenu_FogScatter();
+    }
+}
+
+#undef MAIN_MENU_FOG_COUNT

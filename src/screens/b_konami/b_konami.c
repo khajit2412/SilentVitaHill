@@ -1,0 +1,602 @@
+#include "game.h"
+#ifdef SH_PC_PORT
+#include <stdio.h>
+#include <SDL_scancode.h>
+extern void PsyX_EndScene(void);
+extern const unsigned char* g_sdlKeyboardState;
+extern int PsyX_Pad_SkipButtonHeld(void);
+extern int Pc_Touch_AnyContact(void);
+
+/* QOL boot-logo skip. The stock logo loops only react to heldBtnFlags, but neither the
+ * keyboard nor the gamepad is wired into the game's controller flags this early in boot
+ * on PC, so that is always 0 here and the logos can never be skipped manually. Read the
+ * raw SDL keyboard + the controller skip-button (A/Start) directly so any confirm/start
+ * key or gamepad A/Start skips. */
+static int BootSkip_Pressed(void)
+{
+    if (g_Controller0 != NULL && g_Controller0->heldBtnFlags != 0)
+        return 1;
+
+    if (g_sdlKeyboardState != NULL &&
+        (g_sdlKeyboardState[SDL_SCANCODE_RETURN]   ||
+         g_sdlKeyboardState[SDL_SCANCODE_KP_ENTER] ||
+         g_sdlKeyboardState[SDL_SCANCODE_RETURN2]  ||
+         g_sdlKeyboardState[SDL_SCANCODE_SPACE]    ||
+         g_sdlKeyboardState[SDL_SCANCODE_C]        ||
+         g_sdlKeyboardState[SDL_SCANCODE_V]))
+    {
+        return 1;
+    }
+
+
+    /* A touchscreen has no confirm key and no Start button, so without this the
+     * logos can only be waited out. Same predicate the FMV skip uses. */
+    if (Pc_Touch_AnyContact())
+        return 1;
+    return PsyX_Pad_SkipButtonHeld();
+}
+#endif
+
+#include <psyq/libcd.h>
+#include <psyq/libetc.h>
+
+#include "bodyprog/bodyprog.h"
+#include "bodyprog/demo.h"
+#include "bodyprog/math/math.h"
+#include "bodyprog/memcard.h"
+#include "bodyprog/screen/screen_data.h"
+#include "bodyprog/screen/screen_draw.h"
+#include "bodyprog/sys/joy.h"
+#include "main/fsqueue.h"
+#include "screens/b_konami/b_konami.h"
+#ifdef SH_PC_PORT
+#include "main/fileinfo.h" /* g_GameRegion — PAL FONT16 reload on the auto-load path */
+#endif
+#include "screens/b_konami/lzss.h"
+#include "screens/stream/stream.h"
+
+void GameState_KonamiLogo_Update(void) // 0x800C95AC
+{
+    while (g_GameWork.gameState == GameState_KonamiLogo)
+    {
+        Joy_Update();
+
+#ifdef SH_PC_PORT
+        /* QOL: any confirm/start key skips the boot logo from any visible phase. The
+         * stock skip only fires during the hold-delay, so the fade-in couldn't be
+         * skipped. Jump to the fade-out + finish; the asset loads kicked off in Init
+         * are still awaited by Fs_QueueWaitForEmpty there, so this only drops the
+         * on-screen logo time, never a load. */
+        if (BootSkip_Pressed() &&
+            (g_GameWork.gameStateSteps[0] == KonamiLogoStateStep_WaitForFade ||
+             g_GameWork.gameStateSteps[0] == KonamiLogoStateStep_LogoDelay))
+        {
+            ScreenFade_Start(false, false, false);
+            g_ScreenFadeTimestep         = Q12(0.4f);
+            g_GameWork.gameStateSteps[0] = KonamiLogoStateStep_FinishAfterFade;
+        }
+#endif
+
+        switch (g_GameWork.gameStateSteps[0])
+        {
+            case KonamiLogoStateStep_Init:
+                Screen_Init(SCREEN_WIDTH * 2, true);
+
+                ScreenFade_Start(true, true, false);
+                g_ScreenFadeTimestep = Q12(0.2f);
+
+                // Load `1ST/KONAMI2.TIM` (Konami logo).
+                Fs_QueueStartReadTim(FILE_1ST_KONAMI2_TIM, FS_BUFFER_1, &g_KcetLogoImg);
+
+                WorldGfx_HarryCharaLoad();
+                GameFs_BgItemLoad();
+                Map_EffectTexturesLoad(NO_VALUE);
+
+                // Start loading `ANIM/HB_BASE.ANM` (base Harry animations).
+                Fs_QueueStartRead(FILE_ANIM_HB_BASE_ANM, FS_BUFFER_0);
+
+                g_GameWork.gameStateSteps[0]++;
+                break;
+
+            case KonamiLogoStateStep_WaitForFade:
+                if (ScreenFade_IsNone())
+                {
+                    g_GameWork.gameStateSteps[0] = KonamiLogoStateStep_LogoDelay;
+                }
+                break;
+
+            case KonamiLogoStateStep_LogoDelay:
+                if (g_Controller0->heldBtnFlags != 0 || g_SysWork.counters_1C[0] > 180)
+                {
+                    ScreenFade_Start(false, false, false);
+                    g_ScreenFadeTimestep            = Q12(0.2f);
+                    g_GameWork.gameStateSteps[0] = KonamiLogoStateStep_FinishAfterFade;
+                }
+                break;
+
+            case KonamiLogoStateStep_FinishAfterFade:
+                if (ScreenFade_IsFinished())
+                {
+                    Fs_QueueWaitForEmpty();
+                    Game_StateSetNext(GameState_KcetLogo);
+                }
+                break;
+        }
+
+        BootScreen_KonamiScreenDraw();
+        Screen_FadeUpdate();
+        Fs_QueueUpdate();
+        MemCard_Update();
+        func_80033548();
+        nullsub_800334C8();
+        VSync(SyncMode_Wait);
+#ifdef SH_PC_PORT
+        g_DeltaTime = Q12(1.0f / 60.0f);
+        g_DeltaTimeRaw = Q12(1.0f / 60.0f);
+#endif
+        GsSwapDispBuff();
+        GsDrawOt(&g_OrderingTable2[g_ActiveBufferIdx]);
+#ifdef SH_PC_PORT
+        PsyX_EndScene();
+#endif
+
+        g_ActiveBufferIdx = GsGetActiveBuff();
+        GsOUT_PACKET_P   = (PACKET*)(TEMP_MEMORY_ADDR + (g_ActiveBufferIdx << 15));
+
+        GsClearOt(0, 0, &g_OrderingTable0[g_ActiveBufferIdx]);
+        GsClearOt(0, 0, &g_OrderingTable2[g_ActiveBufferIdx]);
+    }
+}
+
+s32 GameState_KcetLogo_MemCardCheck(void) // 0x800C9874
+{
+    s32 saveEntryType0;
+    s32 saveEntryType1;
+
+    // Memory cards not ready yet, rerun this on next frame.
+    if (func_80033548() == false)
+    {
+        return KcetLogoStateStep_CheckMemCards;
+    }
+
+    g_MemCard_ActiveSavegameEntry = (s_SaveScreenElement*)SAVEGAME_ENTRY_BUFFER_0;
+    saveEntryType0                = g_MemCard_ActiveSavegameEntry->type;
+
+    g_MemCard_ActiveSavegameEntry = (s_SaveScreenElement*)SAVEGAME_ENTRY_BUFFER_1;
+    saveEntryType1                = g_MemCard_ActiveSavegameEntry->type;
+
+    // No memory cards.
+    if (saveEntryType0 == SavegameEntryType_NoMemCard && saveEntryType1 == SavegameEntryType_NoMemCard)
+    {
+        return KcetLogoStateStep_NoMemCard;
+    }
+
+    // No free space on any card.
+    if ((saveEntryType0 == SavegameEntryType_OutOfBlocks && (saveEntryType1 == SavegameEntryType_OutOfBlocks || saveEntryType1 == SavegameEntryType_NoMemCard)) ||
+        (saveEntryType0 == SavegameEntryType_NoMemCard && saveEntryType1 == SavegameEntryType_OutOfBlocks))
+    {
+        return KcetLogoStateStep_NoMemCardFreeSpace;
+    }
+
+    if (saveEntryType0 == SavegameEntryType_Save || saveEntryType1 == SavegameEntryType_Save)
+    {
+        g_MemCard_ActiveSavegameEntry = MemCard_ActiveSavegameEntryGet(g_SelectedSaveSlotIdx);
+        g_MemCard_ActiveSavegameEntry = &g_MemCard_ActiveSavegameEntry[g_SlotElementSelectedIdx[g_SelectedSaveSlotIdx]];
+
+        g_SelectedDeviceId            = g_MemCard_ActiveSavegameEntry->deviceId;
+        g_SelectedFileIdx             = g_MemCard_ActiveSavegameEntry->fileIdx;
+        g_Savegame_SelectedElementIdx = g_MemCard_ActiveSavegameEntry->elementIdx;
+
+        return KcetLogoStateStep_HasSavegame;
+    }
+
+    return KcetLogoStateStep_NoSaveGame;
+}
+
+void GameState_KcetLogo_Update(void) // 0x800C99A4
+{
+    static u8 nextGameState = GameState_Init; // 0x800CA4F0
+
+    while (g_GameWork.gameState == GameState_KcetLogo)
+    {
+        Joy_Update();
+
+#ifdef SH_PC_PORT
+        /* QOL: any confirm/start key (or gamepad A/Start) skips the KCET logo. Its entire
+         * visible time is the CheckMemCards fade-in (~5s on PC: the Q12(0.2) timestep with
+         * dt forced to 1/60), which has no stock skip. On skip, accelerate that fade-in so
+         * the memcard check + loads run immediately (detection still happens — Continue/Load
+         * stay correct), then collapse the post-load LogoDelay hold into a quick fade-out.
+         * Latched so a brief tap fully skips even mid-fade. */
+        {
+            static int s_kcetSkip = 0;
+
+            if (BootSkip_Pressed())
+            {
+                s_kcetSkip = 1;
+            }
+
+            if (s_kcetSkip)
+            {
+                if (g_GameWork.gameStateSteps[0] == KcetLogoStateStep_CheckMemCards && !ScreenFade_IsNone())
+                {
+                    g_ScreenFadeTimestep = Q12(8.0f);
+                }
+                else if (g_GameWork.gameStateSteps[0] == KcetLogoStateStep_LogoDelay)
+                {
+                    ScreenFade_Start(false, false, false);
+                    g_ScreenFadeTimestep         = Q12(8.0f);
+                    g_GameWork.gameStateSteps[0] = KcetLogoStateStep_FinishAfterFade;
+                }
+            }
+        }
+#endif
+
+        switch (g_GameWork.gameStateSteps[0])
+        {
+            case KcetLogoStateStep_Init:
+                Settings_RestoreDefaults();
+
+                ScreenFade_Start(true, true, false);
+                g_ScreenFadeTimestep = Q12(0.2f);
+
+                GameFs_BgEtcGfxLoad();
+                Fs_QueueStartRead(FILE_BG_HP_SAFE1_BIN, FS_BUFFER_5);
+                Fs_QueueStartRead(FILE_BG_S__SAFE2_BIN, FS_BUFFER_6);
+                g_GameWork.gameStateSteps[0]++;
+                break;
+
+            case KcetLogoStateStep_CheckMemCards:
+                if (ScreenFade_IsNone())
+                {
+                    s32 curTime;
+
+                    Fs_QueueWaitForEmpty();
+
+#ifdef SH_PC_PORT
+                    /* PC: previously forced KcetLogoStateStep_NoMemCard
+                     * because the memcard subsystem wasn't implemented.
+                     * Now that PsyCross has a real backed-by-MCD-file
+                     * memcard layer (and the in-game memcard state
+                     * machine reaches InitComplete cleanly per the
+                     * 7d22d94db / 15fd7fd commits), let the real
+                     * MemCardCheck loop run so saves are detected at
+                     * boot and the warning routing / load option
+                     * works correctly. */
+#endif
+
+#if VERSION_REGION_IS(NTSCJ)
+                    // Anti-modchip code from NTSC-J releases, using Sony's `safechk.obj` code.
+                    // Decompresses/decrypts the `S__SAFE2` / `HP_SAFE1` overlays:
+                    // - `S__SAFE2`: runs `safechk.obj` to detect non-stealth modchips and halt game if found,
+                    //   then calls init code relocated from the start of `MainLoop`.
+                    // - `HP_SAFE1`: includes same `safechk.obj` and near-identical `AntiModchip_Check` code,
+                    //   only difference is branches jump to other `MainLoop` init code instead of actually invoking `safechk`.
+                    //
+                    // Init calls were likely moved here so skipping these overlays would break things.
+                    // `HP_SAFE1` being a near-copy of `S__SAFE2` may be just to slightly confuse pirates.
+                    //
+                    // TODO:
+                    // - `CdDiskReady` and `CdGetDiskType` are part of `libcd/type.o`, not included in US release, need conversion from SDK libs.
+                    // - Add `FS_BUFFER_` constants for the addresses used here.
+
+                    while (CdDiskReady(false) != CdlComplete || CdGetDiskType() == CdlStatShellOpen)
+                    {
+                        VSync(0);
+                    }
+
+                    // Decompress the `HP_SAFE1/S__SAFE2` overlays.
+                    Lzss_Init(FS_BUFFER_5, FS_BUFFER_21, 3000); // Larger than actual `HP_SAFE1` size?
+                    Lzss_Decode(NO_VALUE);
+                    Lzss_Init(FS_BUFFER_6, (void*)0x801E6600, 3000);
+                    Lzss_Decode(NO_VALUE);
+
+                    // Decrypt `S__SAFE2` and run `AntiModchip_Check`
+                    Fs_DecryptOverlay((void*)0x801E7600, (void*)0x801E6600, 4096);
+                    curTime = g_SysWork.counters_1C[0];
+                    AntiModchip_Check();
+
+                    // Decrypt `HP_SAFE1` and run `AntiModchip_Check`
+                    Fs_DecryptOverlay((void*)0x801E7600, FS_BUFFER_21, 4096);
+                    
+                    // Only run `HP_SAFE1` if `S__SAFE2` took enough time to execute, cheap way of checking if the call above was skipped?
+                    if ((g_SysWork.counters_1C[0] - curTime) >= 100)
+                    {
+                        AntiModchip_Check();
+                    }
+
+                    // Reset drive & sound driver
+                    CdReset(1);
+                    sd_work_init();
+#endif
+
+                    while (g_GameWork.gameStateSteps[0] < KcetLogoStateStep_NoMemCard)
+                    {
+                        g_GameWork.gameStateSteps[0] = GameState_KcetLogo_MemCardCheck();
+                        MemCard_Update();
+                        VSync(SyncMode_Wait);
+                    }
+                }
+                break;
+
+            case KcetLogoStateStep_NoMemCard:
+#if VERSION_REGION_IS(NTSCJ)
+                Fs_QueueStartReadTim(FILE_1ST_NO_MEMCD_TIM, FS_BUFFER_1, &D_800A900C);
+#else
+                Fs_QueueStartReadTim(FILE_1ST_NO_MCD_E_TIM, FS_BUFFER_1, &D_800A900C);
+#endif
+                GameFs_StreamBinLoad();
+                nextGameState = GameState_MovieIntroFadeIn;
+
+                g_GameWork.gameStateSteps[0] = KcetLogoStateStep_LogoDelay;
+                g_SysWork.counters_1C[1]              = 0;
+                g_GameWork.gameStateSteps[1] = 0;
+                g_GameWork.gameStateSteps[2] = 0;
+                break;
+
+            case KcetLogoStateStep_NoMemCardFreeSpace:
+#if VERSION_REGION_IS(NTSCJ)
+                Fs_QueueStartReadTim(FILE_1ST_NO_BLOCK_TIM, FS_BUFFER_1, &D_800A900C);
+#else
+                Fs_QueueStartReadTim(FILE_1ST_NO_BLK_E_TIM, FS_BUFFER_1, &D_800A900C);
+#endif
+                GameFs_StreamBinLoad();
+                nextGameState = GameState_MovieIntroFadeIn;
+
+                g_GameWork.gameStateSteps[0] = KcetLogoStateStep_LogoDelay;
+                g_SysWork.counters_1C[1]              = 0;
+                g_GameWork.gameStateSteps[1] = 0;
+                g_GameWork.gameStateSteps[2] = 0;
+                break;
+
+            case KcetLogoStateStep_NoSaveGame:
+                GameFs_StreamBinLoad();
+                GameFs_TitleGfxSeek();
+                nextGameState = GameState_MovieIntro;
+
+                g_GameWork.gameStateSteps[0] = KcetLogoStateStep_LogoDelay;
+                g_SysWork.counters_1C[1]              = 0;
+                g_GameWork.gameStateSteps[1] = 0;
+                g_GameWork.gameStateSteps[2] = 0;
+                break;
+
+            case KcetLogoStateStep_HasSavegame:
+                while (g_GameWork.gameStateSteps[1] < 3)
+                {
+                    switch (g_GameWork.gameStateSteps[1])
+                    {
+                        case 0:
+                            MemCard_ProcessSet(MemCardProcess_Load_Game, g_SelectedDeviceId, 0, 0);
+                            g_GameWork.gameStateSteps[2] = 0;
+                            g_GameWork.gameStateSteps[1]++;
+
+                        case 1:
+                            if (MemCard_LastMemCardResultGet() != MemCardResult_Success)
+                            {
+                                g_GameWork.gameStateSteps[2] = 0;
+                                g_GameWork.gameStateSteps[1]++;
+                            }
+                            break;
+
+                        case 2:
+                            if (g_GameWorkConst->config.autoLoad)
+                            {
+                                Fs_QueueStartRead(FILE_VIN_SAVELOAD_BIN, FS_BUFFER_1);
+                                Fs_QueueStartSeek(FILE_TIM_SAVELOAD_TIM);
+                                nextGameState = GameState_AutoLoadSavegame;
+                            }
+                            else
+                            {
+                                GameFs_StreamBinLoad();
+                                GameFs_TitleGfxSeek();
+                                nextGameState = GameState_MovieIntro;
+                            }
+
+                            g_GameWork.gameStateSteps[2] = 0;
+                            g_GameWork.gameStateSteps[1]++;
+                            break;
+                    }
+
+                    func_80033548();
+                    MemCard_Update();
+                    VSync(SyncMode_Wait);
+                }
+
+                g_GameWork.gameStateSteps[0] = KcetLogoStateStep_LogoDelay;
+                g_SysWork.counters_1C[1]              = 0;
+                g_GameWork.gameStateSteps[1] = 0;
+                g_GameWork.gameStateSteps[2] = 0;
+                break;
+
+            case KcetLogoStateStep_LogoDelay:
+                if (g_Controller0->heldBtnFlags != 0 || g_SysWork.counters_1C[0] > 180)
+                {
+                    ScreenFade_Start(false, false, false);
+                    g_ScreenFadeTimestep = Q12(0.2f);
+                    g_GameWork.gameStateSteps[0]++;
+                }
+                break;
+
+            case KcetLogoStateStep_FinishAfterFade:
+                if (ScreenFade_IsFinished())
+                {
+                    Settings_ScreenAndVolUpdate();
+                    Screen_Init(SCREEN_WIDTH, false);
+
+                    switch (nextGameState)
+                    {
+                        case GameState_AutoLoadSavegame:
+                            Fs_QueueStartReadTim(FILE_TIM_SAVELOAD_TIM, FS_BUFFER_7, &g_ItemInspectionImg);
+#ifdef SH_PC_PORT
+                            /* This path skips the title screen (and its PAL
+                             * FONT16 reload in GameFs_TitleGfxLoad), but the
+                             * save-select screen it boots into draws FONT16
+                             * text — reload past the Konami-logo stomp here. */
+                            {
+                                extern e_GameRegion g_GameRegion;
+                                if (g_GameRegion == Region_EUR)
+                                {
+                                    Fs_QueueStartReadTim(FILE_1ST_FONT16_TIM, FS_BUFFER_1, &g_Font16AtlasImg);
+                                }
+                            }
+#endif
+                            break;
+
+                        case GameState_MovieIntroFadeIn:
+                            break;
+
+                        case GameState_MovieIntroAlternate:
+                        default:
+                            // USA moves `Demo_*` calls to after the switch.
+                            // TODO: Confirm whether the later JAP1 release also had them moved.
+#if VERSION_EQUAL_OR_OLDER(JAP0) 
+                            Demo_SequenceAdvance(0);
+                            Demo_DemoDataRead();
+#endif
+                            GameFs_TitleGfxLoad();
+                            break;
+                    }
+                    
+#if VERSION_EQUAL_OR_NEWER(USA)
+                    Demo_SequenceAdvance(0);
+                    Demo_DemoDataRead();
+#endif
+                    Fs_QueueWaitForEmpty();
+
+                    g_SysWork.counters_1C[0] = 0;
+                    g_SysWork.counters_1C[1] = 0;
+
+                    g_GameWork.gameStateSteps[1] = 0;
+                    g_GameWork.gameStateSteps[2] = 0;
+
+                    SysWork_StateSetNext(SysState_Gameplay);
+
+                    g_GameWork.gameStateSteps[0] = g_GameWork.gameState;
+                    g_GameWork.gameState        = nextGameState;
+                    g_GameWork.gameStatePrev    = g_GameWork.gameStateSteps[0];
+                    g_GameWork.gameStateSteps[0] = 0;
+                }
+                break;
+        }
+
+        BootScreen_KcetScreenDraw();
+        Screen_FadeUpdate();
+        Fs_QueueUpdate();
+        MemCard_Update();
+        func_80033548();
+        nullsub_800334C8();
+        VSync(SyncMode_Wait);
+#ifdef SH_PC_PORT
+        g_DeltaTime = Q12(1.0f / 60.0f);
+        g_DeltaTimeRaw = Q12(1.0f / 60.0f);
+#endif
+        GsSwapDispBuff();
+        GsDrawOt(&g_OrderingTable2[g_ActiveBufferIdx]);
+#ifdef SH_PC_PORT
+        PsyX_EndScene();
+#endif
+
+        g_ActiveBufferIdx = GsGetActiveBuff();
+#ifdef SH_PC_PORT
+        GsOUT_PACKET_P   = (PACKET*)(TEMP_MEMORY_ADDR + (g_ActiveBufferIdx << 15));
+#else
+        GsOUT_PACKET_P   = (g_ActiveBufferIdx << 0xF) + (u32)TEMP_MEMORY_ADDR;
+#endif
+
+        GsClearOt(0, 0, &g_OrderingTable0[g_ActiveBufferIdx]);
+        GsClearOt(0, 0, &g_OrderingTable2[g_ActiveBufferIdx]);
+    }
+}
+
+void BootScreen_ImageSegmentDraw(s_FsImageDesc* image, s32 otz, s32 vramX, s32 vramY, s32 w, s32 h, s32 x, s32 y) // 0x800C9E6C
+{
+    DR_TPAGE* tPage;
+    SPRT*     prim     = (SPRT*)GsOUT_PACKET_P;
+    u32       vramBase = image->tPage[1] + (u32)(vramX >> 8) + (((u32)(vramY >> 8)) << 4);
+#ifdef SH_PC_PORT
+    GsOT_TAG* addr     = &g_OtTags0[g_ActiveBufferIdx][otz];
+#else
+    u32*      addr     = &g_OtTags0[g_ActiveBufferIdx][otz];
+#endif
+
+    addPrimFast(addr, prim, 4);
+    setCodeWord(prim, PRIM_RECT | RECT_TEXTURE, 0x808080);
+    setWH(prim, w, h);
+
+    vramX = vramX & 0xFF;
+    vramY = vramY & 0xFF;
+
+    //setUV0AndClut(prim, vramX, vramY, image->clutX, image->clutY);
+    *(u32*)(&prim->u0) = vramX + (vramY << 8) + (((image->clutY << 6) | ((image->clutX >> 4) & 0x3F)) << 16);
+
+    setXY0Fast(prim, (u16)x, y);
+
+    tPage = (DR_TPAGE*)((u8*)prim + sizeof(SPRT));
+    setDrawTPage(tPage, 0, 1, getTPage(image->tPage[0], 0, (vramBase << 6), (((vramBase >> 4) & (1 << 0)) << 8)));
+    AddPrim(addr, tPage);
+
+#ifdef SH_PC_PORT
+    GsOUT_PACKET_P = (u8*)prim + sizeof(SPRT) + sizeof(DR_TPAGE);
+#else
+    GsOUT_PACKET_P = (u8*)prim + 28;
+#endif
+}
+
+void BootScreen_KonamiScreenDraw(void) // 0x800C9FB8
+{
+#ifdef SH_PC_PORT
+    GsOT_TAG* ptr;
+#else
+    s32*  ptr;
+#endif
+    TILE* tile;
+
+    // Draw Konami logo.
+    BootScreen_ImageSegmentDraw(&g_KonamiLogoImg, 0xF, 0, 0, 256, 256, -192, -192);
+    BootScreen_ImageSegmentDraw(&g_KonamiLogoImg, 0xF, 256, 0, 128, 256, 64, -192);
+    BootScreen_ImageSegmentDraw(&g_KonamiLogoImg, 0xF, 0, 256, 256, 128, -192, 64);
+    BootScreen_ImageSegmentDraw(&g_KonamiLogoImg, 0xF, 256, 256, 128, 128, 64, 64);
+
+    ptr = &g_OtTags0[g_ActiveBufferIdx][15];
+    tile = (TILE*)GsOUT_PACKET_P;
+    
+    // Draw fading overlay tile.
+    addPrimFast(ptr, tile, 3);
+    setCodeWord(tile, PRIM_RECT, 0xFFFFFF);
+    setXY0Fast(tile, -SCREEN_WIDTH, -SCREEN_HEIGHT);
+    setWH(tile, SCREEN_WIDTH * 2, SCREEN_HEIGHT * 2);
+
+#if VERSION_REGION_IS(NTSCJ)
+    // Draw unknown JPN0 tile.
+    tile++;
+    ptr--;
+
+    addPrimFast(ptr, tile, 3);
+    setCodeWord(tile, PRIM_RECT, 0xFFFFFF);
+    setXY0Fast(tile, 136, 140);
+    setWH(tile, 13, 13);
+#endif
+
+    GsOUT_PACKET_P = (PACKET*)&tile[1];
+}
+
+void BootScreen_KcetScreenDraw(void) // 0x800CA120
+{
+#ifdef SH_PC_PORT
+    GsOT_TAG* ptr;
+#else
+    u32* ptr;
+#endif
+
+    // Draw KCET logo.
+    BootScreen_ImageSegmentDraw(&g_KcetLogoImg, 0xF, 0, 0, 256, 160, -208, -80);
+    BootScreen_ImageSegmentDraw(&g_KcetLogoImg, 0xF, 256, 0, 160, 160, 48, -80);
+
+    // Draw fading overlay tile.
+    ptr = &g_OtTags0[g_ActiveBufferIdx][15];
+    addPrimFast(ptr, (TILE*)GsOUT_PACKET_P, 3);
+    setCodeWord((TILE*)GsOUT_PACKET_P, PRIM_RECT, 0xFFFFFF);
+    setXY0Fast((TILE*)GsOUT_PACKET_P, -SCREEN_WIDTH, -SCREEN_HEIGHT);
+    setWH((TILE*)GsOUT_PACKET_P, SCREEN_WIDTH * 2, SCREEN_HEIGHT * 2);
+    GsOUT_PACKET_P = (PACKET*)((u8*)GsOUT_PACKET_P + sizeof(TILE));
+}

@@ -1,0 +1,83 @@
+name: The MAP6_S02 map overlay (MAP6_S02)
+sha1: b502c9495d6f3960b383d077a28192eb549ec63d
+options:
+  basename: MAP6_S02.BIN
+  target_path: assets/USA/VIN/MAP6_S02.BIN
+  base_path: ../../..
+  platform: psx
+  compiler: GCC
+
+  asm_path: asm/USA/maps/map6_s02
+  src_path: src/maps/map6_s02
+  build_path: build/USA
+
+  ld_script_path: linkers/USA/maps/map6_s02.ld
+
+  find_file_boundaries: false
+  gp_value: 0x80022BB0
+  global_vram_start: 0x80010000
+  global_vram_end: 0x80200000
+
+  o_as_suffix: false
+  use_legacy_include_asm: false
+
+  asm_function_macro: glabel
+  asm_jtbl_label_macro: jlabel
+  asm_data_macro: dlabel
+  generate_asm_macros_files: False # Disabled as our include_asm.h is customized to work with different game versions.
+
+  section_order: [".rodata", ".text", ".data", ".bss"]
+
+  symbol_addrs_path:
+    - configs/USA/sym.main.txt
+    - configs/USA/sym.bodyprog.txt
+    - configs/USA/maps/sym.map6_s02.txt
+  reloc_addrs_path:
+    - configs/USA/maps/rel.map6_s02.txt
+
+  undefined_funcs_auto_path: linkers/USA/maps/undefined_funcs_auto.map6_s02.txt
+  undefined_syms_auto_path: linkers/USA/maps/undefined_syms_auto.map6_s02.txt
+
+  extensions_path: tools/splat_ext
+
+  subalign: 4
+
+  string_encoding: ASCII
+  data_string_encoding: ASCII
+  rodata_string_guesser_level: 2
+  data_string_guesser_level: 2
+segments:
+  - name: map6_s02
+    type: code
+    start: 0
+    vram: 0x800C9578
+    align: 4
+    subalign: 4
+    subsegments:
+      # .rodata section
+      - [0x0, rodata]
+      - [0x4, .rodata, map6_s02_header]
+      - [0x1050, .rodata, particle]
+      - [0x10A0, .rodata, Chara_Alessa]
+      - [0x10CC, rodata]
+      - [0x10D0, .rodata, map6_s02_2]
+
+      - [0x1628, c, map6_s02_header]
+      - [0x1628, c, map6_s02_events_data]
+      - [0x1628, c, map6_s02_anim_info]
+
+      # .text section
+      - [0x1628, c, unk_draw_m1s03]
+      - [0x1DA4, c, particle]
+      - [0x2F2C, c, player]
+      - [0x41BC, c, Chara_Alessa]
+      - [0x4938, c, map6_s02_2]
+
+      # .data section
+      - [0x9EA4, .data, map6_s02_anim_info]
+      - [0xA154, data]
+      - [0xa43c, .data, map6_s02_header]
+      - [0xA4D4, .data, map6_s02_2]
+      - [0xA538, .data, map6_s02_events_data]
+      - [0xA5C8, data]
+  - [0xB900]

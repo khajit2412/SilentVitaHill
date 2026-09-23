@@ -1,0 +1,553 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* PC port: mouse control for cursor-driven puzzles + a clickable main menu.
+ * See pc_mouse_cursor.h for the design. */
+#include "game.h"
+#include "inline_no_dmpsx.h"
+
+#include "bodyprog/bodyprog.h"
+#include "bodyprog/sys/joy.h"
+#include "pc_config.h"
+#include "pc_mouse_cursor.h"
+#include "sh_log.h"
+
+#include "bodyprog/screen/screen_data.h"
+
+#include <SDL.h>
+#include <PsyX/PsyX_public.h>
+#include <PsyX/PsyX_render.h> /* GR_ReadVRAM */
+#include "pc_confirm_dialog.h"
+#include "pc_bind_panel.h"
+#include "pc_quick_options.h"
+#include <libgs.h>
+
+/* Menu rows are authored via Gfx_StringSetPosition(x, y), a center-origin space
+ * whose reference is (OFFSET_X, OFFSET_Y). The overlay OT draw origin is the
+ * framebuffer centre (gsScreenWidth/2, gsScreenHeight/2). The framebuffer HEIGHT
+ * is 448 on the interlaced title/difficulty menus and 224 in-game, so we read it
+ * live (g_GameWork.gsScreenHeight) — a fixed 240/120 was the bug that trapped the
+ * cursor in the middle band. Width/OFFSET_X are 320/160 in both modes. */
+#define MC_OFFSET_X 160 /* SCREEN_POSITION_X(50) — text authoring X reference */
+#define MC_OFFSET_Y 112 /* SCREEN_POSITION_Y(47) — text authoring Y reference */
+
+/* Puzzle cursor servo gain. Each free-cursor puzzle integrates the analog stick
+ * as a velocity and clamps its cursor to a fixed range, so a delta-velocity
+ * injection only delivered a fraction of that range per full mouse sweep — the
+ * cursor stopped ~2/3 of the way down. Instead we deflect the stick proportional
+ * to the error between the puzzle's own cursor and the framebuffer point the
+ * mouse is over, converging on exactly where the mouse points regardless of the
+ * framebuffer height or the stick scale. Gain sets how hard it steers; the
+ * mouse-sensitivity slider scales it. */
+#define MC_PUZZLE_SERVO_GAIN 8.0f
+
+/* Per-frame pointer state, in logical 320x240 coords. */
+static float s_gx, s_gy, s_prevGx, s_prevGy;
+static float s_vx, s_vy;   /* normalized 0..1 inside the presented picture */
+static int   s_inView;
+static int   s_leftDown, s_prevLeft, s_leftEdge;
+static int   s_rightDown, s_prevRight, s_rightEdge;
+static int   s_puzzleFrames; /* >0 while a free-cursor puzzle is on screen */
+static int   s_havePrev;
+static int   s_moved;        /* mouse moved this frame */
+static int   s_prevMx = -1, s_prevMy = -1;
+
+/* Puzzle cursor servo state: the game's own cursor position (framebuffer
+ * centre-origin px, captured from Gfx_CursorDraw) and whether a recent mouse
+ * move has engaged absolute tracking — released once the cursor reaches the
+ * pointer, so a real controller keeps the stick while the mouse sits idle. */
+static float s_gameCurX, s_gameCurY;
+static int   s_haveGameCur;
+static int   s_servoActive;
+static int   s_wheelStep;    /* +1/-1 on a new wheel notch this frame, else 0 */
+static int   s_prevWheelUp, s_prevWheelDown;
+
+static int Mc_Enabled(void)
+{
+    if (!g_PcConfig.mouseCursor)
+        return 0;
+    /* Only when the OS cursor is free. In TPS/OTS/FPS the pointer is captured
+     * for camera look, so its absolute position is meaningless. */
+    if (SDL_GetRelativeMouseMode() == SDL_TRUE)
+        return 0;
+    /* The quake console owns the mouse while open (its own pointer, click-drag
+     * selection) — no hover/click may leak into the menu underneath. */
+    {
+        extern int Pc_ConsoleIsOpen(void);
+        if (Pc_ConsoleIsOpen())
+            return 0;
+    }
+    return 1;
+}
+
+void Pc_MouseCursor_NoteCursorDrawn(int curX, int curY)
+{
+    s_puzzleFrames = 3;
+    s_gameCurX     = (float)curX;
+    s_gameCurY     = (float)curY;
+    s_haveGameCur  = 1;
+}
+
+int Pc_MouseCursor_Moved(void)
+{
+    return s_moved;
+}
+
+int Pc_MouseCursor_UiPos(int* outX, int* outY)
+{
+    if (!Mc_Enabled() || !s_inView)
+        return 0;
+    if (outX != NULL)
+        *outX = (int)s_gx;
+    if (outY != NULL)
+        *outY = (int)s_gy;
+    return 1;
+}
+
+/* Normalized position inside the presented picture. Anything drawing in the
+ * post-capture GL hook wants THIS, not UiPos: the authoring space UiPos reports
+ * in is the live framebuffer (448 tall for the interlaced menus, 224 in game,
+ * and different again on PAL), so reconstructing viewport pixels from it needs
+ * knowledge this side does not have. */
+int Pc_MouseCursor_ViewportPos(float* outX, float* outY)
+{
+    if (!Mc_Enabled() || !s_inView)
+        return 0;
+    if (outX != NULL) *outX = s_vx;
+    if (outY != NULL) *outY = s_vy;
+    return 1;
+}
+
+int Pc_MouseCursor_LeftClicked(void)
+{
+    return Mc_Enabled() && s_inView && s_leftEdge;
+}
+
+int Pc_MouseCursor_LeftHeld(void)
+{
+    return Mc_Enabled() && s_inView && s_leftDown;
+}
+
+int Pc_MouseCursor_RightClicked(void)
+{
+    return Mc_Enabled() && s_inView && s_rightEdge;
+}
+
+int Pc_MouseCursor_WheelStep(void)
+{
+    return Mc_Enabled() ? s_wheelStep : 0;
+}
+
+unsigned int Pc_MouseCursor_BoundPadBits(void)
+{
+    extern unsigned short g_cfg_mouseButtonMask[8];
+    extern int            g_PsyX_WheelUpFrames, g_PsyX_WheelDownFrames;
+    const Uint32          mb   = SDL_GetMouseState(NULL, NULL);
+    unsigned int          bits = 0;
+    int                   b;
+
+    for (b = 1; b <= 5; b++)
+    {
+        if (mb & SDL_BUTTON(b))
+            bits |= g_cfg_mouseButtonMask[b];
+    }
+    if (g_PsyX_WheelUpFrames > 0)   bits |= g_cfg_mouseButtonMask[6];
+    if (g_PsyX_WheelDownFrames > 0) bits |= g_cfg_mouseButtonMask[7];
+    if (bits & ControllerFlag_DpadUp)    bits |= ControllerFlag_LStickUp;
+    if (bits & ControllerFlag_DpadDown)  bits |= ControllerFlag_LStickDown;
+    if (bits & ControllerFlag_DpadLeft)  bits |= ControllerFlag_LStickLeft;
+    if (bits & ControllerFlag_DpadRight) bits |= ControllerFlag_LStickRight;
+    return bits;
+}
+
+int Pc_MouseCursor_PuzzleActive(void)
+{
+    return s_puzzleFrames > 0;
+}
+
+/* ---- Touch pointer (see pc_mouse_cursor.h) ---------------------------- */
+static int    s_tDown, s_tPrevDown, s_tPressEdge, s_tReleaseEdge, s_tInView;
+static float  s_tgx, s_tgy;
+static float  s_tvx, s_tvy;
+static Uint32 s_tLastMs;
+
+#define MC_TOUCH_RECENT_MS 3000
+
+static void Mc_TouchClear(void)
+{
+    s_tDown = s_tPrevDown = s_tPressEdge = s_tReleaseEdge = 0;
+}
+
+static void Mc_TouchUpdate(void)
+{
+    int   nDev  = SDL_GetNumTouchDevices();
+    int   found = 0, d;
+    float nx = 0.0f, ny = 0.0f;
+
+    /* Every device, as pc_touch.c does: the touchscreen is not necessarily
+     * device 0. The first finger found is the pointer. */
+    for (d = 0; d < nDev && !found; d++)
+    {
+        SDL_TouchID dev = SDL_GetTouchDevice(d);
+
+        if (SDL_GetNumTouchFingers(dev) > 0)
+        {
+            SDL_Finger* f = SDL_GetTouchFinger(dev, 0);
+
+            if (f != NULL)
+            {
+                nx    = f->x;
+                ny    = f->y;
+                found = 1;
+            }
+        }
+    }
+
+    s_tPrevDown    = s_tDown;
+    s_tDown        = found;
+    s_tPressEdge   = (s_tDown && !s_tPrevDown);
+    s_tReleaseEdge = (!s_tDown && s_tPrevDown);
+
+    if (found)
+    {
+        /* The mapping pc_touch.c uses for its buttons, which land where they
+         * are drawn: window-normalised finger -> drawable pixels -> the
+         * presented picture -> the same authoring space as s_gx/s_gy. */
+        int   winW = 0, winH = 0;
+        float vx = 0.0f, vy = 0.0f;
+
+        s_tLastMs = SDL_GetTicks();
+        PsyX_GetScreenSize(&winW, &winH);
+        s_tInView = PsyX_MapWindowToViewport((int)(nx * (float)winW),
+                                             (int)(ny * (float)winH), &vx, &vy);
+        if (s_tInView)
+        {
+            s_tvx = vx;
+            s_tvy = vy;
+            s_tgx = vx * (float)g_GameWork.gsScreenWidth;
+            s_tgy = vy * (float)g_GameWork.gsScreenHeight
+                    - (float)(g_GameWork.gsScreenHeight / 2)
+                    + (float)MC_OFFSET_Y;
+        }
+
+        /* One line per touch, not per frame: where the finger landed at every
+         * stage of the mapping, beside what the synthesised mouse reports, so
+         * a pointer that still lands in the wrong place is a single log away
+         * from its cause. */
+        if (s_tPressEdge)
+        {
+            SH_DBG("[TOUCHPTR] down n=(%.3f,%.3f) px=(%d,%d) of %dx%d view=(%.3f,%.3f) "
+                   "in=%d ui=(%d,%d) fb=%dx%d mouse=(%d,%d)",
+                   nx, ny, (int)(nx * (float)winW), (int)(ny * (float)winH), winW, winH,
+                   vx, vy, s_tInView, (int)s_tgx, (int)s_tgy,
+                   (int)g_GameWork.gsScreenWidth, (int)g_GameWork.gsScreenHeight,
+                   (int)s_gx, (int)s_gy);
+        }
+    }
+}
+
+int Pc_MouseCursor_TouchDriving(void)
+{
+    if (!Mc_Enabled() || s_tLastMs == 0)
+        return 0;
+
+    return s_tDown || (SDL_GetTicks() - s_tLastMs) < MC_TOUCH_RECENT_MS;
+}
+
+int Pc_MouseCursor_TouchDown(int* outX, int* outY)
+{
+    if (!Mc_Enabled() || !s_tDown || !s_tInView)
+        return 0;
+    if (outX != NULL) *outX = (int)s_tgx;
+    if (outY != NULL) *outY = (int)s_tgy;
+    return 1;
+}
+
+int Pc_MouseCursor_TouchViewportPos(float* outX, float* outY)
+{
+    if (!Mc_Enabled() || !(s_tDown || s_tReleaseEdge) || !s_tInView)
+        return 0;
+    if (outX != NULL) *outX = s_tvx;
+    if (outY != NULL) *outY = s_tvy;
+    return 1;
+}
+
+int Pc_MouseCursor_TouchPressed(void)
+{
+    return Mc_Enabled() && s_tPressEdge && s_tInView;
+}
+
+int Pc_MouseCursor_TouchReleased(int* outX, int* outY)
+{
+    if (!Mc_Enabled() || !s_tReleaseEdge || !s_tInView)
+        return 0;
+    if (outX != NULL) *outX = (int)s_tgx;
+    if (outY != NULL) *outY = (int)s_tgy;
+    return 1;
+}
+
+void Pc_MouseCursor_FrameUpdate(void)
+{
+    int    mx, my;
+    Uint32 btn;
+    float  fx, fy;
+
+    s_leftEdge = s_rightEdge = 0;
+
+    if (!Mc_Enabled())
+    {
+        s_prevLeft = s_prevRight = 0;
+        s_havePrev  = 0;
+        s_wheelStep = 0;
+        Mc_TouchClear();
+        if (s_puzzleFrames > 0)
+            s_puzzleFrames--;
+        return;
+    }
+
+    /* Wheel: PsyX latches each notch as a 2-frame countdown; a fresh notch is a
+     * rise back to 2 (prev<2). Two notches in one frame collapse to one step. */
+    {
+        extern int g_PsyX_WheelUpFrames, g_PsyX_WheelDownFrames;
+
+        s_wheelStep = 0;
+        if (g_PsyX_WheelUpFrames == 2 && s_prevWheelUp < 2)
+            s_wheelStep = 1;
+        else if (g_PsyX_WheelDownFrames == 2 && s_prevWheelDown < 2)
+            s_wheelStep = -1;
+        s_prevWheelUp   = g_PsyX_WheelUpFrames;
+        s_prevWheelDown = g_PsyX_WheelDownFrames;
+    }
+
+    btn         = SDL_GetMouseState(&mx, &my);
+    /* SDL hands these back in window points, including the ones it
+     * synthesises from touch. PsyX_MapWindowToViewport reasons in drawable
+     * pixels, so on a high-DPI iPhone an unscaled pointer lands at a third
+     * of its true position -- touch the centre of the menu, the cursor
+     * appears in the top-left corner. No-op everywhere else. */
+    PsyX_ScaleWindowToDrawable(&mx, &my);
+    s_moved     = (mx != s_prevMx || my != s_prevMy);
+    s_prevMx    = mx;
+    s_prevMy    = my;
+    s_leftDown  = (btn & SDL_BUTTON(SDL_BUTTON_LEFT))  != 0;
+    s_rightDown = (btn & SDL_BUTTON(SDL_BUTTON_RIGHT)) != 0;
+    s_leftEdge  = (s_leftDown  && !s_prevLeft);
+    s_rightEdge = (s_rightDown && !s_prevRight);
+    s_prevLeft  = s_leftDown;
+    s_prevRight = s_rightDown;
+
+    s_prevGx = s_gx;
+    s_prevGy = s_gy;
+    s_inView = PsyX_MapWindowToViewport(mx, my, &fx, &fy);
+    s_vx = fx;
+    s_vy = fy;
+    /* Mouse -> menu text-authoring space. Height differs by framebuffer mode:
+     * 448 (interlaced menus) / 224 (progressive in-game), read live. */
+    s_gx = fx * (float)g_GameWork.gsScreenWidth;
+    s_gy = fy * (float)g_GameWork.gsScreenHeight
+           - (float)(g_GameWork.gsScreenHeight / 2)
+           + (float)MC_OFFSET_Y;
+    if (!s_havePrev)
+    {
+        s_prevGx  = s_gx;
+        s_prevGy  = s_gy;
+        s_havePrev = 1;
+    }
+
+    Mc_TouchUpdate();
+
+    /* ---- Free-cursor puzzle servo (piano / plate / door / map pan) ---- */
+    if (s_puzzleFrames > 0)
+    {
+        float sens = g_PcConfig.mouseSensitivity;
+        int   sx = 0, sy = 0;
+
+        if (sens <= 0.0f)
+            sens = 1.0f;
+
+        /* A mouse move (re)engages absolute tracking; it releases once the cursor
+         * has caught up to the pointer, so an idle mouse won't fight a real pad. */
+        if (s_moved)
+            s_servoActive = 1;
+
+        if (s_servoActive && s_haveGameCur)
+        {
+            /* The mouse target and the puzzle's own cursor are both framebuffer
+             * centre-origin pixels (the MC_OFFSET reference cancels), so steer the
+             * stick by their difference until the cursor reaches the pointer. */
+            float ex = (s_gx - (float)MC_OFFSET_X) - s_gameCurX;
+            float ey = (s_gy - (float)MC_OFFSET_Y) - s_gameCurY;
+
+            if (ex > -3.0f && ex < 3.0f && ey > -3.0f && ey < 3.0f)
+            {
+                s_servoActive = 0; /* arrived — hand the stick back to a real pad */
+            }
+            else
+            {
+                sx = (int)(ex * MC_PUZZLE_SERVO_GAIN * sens);
+                sy = (int)(ey * MC_PUZZLE_SERVO_GAIN * sens);
+                if (sx < -127) sx = -127; else if (sx > 127) sx = 127;
+                if (sy < -127) sy = -127; else if (sy > 127) sy = 127;
+            }
+        }
+
+        if (g_Controller0 != NULL)
+        {
+            /* Harry is control-frozen during these puzzles, so this can't move the
+             * player. Only overwrite while steering, so an idle mouse leaves a
+             * plugged-in analog stick alone. */
+            if (sx != 0) g_Controller0->sticks_24.sticks_0.leftX = (s8)sx;
+            if (sy != 0) g_Controller0->sticks_24.sticks_0.leftY = (s8)sy;
+
+            if (s_leftEdge)
+                g_Controller0->clickedBtnFlags |= g_GameWorkPtr->config.controllerConfig.enter;
+            if (s_rightEdge)
+                g_Controller0->clickedBtnFlags |= g_GameWorkPtr->config.controllerConfig.cancel;
+        }
+        s_puzzleFrames--;
+    }
+}
+
+int Pc_MouseCursor_MenuRowHover(int baseY, int stepY, int count, unsigned int visibleFlags, int* outClicked)
+{
+    int i, hovered = -1;
+
+    if (outClicked != NULL)
+        *outClicked = 0;
+
+    if (!Mc_Enabled() || !s_inView || stepY <= 0)
+        return -1;
+
+    for (i = 0; i < count; i++)
+    {
+        int top, bot;
+
+        if ((visibleFlags & (1u << i)) == 0)
+            continue;
+
+        top = baseY + (i * stepY) - 3; /* small lead-in above the glyph top */
+        bot = top + stepY;
+        if (s_gy >= (float)top && s_gy < (float)bot)
+        {
+            hovered = i;
+            break;
+        }
+    }
+
+    if (hovered >= 0 && outClicked != NULL)
+        *outClicked = s_leftEdge;
+
+    return hovered;
+}
+
+void Pc_MouseCursor_Draw(void)
+{
+    POLY_FT4* poly;
+    s32       cx, cy;
+
+    if (!Mc_Enabled() || !s_inView)
+        return;
+    /* A GL overlay dialog composites above this whole frame, so it draws the
+     * cursor itself (Pc_MouseCursor_SpriteRgba/GlRect); ours would sit under it. */
+    if (Pc_ConfirmDialog_IsOpen() || Pc_QuickOptions_IsOpen() || Pc_BindPanel_IsOpen())
+        return;
+
+    /* Touch drives menus through this same hover/click path (SDL synthesizes
+     * mouse events from taps), but an arrow sprite parked wherever the last tap
+     * landed represents a pointer a touchscreen does not have. Keep the input
+     * behaviour, drop the drawing. Recency-based rather than compile-time so a
+     * device with both a touchscreen and a mouse follows whichever is in use. */
+    {
+        extern int Pc_Touch_UsedRecently(void);
+        if (Pc_Touch_UsedRecently() || Pc_MouseCursor_TouchDriving())
+            return;
+    }
+#if defined(__ANDROID__) || defined(SH_IOS)
+    /* Before the first touch there is nothing to be "recent" yet, and on a
+     * phone the pointer starts parked at 0,0. Nothing here has a mouse unless
+     * one is plugged in, so stay hidden until a real one moves the pointer. */
+    if (!s_moved)
+        return;
+#endif
+
+    cx = (s32)s_gx - MC_OFFSET_X;
+    cy = (s32)s_gy - MC_OFFSET_Y;
+
+    /* The game's own arrow pointer — the 32x32 sprite every cursor puzzle passes
+     * to Gfx_CursorDraw: BG_ETC.TIM atlas UV(0,64), CLUT (192,0), 4bpp tpage at
+     * VRAM (768,0). BG_ETC is uploaded during the boot logos (b_konami.c, or the
+     * skip_intros replication in game_main.c) and no region's title art overlaps
+     * it (US/JPN title lives at (848,0), PAL at (896,0); PAL's resliced BG_ETC
+     * keeps the top half, so the same UVs hold). Drawn at 16x16 like the puzzles
+     * do; the arrow tip sits at the sprite's top-left, so no hotspot offset. */
+    poly = (POLY_FT4*)GsOUT_PACKET_P;
+    setPolyFT4(poly);
+    setXY0Fast(poly, cx,      cy);
+    setXY1Fast(poly, cx + 16, cy);
+    setXY2Fast(poly, cx,      cy + 16);
+    setXY3Fast(poly, cx + 16, cy + 16);
+    setUVWH(poly, 0, 64, 32, 32);
+    poly->clut  = getClut(192, 0);
+    poly->tpage = getTPage(0, 0, 768, 0);
+    setRGB0(poly, 128, 128, 128);
+    setSemiTrans(poly, false);
+
+    /* The menu text draws into g_OrderingTable2 (g_OtTags0), layer 6; add the
+     * cursor at layer 4 so it sits on top — same overlay the crosshair uses. */
+    AddPrim(&g_OtTags0[g_ActiveBufferIdx][4], poly);
+    GsOUT_PACKET_P = (PACKET*)(poly + 1);
+}
+
+int Pc_MouseCursor_SpriteRgba(unsigned char* out)
+{
+    /* Same sprite as Pc_MouseCursor_Draw: 32x32 4bpp at tpage VRAM (768,0),
+     * UV (0,64) -> halfword column 768, row 64, 8 halfwords per row; 16-entry
+     * CLUT at halfword (192,0). Texel 0x0000 is transparent on the PSX. */
+    unsigned short px[32 * 8];
+    unsigned short clut[16];
+    int x, y;
+
+    GR_ReadVRAM(px, 768, 64, 8, 32);
+    GR_ReadVRAM(clut, 192, 0, 16, 1);
+
+    /* BG_ETC not uploaded yet: an all-zero CLUT would decode to nothing. */
+    for (x = 0; x < 16; x++)
+        if (clut[x] != 0)
+            break;
+    if (x == 16)
+        return 0;
+
+    for (y = 0; y < 32; y++) {
+        for (x = 0; x < 32; x++) {
+            unsigned short w = px[y * 8 + (x >> 2)];
+            unsigned short c = clut[(w >> ((x & 3) * 4)) & 0xF];
+            unsigned char* o = out + (y * 32 + x) * 4;
+            o[0] = (unsigned char)((c & 0x1F) << 3);
+            o[1] = (unsigned char)(((c >> 5) & 0x1F) << 3);
+            o[2] = (unsigned char)(((c >> 10) & 0x1F) << 3);
+            o[3] = (c == 0) ? 0 : 255;
+        }
+    }
+    return 1;
+}
+
+int Pc_MouseCursor_GlRect(float vpW, float vpH, float* outX, float* outY, float* outW, float* outH)
+{
+    float w, h, fbH;
+
+    if (!Mc_Enabled() || !s_inView)
+        return 0;
+
+    /* The PSX draw is 16x16 framebuffer units; the framebuffer is 320 wide and
+     * gsScreenHeight tall (448 on the interlaced menus, 224 in-game), so the
+     * cursor is the same fraction of the picture here as it is there. */
+    fbH = (float)g_GameWork.gsScreenHeight;
+    if (fbH <= 0.0f)
+        fbH = 240.0f;
+    w = 16.0f / 320.0f * vpW;
+    h = 16.0f / fbH * vpH;
+
+    if (outX) *outX = s_vx * vpW;
+    if (outY) *outY = (1.0f - s_vy) * vpH; /* top edge; arrow tip at top-left */
+    if (outW) *outW = w;
+    if (outH) *outH = h;
+    return 1;
+}

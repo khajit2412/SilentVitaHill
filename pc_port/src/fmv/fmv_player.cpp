@@ -1,0 +1,2624 @@
+/*
+ * fmv_player.cpp - PC FMV playback for Silent Hill
+ *
+ * Plays pre-converted AVI (MJPG) files using libjpeg + OpenGL.
+ * Audio streamed via SDL_QueueAudio (PCM).
+ * Adapted from REDRIVER2's VideoPlayer (BSD licensed).
+ */
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
+#include "fmv_player.h"
+#include "ReadAVI.h"
+#include "mdec.h"
+#include "str_demux.h"
+#include "sh_log.h"
+
+#include <PsyX/PsyX_public.h>
+#include <PsyX/PsyX_render.h>
+#include <PsyX/PsyX_audio.h>   /* PsyX_AudioPushXaFrames — FMV audio via the mixer */
+#include <PsyX/PsyX_globals.h> /* g_windowWidth/Height = the scene-target size */
+#include <PsyX/util/timer.h>
+#include <PsyX/common/glad.h>
+#include <PsyX/PsyX_backend.h>
+
+#include <psx/libgpu.h>
+#include <psx/libetc.h>
+#include <psx/libspu.h>   /* SpuSetCommonAttr — open the CD input for FMV audio */
+
+/* MJPG AVI overrides are a desktop convenience feature layered on top of the
+ * disc FMVs; the game's own STR/MDEC path below needs no libjpeg. Android has
+ * no system libjpeg, so the decoder compiles out there and IdentifyCodec
+ * reports MJPG as unsupported, which already falls back to the disc STR. */
+#if defined(SH_FMV_MJPEG)
+#include <jpeglib.h>
+#endif
+#include <SDL.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+
+extern "C" const char* PcPort_GetGameDataPath(void);
+extern "C" const char* PcPort_GetGameDiscPath(void);
+extern "C" unsigned int PcPort_FileTableStartSector(int fileIdx);
+
+/* FMV diagnostics need to survive the brief tick=23 MovieIntro state — if
+ * the game exits before the next stdout flush, plain printf output never
+ * hits the log file. Redirect every [FMV] line through SH_DBG (which
+ * writes to the line-buffered, exception-handler-flushed g_ShDebugLog). */
+#undef printf
+#define printf(...) SH_DBG_PRINTF_TRAILING_NEWLINE(__VA_ARGS__)
+static inline void SH_DBG_PRINTF_TRAILING_NEWLINE(const char* fmt, ...) {
+    if (!g_ShDebugLog) return;
+    va_list ap; va_start(ap, fmt);
+    vfprintf(g_ShDebugLog, fmt, ap);
+    va_end(ap);
+    fflush(g_ShDebugLog);
+}
+
+/* PsyCross internal - needed for direct buffer swap */
+extern SDL_Window* g_window;
+
+/* File ID to filename + disc-sector mapping.
+ *
+ * `name`         — base filename (used to locate optional AVI override).
+ * `base_sector`  — US-disc reference sector (documentation only; playback
+ *                  reads the live region-remapped g_FileTable instead).
+ * `n_sectors`    — total sectors the file spans on disc (== the suffix in `name`).
+ *
+ * Sector offsets are pulled from filetable.c.inc (entries 2044..2073, the
+ * XA/MOVIE block on Silent Hill USA). The PSX SDK packed XA dialog audio
+ * and STR FMV video into the same sector layout — entries 0..8 are pure
+ * audio (in-game voice lines, played via xa_player), entries 9..29 are
+ * video+audio cutscenes. The demuxer transparently skips audio sectors
+ * when reading a video stream, so the same table feeds both paths. */
+typedef struct {
+    const char* name;
+    uint32_t    base_sector;
+    uint32_t    n_sectors;
+} FmvFileEntry;
+
+static const FmvFileEntry s_fmvFiles[] = {
+    { "05_02152", 0x099bf,  2152 },  /* 0  - in-game voice line (XA-only) */
+    { "10_04432", 0x0a227,  4432 },  /* 1 */
+    { "15_07496", 0x0b377,  7496 },  /* 2 */
+    { "20_06552", 0x0d0bf,  6552 },  /* 3 */
+    { "25_03904", 0x0ea57,  3904 },  /* 4 */
+    { "30_04056", 0x0f997,  4056 },  /* 5 */
+    { "35_26008", 0x1096f, 26008 },  /* 6 */
+    { "40_10384", 0x16f07, 10384 },  /* 7 */
+    { "45_28784", 0x19797, 28784 },  /* 8 */
+    { "C1_20670", 0x20807, 20670 },  /* 9  - intro (US) */
+    { "C2_20670", 0x258c5, 20670 },  /* 10 - intro (JP) */
+    { "M1_03500", 0x2a983,  3500 },  /* 11 - opening */
+    { "M2_01190", 0x2b72f,  1190 },  /* 12 */
+    { "M3_02570", 0x2bbd5,  2570 },  /* 13 */
+    { "M4_02490", 0x2c5df,  2490 },  /* 14 */
+    { "M5_03140", 0x2cf99,  3140 },  /* 15 */
+    { "M6_02112", 0x2dbdd,  2112 },  /* 16 */
+    { "M7_01536", 0x2e41d,  1536 },  /* 17 */
+    { "M8_03039", 0x2ea1d,  3039 },  /* 18 */
+    { "M9_01730", 0x2f5fc,  1730 },  /* 19 */
+    { "MA_03590", 0x2fcbe,  3590 },  /* 20 */
+    { "MB_04850", 0x30ac4,  4850 },  /* 21 */
+    { "MC_01930", 0x31db6,  1930 },  /* 22 */
+    { "MD_03780", 0x32540,  3780 },  /* 23 */
+    { "ME_03300", 0x33404,  3300 },  /* 24 */
+    { "Z1_16180", 0x340e8, 16180 },  /* 25 */
+    { "Z3_02340", 0x3801c,  2340 },  /* 26 */
+    { "Z4_01590", 0x38940,  1590 },  /* 27 */
+    { "ZC_14392", 0x38f76, 14392 },  /* 28 */
+    { "ZZ_14239", 0x3c7ae, 14239 },  /* 29 */
+};
+
+#define FMV_FILE_COUNT (sizeof(s_fmvFiles) / sizeof(s_fmvFiles[0]))
+
+/* First XA file index in the file enum (FILE_XA_05_02152 = 2044 across versions) */
+#define FIRST_XA_FILE_IDX 2044
+
+/* Console command accessors (pc_console_cmd.c): list + play by table index.
+ * Entries 0..8 are XA voice banks (multiple interleaved audio channels, no
+ * video) — feeding them to FMV_Play decodes every channel back-to-back into
+ * fast garbled audio with a black screen. Only expose the real movies. */
+#define FIRST_MOVIE_TABLE_IDX 9
+extern "C" int FMV_GetCount(void) { return (int)FMV_FILE_COUNT - FIRST_MOVIE_TABLE_IDX; }
+extern "C" const char* FMV_GetName(int movieIdx)
+{
+    int tableIdx = FIRST_MOVIE_TABLE_IDX + movieIdx;
+    if (movieIdx < 0 || tableIdx >= (int)FMV_FILE_COUNT) return "";
+    return s_fmvFiles[tableIdx].name;
+}
+extern "C" int FMV_GetFileIdx(int movieIdx) { return FIRST_XA_FILE_IDX + FIRST_MOVIE_TABLE_IDX + movieIdx; }
+
+/* GL resources */
+static GLuint s_fmvTexture = 0;
+
+/* RGB decode buffer, grown on demand to fit the video — no resolution cap.
+ * (A fixed 1920x1080 buffer used to overflow the heap on 4K upscale mods.) */
+static unsigned char* s_decodeBuffer = NULL;
+static size_t s_decodeBufferSize = 0;
+
+/* Growable scratch for repacking 24/32-bit PCM audio chunks to S16. */
+static unsigned char* s_audioConvBuf = NULL;
+static size_t s_audioConvBufSize = 0;
+
+static int EnsureDecodeBuffer(size_t bytes)
+{
+    if (bytes <= s_decodeBufferSize)
+        return 0;
+
+    unsigned char* p = (unsigned char*)realloc(s_decodeBuffer, bytes);
+    if (!p) {
+        printf("[FMV] Out of memory growing decode buffer to %u bytes\n", (unsigned)bytes);
+        return -1;
+    }
+    s_decodeBuffer = p;
+    s_decodeBufferSize = bytes;
+    return 0;
+}
+
+#if defined(SH_FMV_MJPEG)
+/* libjpeg's default error handler exit()s the process on a corrupt frame —
+ * longjmp back out and drop the frame instead. */
+#include <setjmp.h>
+struct FmvJpegErr {
+    struct jpeg_error_mgr pub;
+    jmp_buf jump;
+};
+
+static void FmvJpegErrorExit(j_common_ptr cinfo)
+{
+    FmvJpegErr* err = (FmvJpegErr*)cinfo->err;
+    longjmp(err->jump, 1);
+}
+
+static int UnpackJPEG(unsigned char* src, unsigned src_len, int* out_w, int* out_h)
+{
+    struct jpeg_decompress_struct cinfo;
+    FmvJpegErr jerr;
+
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = FmvJpegErrorExit;
+    if (setjmp(jerr.jump)) {
+        jpeg_destroy_decompress(&cinfo);
+        return -1;
+    }
+
+    jpeg_create_decompress(&cinfo);
+    jpeg_mem_src(&cinfo, src, src_len);
+
+    if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
+        jpeg_destroy_decompress(&cinfo);
+        return -1;
+    }
+
+    /* Always decode to RGB (grayscale sources included) and size the buffer
+     * from the actual frame header, so any resolution fits. */
+    cinfo.out_color_space = JCS_RGB;
+
+    if (EnsureDecodeBuffer((size_t)cinfo.image_width * cinfo.image_height * 3u) != 0) {
+        jpeg_destroy_decompress(&cinfo);
+        return -1;
+    }
+
+    jpeg_start_decompress(&cinfo);
+
+    *out_w = cinfo.output_width;
+    *out_h = cinfo.output_height;
+
+    for (unsigned char* scanline = s_decodeBuffer;
+         cinfo.output_scanline < cinfo.output_height;
+         scanline += cinfo.output_width * cinfo.output_components)
+    {
+        jpeg_read_scanlines(&cinfo, &scanline, 1);
+    }
+
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    return 0;
+}
+#endif /* SH_FMV_MJPEG */
+
+/* Raw GL fullscreen quad - bypasses PsyCross vertex format */
+static GLuint s_fmvVAO = 0;
+static GLuint s_fmvVBO = 0;
+static GLuint s_fmvProgram = 0;
+
+/* No #version here: PsyX_Shader_Preamble prepends the one the live context
+ * takes, so this body also builds on the ANGLE-backed ES 3.0 backends. */
+static const char* s_fmvVertSrc =
+    "in vec2 a_pos;\n"
+    "in vec2 a_uv;\n"
+    "out vec2 v_uv;\n"
+    "void main() {\n"
+    "    v_uv = a_uv;\n"
+    "    gl_Position = vec4(a_pos, 0.0, 1.0);\n"
+    "}\n";
+
+static const char* s_fmvFragSrc =
+    "in vec2 v_uv;\n"
+    "out vec4 fragColor;\n"
+    "uniform sampler2D s_texture;\n"
+    "void main() {\n"
+    "    fragColor = texture(s_texture, v_uv);\n"
+    "}\n";
+
+static void InitBlitResources(void)
+{
+    if (s_fmvProgram)
+        return;
+
+    GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+    { const char* src[2] = { PsyX_Shader_Preamble(0, PSYX_GLSL_MODERN), s_fmvVertSrc };
+      glShaderSource(vs, 2, src, NULL); }
+    glCompileShader(vs);
+
+    GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+    { const char* src[2] = { PsyX_Shader_Preamble(1, PSYX_GLSL_MODERN), s_fmvFragSrc };
+      glShaderSource(fs, 2, src, NULL); }
+    glCompileShader(fs);
+
+    s_fmvProgram = glCreateProgram();
+    glAttachShader(s_fmvProgram, vs);
+    glAttachShader(s_fmvProgram, fs);
+    glBindAttribLocation(s_fmvProgram, 0, "a_pos");
+    glBindAttribLocation(s_fmvProgram, 1, "a_uv");
+    glLinkProgram(s_fmvProgram);
+
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+
+    glGenVertexArrays(1, &s_fmvVAO);
+    glGenBuffers(1, &s_fmvVBO);
+}
+
+/* Save/restore GL state so PsyCross is undisturbed */
+typedef struct {
+    GLboolean depth_test, stencil_test, blend, scissor_test;
+    GLint viewport[4];
+    GLfloat clear_color[4];
+    GLint active_texture;
+    GLint bound_texture;
+    GLint current_program;
+    GLint bound_vao;
+    GLint bound_vbo;
+} FmvGLState;
+
+static void SaveGLState(FmvGLState* s)
+{
+    s->depth_test = glIsEnabled(GL_DEPTH_TEST);
+    s->stencil_test = glIsEnabled(GL_STENCIL_TEST);
+    s->blend = glIsEnabled(GL_BLEND);
+    s->scissor_test = glIsEnabled(GL_SCISSOR_TEST);
+    glGetIntegerv(GL_VIEWPORT, s->viewport);
+    glGetFloatv(GL_COLOR_CLEAR_VALUE, s->clear_color);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &s->active_texture);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &s->bound_texture);
+    glGetIntegerv(GL_CURRENT_PROGRAM, &s->current_program);
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &s->bound_vao);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &s->bound_vbo);
+}
+
+static void RestoreGLState(const FmvGLState* s)
+{
+    if (s->depth_test) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    if (s->stencil_test) glEnable(GL_STENCIL_TEST); else glDisable(GL_STENCIL_TEST);
+    if (s->blend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+    if (s->scissor_test) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+    glViewport(s->viewport[0], s->viewport[1], s->viewport[2], s->viewport[3]);
+    glClearColor(s->clear_color[0], s->clear_color[1], s->clear_color[2], s->clear_color[3]);
+    glActiveTexture(s->active_texture);
+    glBindTexture(GL_TEXTURE_2D, s->bound_texture);
+    glUseProgram(s->current_program);
+    glBindVertexArray(s->bound_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, s->bound_vbo);
+}
+
+/* Texture storage is (re)allocated only when the frame size/format changes —
+ * a per-frame glTexImage2D realloc stalls some drivers hard at 4K. */
+static int s_fmvTexW = 0, s_fmvTexH = 0, s_fmvTexRgba = -1;
+
+extern "C" GLuint GR_ScreenFBO(void);
+
+static void DrawVideoFrameEx(const unsigned char* pixels, int image_w, int image_h, int rgba)
+{
+    int windowWidth, windowHeight;
+
+    /* GPUs cap 2D texture size (16384 on anything modern) — a frame past the
+     * cap would silently upload nothing. Warn once so the log names the cause. */
+    {
+        static int warned = 0;
+        static GLint maxTex = -1;
+        if (maxTex < 0)
+            glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTex);
+        if (maxTex > 0 && (image_w > maxTex || image_h > maxTex) && !warned) {
+            printf("[FMV] Frame %dx%d exceeds GPU max texture size %d — frame will not display\n",
+                   image_w, image_h, (int)maxTex);
+            warned = 1;
+        }
+    }
+
+    /* Size of the SCENE TARGET, not the OS window: in borderless the scene
+     * renders into an internal target at the chosen resolution and the present
+     * blit stretches it over the window. Sizing the viewport by the window
+     * put only the bottom-left render-size corner of it inside the target.
+     * These globals ARE the window size whenever no internal target exists. */
+    windowWidth  = g_windowWidth;
+    windowHeight = g_windowHeight;
+
+    float video_aspect = (float)image_w / (float)image_h;
+    float window_aspect = (float)windowWidth / (float)windowHeight;
+
+    float scaleX, scaleY;
+    if (video_aspect > window_aspect) {
+        scaleX = 1.0f;
+        scaleY = window_aspect / video_aspect;
+    } else {
+        scaleX = video_aspect / window_aspect;
+        scaleY = 1.0f;
+    }
+
+    /* pos.x, pos.y, uv.x, uv.y */
+    float quad[] = {
+        -scaleX,  scaleY,   0.0f, 0.0f,
+         scaleX,  scaleY,   1.0f, 0.0f,
+        -scaleX, -scaleY,   0.0f, 1.0f,
+         scaleX, -scaleY,   1.0f, 1.0f,
+    };
+
+    FmvGLState saved;
+    SaveGLState(&saved);
+
+    /* Draw into the SCENE target, not whatever happens to be bound. In
+     * borderless the scene renders into an internal target that is stretched
+     * over the whole window at present, and that blit would paint straight over
+     * a movie drawn to the window -- which is why FMVs went black as soon as the
+     * borderless resolution differed from the desktop. GR_ScreenFBO() is 0 in
+     * every other mode, so this is the same target it always used. */
+    glBindFramebuffer(GL_FRAMEBUFFER, GR_ScreenFBO());
+
+    glViewport(0, 0, windowWidth, windowHeight);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s_fmvTexture);
+
+    /* Our buffers are tightly packed; alignment 1 covers RGB24 rows where
+     * w*3 % 4 != 0 (default alignment 4 would skew those frames). */
+    GLint prevAlign = 4, prevRowLen = 0;
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &prevAlign);
+    glGetIntegerv(GL_UNPACK_ROW_LENGTH, &prevRowLen);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+
+    if (image_w != s_fmvTexW || image_h != s_fmvTexH || rgba != s_fmvTexRgba) {
+        glTexImage2D(GL_TEXTURE_2D, 0, rgba ? GL_RGBA8 : GL_RGB8, image_w, image_h, 0,
+                     rgba ? GL_RGBA : GL_RGB, GL_UNSIGNED_BYTE, NULL);
+        s_fmvTexW = image_w;
+        s_fmvTexH = image_h;
+        s_fmvTexRgba = rgba;
+    }
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, image_w, image_h,
+                    rgba ? GL_RGBA : GL_RGB, GL_UNSIGNED_BYTE, pixels);
+
+    glPixelStorei(GL_UNPACK_ALIGNMENT, prevAlign);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, prevRowLen);
+
+    glUseProgram(s_fmvProgram);
+    glUniform1i(glGetUniformLocation(s_fmvProgram, "s_texture"), 0);
+
+    glBindVertexArray(s_fmvVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, s_fmvVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    RestoreGLState(&saved);
+
+    /* FMV presents its own frames outside the normal render loop, but it must
+     * present through GR_SwapWindow like every other frame: that is where the
+     * internal target gets blitted onto the real window in borderless. The
+     * movie was drawn INTO that target above, so swapping the window directly
+     * showed only the stale black backbuffer — FMVs went dark exactly when the
+     * borderless resolution was below the desktop's. GR_SwapWindow also picks
+     * the right swap call for the backend (ANGLE never goes through SDL). */
+    GR_SwapWindow();
+}
+
+static void DrawVideoFrame(int image_w, int image_h)
+{
+    DrawVideoFrameEx(s_decodeBuffer, image_w, image_h, 0);
+}
+
+/* ===== Video codec dispatch =====
+ *
+ * Everything decodes into s_decodeBuffer as tightly-packed RGB24. MJPEG (all
+ * fourcc spellings) goes through libjpeg; the raw formats ffmpeg's -c:v
+ * rawvideo / BI_RGB writers emit are converted inline. Anything else falls
+ * back to the original disc STR so the cutscene still plays. */
+typedef enum {
+    FMV_CODEC_MJPEG,
+    FMV_CODEC_RGB,   /* uncompressed DIB, 24/32 bpp */
+    FMV_CODEC_YUY2,
+    FMV_CODEC_UYVY,
+    FMV_CODEC_I420,  /* also IYUV */
+    FMV_CODEC_YV12,
+    FMV_CODEC_NV12,
+    FMV_CODEC_UNSUPPORTED
+} FmvCodec;
+
+static int FourccIs(const char* fourcc, const char* want)
+{
+    for (int i = 0; i < 4; i++) {
+        char a = fourcc[i], b = want[i];
+        if (a >= 'a' && a <= 'z') a -= 32;
+        if (b >= 'a' && b <= 'z') b -= 32;
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
+static FmvCodec IdentifyCodec(const ReadAVI::stream_format_t* fmt)
+{
+    const char* cc = fmt->compression_type;
+
+#if defined(SH_FMV_MJPEG)
+    if (FourccIs(cc, "MJPG") || FourccIs(cc, "DMB1") ||
+        FourccIs(cc, "JPEG") || FourccIs(cc, "AVI1"))
+        return FMV_CODEC_MJPEG;
+#endif
+
+    /* BI_RGB has a zeroed compression field; some writers tag "DIB ". */
+    if ((cc[0] == 0 || FourccIs(cc, "DIB ")) &&
+        (fmt->bits_per_pixel == 24 || fmt->bits_per_pixel == 32))
+        return FMV_CODEC_RGB;
+
+    if (FourccIs(cc, "YUY2") || FourccIs(cc, "YUYV")) return FMV_CODEC_YUY2;
+    if (FourccIs(cc, "UYVY"))                         return FMV_CODEC_UYVY;
+    if (FourccIs(cc, "I420") || FourccIs(cc, "IYUV")) return FMV_CODEC_I420;
+    if (FourccIs(cc, "YV12"))                         return FMV_CODEC_YV12;
+    if (FourccIs(cc, "NV12"))                         return FMV_CODEC_NV12;
+
+    return FMV_CODEC_UNSUPPORTED;
+}
+
+/* BT.601 limited-range YUV -> RGB (what raw YUV AVIs carry). */
+static inline void YuvToRgb(int y, int u, int v, unsigned char* rgb)
+{
+    int c = y - 16, d = u - 128, e = v - 128;
+    int r = (298 * c + 409 * e + 128) >> 8;
+    int g = (298 * c - 100 * d - 208 * e + 128) >> 8;
+    int b = (298 * c + 516 * d + 128) >> 8;
+    rgb[0] = (unsigned char)(r < 0 ? 0 : (r > 255 ? 255 : r));
+    rgb[1] = (unsigned char)(g < 0 ? 0 : (g > 255 ? 255 : g));
+    rgb[2] = (unsigned char)(b < 0 ? 0 : (b > 255 ? 255 : b));
+}
+
+/* Uncompressed DIB: rows bottom-up unless height was negative, BGR(A) order,
+ * rows padded to 4 bytes. */
+static int UnpackRGB(const unsigned char* src, unsigned src_len, int w, int h,
+                     int bpp, int top_down)
+{
+    int bytes_pp = bpp / 8;
+    size_t stride = ((size_t)w * bytes_pp + 3) & ~(size_t)3;
+
+    if ((size_t)h * stride > src_len)
+        return -1;
+    if (EnsureDecodeBuffer((size_t)w * h * 3u) != 0)
+        return -1;
+
+    for (int y = 0; y < h; y++) {
+        const unsigned char* row = src + (size_t)(top_down ? y : (h - 1 - y)) * stride;
+        unsigned char* out = s_decodeBuffer + (size_t)y * w * 3;
+        for (int x = 0; x < w; x++) {
+            out[x * 3 + 0] = row[x * bytes_pp + 2];
+            out[x * 3 + 1] = row[x * bytes_pp + 1];
+            out[x * 3 + 2] = row[x * bytes_pp + 0];
+        }
+    }
+    return 0;
+}
+
+/* Packed 4:2:2 — YUY2 (Y0 U Y1 V) and UYVY (U Y0 V Y1). */
+static int UnpackYuv422(const unsigned char* src, unsigned src_len, int w, int h,
+                        int y_first)
+{
+    if ((size_t)w * h * 2u > src_len || (w & 1))
+        return -1;
+    if (EnsureDecodeBuffer((size_t)w * h * 3u) != 0)
+        return -1;
+
+    for (int y = 0; y < h; y++) {
+        const unsigned char* row = src + (size_t)y * w * 2;
+        unsigned char* out = s_decodeBuffer + (size_t)y * w * 3;
+        for (int x = 0; x < w; x += 2) {
+            const unsigned char* p = row + x * 2;
+            int y0 = y_first ? p[0] : p[1];
+            int u  = y_first ? p[1] : p[0];
+            int y1 = y_first ? p[2] : p[3];
+            int v  = y_first ? p[3] : p[2];
+            YuvToRgb(y0, u, v, out + x * 3);
+            YuvToRgb(y1, u, v, out + x * 3 + 3);
+        }
+    }
+    return 0;
+}
+
+/* Planar/semi-planar 4:2:0 — I420 (Y,U,V), YV12 (Y,V,U), NV12 (Y, UV interleaved). */
+static int UnpackYuv420(const unsigned char* src, unsigned src_len, int w, int h,
+                        FmvCodec codec)
+{
+    int cw = (w + 1) / 2, ch = (h + 1) / 2;
+    size_t ysize = (size_t)w * h, csize = (size_t)cw * ch;
+
+    if (ysize + csize * 2 > src_len)
+        return -1;
+    if (EnsureDecodeBuffer(ysize * 3u) != 0)
+        return -1;
+
+    const unsigned char* yp = src;
+    const unsigned char* up;
+    const unsigned char* vp;
+    int uv_interleaved = (codec == FMV_CODEC_NV12);
+
+    if (codec == FMV_CODEC_YV12) {
+        vp = src + ysize;
+        up = vp + csize;
+    } else { /* I420 + NV12 (up = base of interleaved plane for NV12) */
+        up = src + ysize;
+        vp = up + (uv_interleaved ? 1 : csize);
+    }
+
+    for (int y = 0; y < h; y++) {
+        unsigned char* out = s_decodeBuffer + (size_t)y * w * 3;
+        size_t crow = (size_t)(y / 2) * (uv_interleaved ? (size_t)cw * 2 : (size_t)cw);
+        for (int x = 0; x < w; x++) {
+            size_t ci = crow + (size_t)(x / 2) * (uv_interleaved ? 2 : 1);
+            YuvToRgb(yp[(size_t)y * w + x], up[ci], vp[ci], out + x * 3);
+        }
+    }
+    return 0;
+}
+
+/* Decode one video chunk into s_decodeBuffer. Returns 0 + real dims on success. */
+static int DecodeVideoFrame(FmvCodec codec, unsigned char* buf, unsigned len,
+                            const ReadAVI::stream_format_t* fmt, int* out_w, int* out_h)
+{
+    int w = fmt->image_width;
+    int h = fmt->image_height < 0 ? -fmt->image_height : fmt->image_height;
+    int top_down = fmt->image_height < 0;
+
+    switch (codec) {
+#if defined(SH_FMV_MJPEG)
+        case FMV_CODEC_MJPEG:
+            return UnpackJPEG(buf, len, out_w, out_h);
+#endif
+        case FMV_CODEC_RGB:
+            if (UnpackRGB(buf, len, w, h, fmt->bits_per_pixel, top_down) != 0) return -1;
+            break;
+        case FMV_CODEC_YUY2:
+            if (UnpackYuv422(buf, len, w, h, 1) != 0) return -1;
+            break;
+        case FMV_CODEC_UYVY:
+            if (UnpackYuv422(buf, len, w, h, 0) != 0) return -1;
+            break;
+        case FMV_CODEC_I420:
+        case FMV_CODEC_YV12:
+        case FMV_CODEC_NV12:
+            if (UnpackYuv420(buf, len, w, h, codec) != 0) return -1;
+            break;
+        default:
+            return -1;
+    }
+    *out_w = w;
+    *out_h = h;
+    return 0;
+}
+
+/* Try to find AVI file in several locations */
+static int FindAviFile(const char* basename, char* out_path, int out_path_size)
+{
+    const char* search_dirs[] = {
+        "gamedata/fmv/",
+        "../gamedata/fmv/",
+        "",
+    };
+    const char* extensions[] = { ".avi", ".AVI" };
+
+    for (int d = 0; search_dirs[d]; d++) {
+        for (int e = 0; e < 2; e++) {
+            snprintf(out_path, out_path_size, "%s%s%s", search_dirs[d], basename, extensions[e]);
+            FILE* f = fopen(out_path, "rb");
+            if (f) {
+                fclose(f);
+                return 0;
+            }
+        }
+        if (search_dirs[d][0] == '\0') break;
+    }
+    return -1;
+}
+
+extern "C" void FMV_Init(void)
+{
+    if (s_decodeBuffer)
+        return;
+
+    /* Seed with a 640x480 buffer; EnsureDecodeBuffer grows it to fit
+     * whatever resolution actually plays. */
+    EnsureDecodeBuffer(640 * 480 * 3);
+    if (s_decodeBuffer)
+        memset(s_decodeBuffer, 0, s_decodeBufferSize);
+
+    glGenTextures(1, &s_fmvTexture);
+    /* Fresh texture object has no storage — invalidate the size cache so the
+     * next DrawVideoFrameEx allocates before its glTexSubImage2D. */
+    s_fmvTexW = s_fmvTexH = 0;
+    s_fmvTexRgba = -1;
+    glBindTexture(GL_TEXTURE_2D, s_fmvTexture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    InitBlitResources();
+}
+
+extern "C" void FMV_Shutdown(void)
+{
+    if (s_decodeBuffer) {
+        ::free(s_decodeBuffer);
+        s_decodeBuffer = NULL;
+        s_decodeBufferSize = 0;
+    }
+    if (s_audioConvBuf) {
+        ::free(s_audioConvBuf);
+        s_audioConvBuf = NULL;
+        s_audioConvBufSize = 0;
+    }
+    if (s_fmvTexture) {
+        glDeleteTextures(1, &s_fmvTexture);
+        s_fmvTexture = 0;
+        s_fmvTexW = s_fmvTexH = 0;
+        s_fmvTexRgba = -1;
+    }
+    if (s_fmvVAO) {
+        glDeleteVertexArrays(1, &s_fmvVAO);
+        s_fmvVAO = 0;
+    }
+    if (s_fmvVBO) {
+        glDeleteBuffers(1, &s_fmvVBO);
+        s_fmvVBO = 0;
+    }
+    if (s_fmvProgram) {
+        glDeleteProgram(s_fmvProgram);
+        s_fmvProgram = 0;
+    }
+}
+
+/* ===== XA-ADPCM decoder for FMV audio =====
+ *
+ * Silent Hill FMVs interleave 4-bit XA-ADPCM stereo audio sectors with the
+ * MDEC video sectors. The demuxer (str_demux) forwards every audio sector
+ * to FmvAudio_OnSector via the registered callback; we decode the 18 sound
+ * groups into 4032 interleaved int16 samples and push them to SDL's audio
+ * queue. Format constants and decode logic mirror xa_player.c's standalone
+ * implementation — we keep separate ADPCM filter state so the FMV path
+ * does not collide with in-game XA voice playback. */
+static const int16_t s_fmvXaFilterPos[16] = {0, 60, 115,  98, 122, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+static const int16_t s_fmvXaFilterNeg[16] = {0,  0, -52, -55, -60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+
+#define FMV_XA_PAYLOAD_OFFSET     8
+#define FMV_XA_GROUPS_PER_SECTOR  18
+#define FMV_XA_GROUP_SIZE         128
+#define FMV_XA_SAMPLES_PER_SECTOR 4032   /* int16 count: 18 groups × 4 stereo pairs × 28 samples × 2ch */
+
+typedef struct {
+    SDL_AudioDeviceID dev;
+    int               sampleRate;
+    int               isStereo;
+    int               isOpen;
+    /* Set when this platform will not hand out a second output device (Android:
+     * SDL exposes one and the software SPU holds it). Decoded XA then goes to
+     * PsyX_AudioPushXaFrames, the same mixer path in-game voices use. */
+    int               useEngineMixer;
+    int32_t           lastSamples[2][2]; /* [channel][prev0=newer, prev1=older] */
+    int               sectorsDecoded;
+} FmvAudioState;
+
+static FmvAudioState s_fmvAudio;
+
+static inline int16_t FmvClampS16(int32_t v) {
+    if (v > 32767)  return 32767;
+    if (v < -32768) return -32768;
+    return (int16_t)v;
+}
+
+/* Decode 28 ADPCM samples from one 4-bit sub-block of a sound group.
+ * Identical to xa_player.c's DecodeSubblock4bit — see that file for full
+ * notes on group layout. Briefly: 8 header bytes describe the 8 sub-blocks
+ * (shift in low nibble, filter idx in high nibble) and 28 little-endian
+ * u32 words pack 8 nibbles each (one per sub-block). prev[] is the IIR
+ * history (UNCLAMPED — clamping only happens on the emitted s16). */
+static void FmvDecodeSubblock4bit(const uint8_t* group, int sb,
+                                  int32_t prev[2], int16_t out[28])
+{
+    const uint8_t* headers = group + 4;
+    const uint8_t* words   = group + 16;
+
+    int     shift     = headers[sb] & 0xF;
+    int     filterIdx = (headers[sb] >> 4) & 0x7;
+    int16_t fpos      = s_fmvXaFilterPos[filterIdx];
+    int16_t fneg      = s_fmvXaFilterNeg[filterIdx];
+    int     byteIdx   = sb >> 1;
+    int     nibShift  = (sb & 1) ? 4 : 0;
+
+    for (int w = 0; w < 28; w++) {
+        uint8_t b      = words[w * 4 + byteIdx];
+        int     nibble = (b >> nibShift) & 0xF;
+        int32_t s      = ((int16_t)(nibble << 12)) >> shift;
+        s += ((int32_t)prev[0] * fpos + (int32_t)prev[1] * fneg + 32) >> 6;
+        prev[1] = prev[0];
+        prev[0] = s;
+        out[w]  = FmvClampS16(s);
+    }
+}
+
+/* Decode one 2336-byte XA sector. Returns int16 sample count written.
+ * Layout: 18 sound groups, each 128 bytes, starting at offset 8 (after
+ * the 8-byte XA subheader). For 4-bit stereo, each group emits 8 sub-blocks
+ * = 4 stereo pairs × 28 samples × 2 channels = 224 int16 per group →
+ * 4032 int16 per sector. */
+static int FmvDecodeXaSector(const uint8_t* sector, int16_t* pcmOut)
+{
+    uint8_t coding   = sector[3];
+    int     isStereo = coding & 1;
+    int     bitDepth = (coding >> 4) & 1;
+
+    if (bitDepth != 0) {
+        /* 8-bit XA is rare and not used by Silent Hill FMVs — bail. */
+        return 0;
+    }
+
+    int     written = 0;
+    int16_t* out    = pcmOut;
+
+    for (int g = 0; g < FMV_XA_GROUPS_PER_SECTOR; g++) {
+        const uint8_t* group = sector + FMV_XA_PAYLOAD_OFFSET + g * FMV_XA_GROUP_SIZE;
+
+        if (isStereo) {
+            for (int p = 0; p < 4; p++) {
+                int16_t l[28], r[28];
+                FmvDecodeSubblock4bit(group, 2 * p,     s_fmvAudio.lastSamples[0], l);
+                FmvDecodeSubblock4bit(group, 2 * p + 1, s_fmvAudio.lastSamples[1], r);
+                for (int s = 0; s < 28; s++) {
+                    *out++ = l[s];
+                    *out++ = r[s];
+                }
+                written += 56;
+            }
+        } else {
+            for (int sb = 0; sb < 8; sb++) {
+                int16_t s[28];
+                FmvDecodeSubblock4bit(group, sb, s_fmvAudio.lastSamples[0], s);
+                for (int i = 0; i < 28; i++) *out++ = s[i];
+                written += 28;
+            }
+        }
+    }
+
+    return written;
+}
+
+/* FMV *movie* volume (0..1), independent of the XA cutscene-voice volume
+ * (g_PcXaVolume). FMV movie audio streams as raw PCM via SDL_QueueAudio — a
+ * different path from the OpenAL XA player — so it must be scaled here, and the
+ * two are split into separate options sliders (Voice vs FMV Movie). */
+extern "C" { float g_PcFmvVolume = 1.0f; }
+extern "C" { int   g_PcFmvPsxVolume = 1; }
+
+/* PSX movie_main routes the STR's XA through the SPU CD input at
+ * SsSetSerialVol(0, 80, 80) = 80/128 of full scale (stream.c:215-216;
+ * SdSetSerialVol maps voll<<8 against s16 full scale). The PC FMV paths
+ * bypass movie_main entirely, so without this factor every movie's audio bed
+ * plays ~4 dB hotter than on PSX relative to the SEQ BGM that keeps running
+ * underneath (e.g. "Loneliness" under the M7_01536 static in the
+ * Lisa-introduction scene) and masks it. */
+#define FMV_PSX_SERIAL_VOL (80.0f / 128.0f)
+
+static void FmvApplyVolume(void* buf, int bytes, SDL_AudioFormat fmt)
+{
+    float g = g_PcFmvVolume * (g_PcFmvPsxVolume ? FMV_PSX_SERIAL_VOL : 1.0f);
+    if (g >= 0.999f) return; /* full volume: leave the samples byte-identical */
+    if (g < 0.0f) g = 0.0f;
+
+    if (fmt == AUDIO_S16LSB || fmt == AUDIO_S16MSB)
+    {
+        int16_t* s = (int16_t*)buf;
+        int      n = bytes / (int)sizeof(int16_t);
+        for (int i = 0; i < n; i++)
+            s[i] = (int16_t)((float)s[i] * g);
+    }
+    else if (fmt == AUDIO_U8) /* unsigned 8-bit: silence is 128 */
+    {
+        uint8_t* s = (uint8_t*)buf;
+        for (int i = 0; i < bytes; i++)
+            s[i] = (uint8_t)(128 + (int)(((float)s[i] - 128.0f) * g));
+    }
+    else if (fmt == AUDIO_F32LSB)
+    {
+        float* s = (float*)buf;
+        int    n = bytes / (int)sizeof(float);
+        for (int i = 0; i < n; i++)
+            s[i] *= g;
+    }
+}
+
+/* str_demux audio sector callback. Lazily opens an SDL audio device on
+ * the first sector (using its subheader to learn rate/channels), then
+ * decodes and queues PCM. Must be C-linkage so it can be assigned to
+ * str_audio_cb_t (declared inside extern "C"). */
+extern "C" {
+static void FmvAudio_OnSector(const uint8_t* sector, void* user)
+{
+    FmvAudioState* st = (FmvAudioState*)user;
+
+    if (!st->isOpen) {
+        uint8_t coding     = sector[3];
+        int     isStereo   = coding & 1;
+        int     srCode     = (coding >> 2) & 3;
+        int     sampleRate = (srCode == 0) ? 37800 : 18900;
+
+        if (!(SDL_WasInit(SDL_INIT_AUDIO) & SDL_INIT_AUDIO)) {
+            if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
+                printf("[FMV] SDL audio init failed: %s\n", SDL_GetError());
+                return;
+            }
+        }
+
+        SDL_AudioSpec want, got;
+        SDL_memset(&want, 0, sizeof(want));
+        want.freq     = sampleRate;
+        want.format   = AUDIO_S16LSB;
+        want.channels = (Uint8)(isStereo ? 2 : 1);
+        want.samples  = 4096;
+
+        /* A second SDL output device is a desktop luxury. SDL's Android backend
+         * exposes ONE, and the software SPU already owns it, so this failed with
+         * "Audio device already open" and every movie played silent — the whole
+         * time, in the log, because printf goes nowhere on that platform.
+         *
+         * The engine already has a mixer-side path for exactly this shape of
+         * data: PsyX_AudioPushXaFrames, which is what xa_player_software.c uses
+         * for in-game voices. Push through it instead of opening anything. */
+        if (!st->useEngineMixer) {
+            st->dev = SDL_OpenAudioDevice(NULL, 0, &want, &got, 0);
+            if (st->dev == 0) {
+                SH_DBG("[FMV] SDL_OpenAudioDevice failed (%s) — routing FMV audio "
+                       "through the engine mixer instead", SDL_GetError());
+                st->useEngineMixer = 1;
+            }
+        }
+
+        if (st->useEngineMixer) {
+            st->sampleRate = sampleRate;
+            st->isStereo   = isStereo ? 1 : 0;
+            st->isOpen     = 1;
+            /* The mixer's XA stream is left stopped/drained by whatever voice
+             * played last (the log shows [XA] Stop right before a movie starts),
+             * so pushing frames into it produces nothing. Open it the same way
+             * xa_player_software.c does before its own pushes: reset the stream,
+             * set the gain, make sure it is not paused. Without these three the
+             * fallback path is silent even though every frame is queued. */
+            PsyX_AudioResetXa();
+            PsyX_AudioSetXaMasterGain((double)g_PcFmvVolume);
+            PsyX_AudioSetXaPaused(0);
+
+            /* XA reaches the output only through the SPU's CD input, and that
+             * has two gates the master gain above does NOT cover: SPU_COMMON_CDMIX
+             * (m_cdEnable) and the CD volume (m_cdVolL/R). Both default to
+             * off/zero, and the mixer applies the master gain BEFORE the CD
+             * volume, so gain 1.0 x volume 0 is still silence. The game opens
+             * these when it starts an XA voice (SdSetSerialVol / SdSetSerialAttr
+             * in smf_snd.c) but never for a movie, because on desktop movie audio
+             * never goes near the SPU. Open them here, the same way voices do.
+             *
+             * Measured before this: pushes returned ret=1 and the queue drained
+             * (2352 -> 2656 -> 2352 frames), i.e. decoded, accepted and mixed —
+             * and inaudible, because it was multiplied by a zero CD volume. */
+            {
+                SpuCommonAttr cdAttr;
+                memset(&cdAttr, 0, sizeof(cdAttr));
+                cdAttr.mask   = SPU_COMMON_CDMIX;
+                cdAttr.cd.mix = SPU_ON;
+                SpuSetCommonAttr(&cdAttr);
+
+                memset(&cdAttr, 0, sizeof(cdAttr));
+                cdAttr.mask             = SPU_COMMON_CDVOLL | SPU_COMMON_CDVOLR;
+                cdAttr.cd.volume.left   = 0x3FFF;
+                cdAttr.cd.volume.right  = 0x3FFF;
+                SpuSetCommonAttr(&cdAttr);
+            }
+            SH_DBG("[FMV] XA audio via engine mixer: %d Hz %s (coding=0x%02X) gain=%.2f",
+                   sampleRate, isStereo ? "stereo" : "mono", coding, (double)g_PcFmvVolume);
+        } else {
+            st->sampleRate = got.freq;
+            st->isStereo   = (got.channels == 2);
+            st->isOpen     = 1;
+            SDL_PauseAudioDevice(st->dev, 0);
+            SH_DBG("[FMV] XA audio opened: %d Hz %s (coding=0x%02X)",
+                   sampleRate, isStereo ? "stereo" : "mono", coding);
+        }
+    }
+
+    if (st->dev == 0 && !st->useEngineMixer) return;
+
+    int16_t pcm[FMV_XA_SAMPLES_PER_SECTOR];
+    int     n = FmvDecodeXaSector(sector, pcm);
+    if (n > 0) {
+        FmvApplyVolume(pcm, n * (int)sizeof(int16_t), AUDIO_S16LSB);
+        if (st->useEngineMixer) {
+            const int ch = st->isStereo ? 2 : 1;
+            PsyX_AudioPushXaFrames(pcm, (uint32_t)(n / ch),
+                                   (uint32_t)st->sampleRate, (uint32_t)ch);
+        } else {
+            SDL_QueueAudio(st->dev, pcm, (Uint32)(n * (int)sizeof(int16_t)));
+        }
+        st->sectorsDecoded++;
+    }
+}
+} /* extern "C" */
+
+/* AVI audio: PCM integer 8/16 bits map straight to SDL formats, float 32
+ * (wFormatTag 3, what `ffmpeg -c:a pcm_f32le` writes) queues as AUDIO_F32,
+ * and 24/32-bit integer PCM is repacked to S16 per chunk (`convertFrom`).
+ * Compressed audio (MP3/AAC/AC3) has no decoder here — the video plays
+ * silent and the log says how to re-encode. */
+typedef struct {
+    SDL_AudioDeviceID dev;
+    SDL_AudioSpec     spec;
+    int               convertFrom; /* 0 = none, else source bits (24/32 int PCM) */
+} FmvAviAudio;
+
+static int OpenFmvAudio(const ReadAVI::stream_format_auds_t* fmt, FmvAviAudio* out)
+{
+    memset(out, 0, sizeof(*out));
+
+    if (fmt->samples_per_second == 0 || fmt->channels == 0)
+        return -1; /* no audio stream */
+
+    if (!(SDL_WasInit(SDL_INIT_AUDIO) & SDL_INIT_AUDIO)) {
+        if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
+            printf("[FMV] Failed to init SDL audio: %s\n", SDL_GetError());
+            return -1;
+        }
+    }
+
+    SDL_AudioSpec want;
+    SDL_memset(&want, 0, sizeof(want));
+    want.freq = fmt->samples_per_second;
+    want.channels = (Uint8)fmt->channels;
+    want.samples = 4096;
+
+    if (fmt->format == 3 && fmt->bits_per_sample == 32) {
+        want.format = AUDIO_F32LSB;
+    } else if (fmt->format == 1 && fmt->bits_per_sample == 16) {
+        want.format = AUDIO_S16LSB;
+    } else if (fmt->format == 1 && fmt->bits_per_sample == 8) {
+        want.format = AUDIO_U8;
+    } else if (fmt->format == 1 &&
+               (fmt->bits_per_sample == 24 || fmt->bits_per_sample == 32)) {
+        want.format = AUDIO_S16LSB;
+        out->convertFrom = fmt->bits_per_sample;
+    } else {
+        printf("[FMV] Unsupported audio (wFormatTag=0x%X, %d bit) — video will play WITHOUT sound.\n"
+               "[FMV] Re-encode the audio track as PCM, e.g.: ffmpeg -i in.avi -c:v copy -c:a pcm_s16le out.avi\n",
+               fmt->format, fmt->bits_per_sample);
+        return -1;
+    }
+
+    out->dev = SDL_OpenAudioDevice(NULL, 0, &want, &out->spec, 0);
+    if (out->dev == 0) {
+        printf("[FMV] Failed to open audio device: %s\n", SDL_GetError());
+        return -1;
+    }
+
+    printf("[FMV] Audio: %d Hz, %d ch, %d bit %s%s\n",
+           fmt->samples_per_second, fmt->channels, fmt->bits_per_sample,
+           (fmt->format == 3) ? "float" : "PCM",
+           out->convertFrom ? " (repacked to 16-bit)" : "");
+
+    return 0;
+}
+
+/* Repack 24/32-bit little-endian integer PCM to S16 (keep the top 16 bits). */
+static int ConvertPcmToS16(const unsigned char* src, int src_bytes, int src_bits,
+                           unsigned char** out_buf, int* out_bytes)
+{
+    int bytes_per = src_bits / 8;
+    int samples = src_bytes / bytes_per;
+    size_t need = (size_t)samples * 2;
+
+    if (need > s_audioConvBufSize) {
+        unsigned char* p = (unsigned char*)realloc(s_audioConvBuf, need);
+        if (!p) return -1;
+        s_audioConvBuf = p;
+        s_audioConvBufSize = need;
+    }
+
+    int16_t* dst = (int16_t*)s_audioConvBuf;
+    for (int i = 0; i < samples; i++) {
+        const unsigned char* s = src + (size_t)i * bytes_per;
+        /* little-endian: the two most significant bytes are the last two */
+        dst[i] = (int16_t)(s[bytes_per - 2] | (s[bytes_per - 1] << 8));
+    }
+
+    *out_buf = s_audioConvBuf;
+    *out_bytes = samples * 2;
+    return 0;
+}
+
+/* Open the resolved disc image (any region — PcPort_GetGameDiscPath also
+ * region-initializes g_FileTable on first use, exactly like xa_player).
+ * Caller owns the FILE*. */
+static FILE* OpenDiscImage(void)
+{
+    const char* path = PcPort_GetGameDiscPath();
+    FILE* f = (path && path[0]) ? fopen(path, "rb") : NULL;
+    if (!f) {
+        printf("[FMV] Failed to open disc image: %s\n",
+               (path && path[0]) ? path : "(no disc found)");
+    }
+    return f;
+}
+
+/* Taskbar close / Alt+F4 / window X during an FMV used to only stop the video:
+ * all three playback loops treat SDL_QUIT as "bail out of this FMV", then return
+ * into the game, swallowing the close request — the window stayed open and the
+ * user had to close it again once the movie was gone. Route it to the real close
+ * path instead. PsyX_Exit is what PsyCross's own window-close handler calls, so
+ * teardown matches Alt+F4 exactly, including the normal-exit flag that stops a
+ * benign teardown exception from being logged as FATAL. Does not return. */
+extern void PsyX_Exit();
+
+static void FmvQuitNow(const char* where)
+{
+    printf("[FMV] close requested during %s — quitting\n", where);
+    fflush(stdout);
+    PsyX_Exit();
+}
+
+/* A movie has no on-screen UI and a touchscreen has no Start button, so any
+ * finger on the glass counts as the skip control. This feeds the SAME predicate
+ * the keys use, which matters: the skip-arming below only trusts it once it has
+ * seen everything released, so the tap that skipped one movie cannot run
+ * straight through the next one. Gated on the touch-controls setting so a
+ * player on a gamepad can rest a hand on the screen. */
+extern "C" int Pc_Touch_AnyContact(void);
+
+static int FmvTouchHeld(void)
+{
+    return Pc_Touch_AnyContact();
+}
+
+/* Poll skip keys, drain SDL events, and return 1 if the user wants to bail. */
+static int PollSkipOrQuit(int* out_quit)
+{
+    SDL_PumpEvents();
+
+    SDL_Event evt;
+    while (SDL_PollEvent(&evt)) {
+        if (evt.type == SDL_QUIT) {
+            FmvQuitNow("MDEC playback");
+            if (out_quit) *out_quit = 1;
+            return 1;
+        }
+    }
+
+    const Uint8* keystate = SDL_GetKeyboardState(NULL);
+    return (keystate[SDL_SCANCODE_RETURN] ||
+            keystate[SDL_SCANCODE_ESCAPE] ||
+            keystate[SDL_SCANCODE_SPACE] ||
+            PsyX_Pad_SkipButtonHeld() ||
+            FmvTouchHeld());
+}
+
+/* Play an FMV directly from the BIN disc image using the MDEC software
+ * decoder. Audio is *not* decoded here yet — XA dialogue tracks have their
+ * own pipeline (xa_player) and FMV soundtrack sync is a follow-up. Returns
+ * 0 on completion / user skip, -1 on open failure. */
+static int PlayFromBin(int table_idx, int max_frames)
+{
+    const FmvFileEntry& e = s_fmvFiles[table_idx];
+
+    FILE* bin = OpenDiscImage();
+    if (!bin) return -1;
+
+    /* Base sector from the live (region-remapped) file table, not the
+     * US-baked s_fmvFiles value — PAL places the same byte-identical movies
+     * +0x1E88 sectors later. OpenDiscImage() above guarantees the table is
+     * region-initialized. n_sectors/name stay table-local (identical across
+     * regions; name only feeds the AVI-override lookup). */
+    str_stream_t stream;
+    if (!str_open(&stream, bin, PcPort_FileTableStartSector(FIRST_XA_FILE_IDX + table_idx), e.n_sectors)) {
+        printf("[FMV] str_open failed for %s\n", e.name);
+        fclose(bin);
+        return -1;
+    }
+
+    /* Reset FMV audio state and register the audio-sector callback. The
+     * demuxer calls this for every audio sector encountered while reading
+     * the next video frame; the callback lazily opens an SDL audio device
+     * on the first sector and queues decoded PCM thereafter. */
+    SDL_memset(&s_fmvAudio, 0, sizeof(s_fmvAudio));
+    stream.audio_cb   = &FmvAudio_OnSector;
+    stream.audio_user = &s_fmvAudio;
+
+    FMV_Init();
+
+    /* Allocate persistent decode state: a 16k-halfword bitstream buffer
+     * (matches STR_FRAME_BS_MAX_HALFWORDS), the MDEC context (lazy IDCT/
+     * VLC tables), and the RGB output. */
+    static uint16_t bs[STR_FRAME_BS_MAX_HALFWORDS];
+    mdec_ctx_t ctx;
+    int ctx_initialized = 0;
+    uint8_t* rgb = NULL;
+    int rgb_w = 0, rgb_h = 0;
+
+    str_frame_info_t info;
+    size_t bs_halfwords = 0;
+
+    timerCtx_t fmvTimer;
+    Util_InitHPCTimer(&fmvTimer);
+    double nextFrameDelay = 0.0;
+    int done_frames = 0;
+    int want_quit = 0;
+
+    Util_GetHPCTime(&fmvTimer, 1);
+
+    /* Flush stale keys */
+    SDL_PumpEvents();
+    SDL_FlushEvent(SDL_KEYDOWN);
+    SDL_FlushEvent(SDL_KEYUP);
+
+    /* Skip is armed only after the skip keys have been seen released once:
+     * the keystroke that STARTED playback (console Enter, menu confirm) is
+     * usually still held on the first loop iterations and would otherwise
+     * skip the video at frame 0. */
+    int skip_armed = 0;
+
+    while (1) {
+        int skipHeld = PollSkipOrQuit(&want_quit);
+        if (want_quit) {
+            printf("[FMV] Quit at frame %d\n", done_frames);
+            break;
+        }
+        if (!skip_armed) {
+            if (!skipHeld)
+                skip_armed = 1;
+        } else if (skipHeld) {
+            printf("[FMV] Skipped at frame %d\n", done_frames);
+            break;
+        }
+
+        double delta = Util_GetHPCTime(&fmvTimer, 1);
+        if (delta > 1.0) delta = 0.0;
+        nextFrameDelay -= delta;
+
+        if (nextFrameDelay > 0) {
+            SDL_Delay(1);
+            continue;
+        }
+
+        int r = str_read_frame(&stream, bs, &info, &bs_halfwords);
+        if (r <= 0) break; /* EOF or demux error */
+
+        if (max_frames > 0 && done_frames >= max_frames) break;
+
+        /* (Re)allocate RGB buffer if dimensions changed (shouldn't for a
+         * single FMV, but cheap to be defensive). */
+        if (info.width != rgb_w || info.height != rgb_h) {
+            ::free(rgb);
+            rgb = (uint8_t*)calloc((size_t)info.width * info.height * 3u, 1);
+            rgb_w = info.width;
+            rgb_h = info.height;
+            if (!ctx_initialized) {
+                mdec_init(&ctx, info.width, info.height);
+                ctx_initialized = 1;
+            }
+        }
+        if (!rgb) break;
+
+        int mb = mdec_decode_frame(&ctx,
+                                   (const uint8_t*)bs,
+                                   bs_halfwords * 2u,
+                                   rgb);
+        if (mb < 0) {
+            /* Decode failure — emit a blank frame so timing still ticks. */
+            memset(rgb, 0, (size_t)info.width * info.height * 3u);
+        }
+
+        /* Move into the persistent decode buffer for DrawVideoFrame, then
+         * blit. We copy because s_decodeBuffer is what DrawVideoFrame
+         * uploads to GL — keeping that contract stable. */
+        size_t bytes = (size_t)info.width * info.height * 3u;
+        if (EnsureDecodeBuffer(bytes) == 0) {
+            memcpy(s_decodeBuffer, rgb, bytes);
+            DrawVideoFrame(info.width, info.height);
+        }
+
+        /* PSX STR videos target 15fps (every other NTSC frame). */
+        nextFrameDelay += 1.0 / 15.0;
+        done_frames++;
+
+        if (want_quit) break;
+    }
+
+    ::free(rgb);
+    fclose(bin);
+
+    /* Wait for skip keys to release before returning so the still-held key
+     * doesn't carry into the next state's first Joy_Update (Enter → phantom
+     * Confirm on the title; Cross on pad = Confirm too). Same protection as
+     * the AVI path. */
+    {
+        int wait_frames = 0;
+        while (wait_frames < 30) {
+            SDL_PumpEvents();
+            const Uint8* ks = SDL_GetKeyboardState(NULL);
+            if (!ks[SDL_SCANCODE_RETURN] && !ks[SDL_SCANCODE_ESCAPE] &&
+                !ks[SDL_SCANCODE_SPACE] && !PsyX_Pad_SkipButtonHeld() &&
+                !FmvTouchHeld())
+                break;
+            SDL_Delay(16);
+            wait_frames++;
+        }
+        SDL_PumpEvents();
+        SDL_FlushEvent(SDL_KEYDOWN);
+        SDL_FlushEvent(SDL_KEYUP);
+    }
+
+    printf("[FMV] BIN playback complete (%d frames from %s)\n",
+           done_frames, e.name);
+    return 0;
+}
+
+/* ============================================================================
+ * Optional ffmpeg fallback: native h264/h265/vp9/av1 inside mp4/mkv/webm/avi.
+ *
+ * Compiled in by default (CMake option SH_FMV_FFMPEG), but ffmpeg is loaded at
+ * RUNTIME and we ship no ffmpeg binaries: only the headers are a build
+ * dependency, nothing is in the exe's import table. Linking normally would make
+ * Windows refuse to start the exe for every user who has no ffmpeg DLLs, and we
+ * cannot redistribute them (the MSYS2 prebuilt is GPL). So the DLLs are
+ * user-supplied — dropped next to the exe or on PATH — and absent DLLs degrade
+ * to the disc STR exactly as if the feature were off.
+ *
+ * This is a FALLBACK BELOW the zero-dependency built-in MJPEG/raw decoder — a
+ * modder can drop e.g. gamedata/fmv/<name>.mp4 and it plays natively instead of
+ * forcing a huge MJPEG re-encode. Video decodes to RGB24 straight into
+ * s_decodeBuffer and presents through DrawVideoFrame; audio decodes to
+ * interleaved S16 and streams through the same SDL device + FmvApplyVolume the
+ * AVI path uses. Presentation is paced to the container's own PTS.
+ * ==========================================================================*/
+#if defined(SH_FMV_FFMPEG)
+extern "C" {
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libavutil/channel_layout.h>
+#include <libavutil/opt.h>
+#include <libswscale/swscale.h>
+#include <libswresample/swresample.h>
+}
+
+extern "C" {
+#include "../dll_loader.h"
+}
+
+/* We dereference public libav structs directly, so the loader's job is not
+ * "is this ffmpeg new enough" but "is every field we touch where our headers
+ * think it is". See the FfmpegAbiGen table below for how that is decided. */
+struct FfmpegApi
+{
+    int         (*avformat_open_input)(AVFormatContext**, const char*, const AVInputFormat*, AVDictionary**);
+    int         (*avformat_find_stream_info)(AVFormatContext*, AVDictionary**);
+    void        (*avformat_close_input)(AVFormatContext**);
+    int         (*av_read_frame)(AVFormatContext*, AVPacket*);
+    int         (*av_find_best_stream)(AVFormatContext*, enum AVMediaType, int, int, const AVCodec**, int);
+    unsigned    (*avformat_version)(void);
+
+    const AVCodec*   (*avcodec_find_decoder)(enum AVCodecID);
+    AVCodecContext*  (*avcodec_alloc_context3)(const AVCodec*);
+    void        (*avcodec_free_context)(AVCodecContext**);
+    int         (*avcodec_parameters_to_context)(AVCodecContext*, const AVCodecParameters*);
+    int         (*avcodec_open2)(AVCodecContext*, const AVCodec*, AVDictionary**);
+    int         (*avcodec_send_packet)(AVCodecContext*, const AVPacket*);
+    int         (*avcodec_receive_frame)(AVCodecContext*, AVFrame*);
+    const char* (*avcodec_get_name)(enum AVCodecID);
+    AVPacket*   (*av_packet_alloc)(void);
+    void        (*av_packet_free)(AVPacket**);
+    void        (*av_packet_unref)(AVPacket*);
+    unsigned    (*avcodec_version)(void);
+
+    AVFrame*    (*av_frame_alloc)(void);
+    void        (*av_frame_free)(AVFrame**);
+    void        (*av_frame_unref)(AVFrame*);
+    void        (*av_channel_layout_default)(AVChannelLayout*, int);
+    void        (*av_channel_layout_uninit)(AVChannelLayout*);
+    int         (*av_opt_get_int)(void*, const char*, int, int64_t*);
+    int         (*av_opt_set_int)(void*, const char*, int64_t, int);
+    int         (*av_opt_get_chlayout)(void*, const char*, int, AVChannelLayout*);
+    unsigned    (*avutil_version)(void);
+
+    struct SwsContext* (*sws_getContext)(int, int, enum AVPixelFormat, int, int, enum AVPixelFormat,
+                                         int, SwsFilter*, SwsFilter*, const double*);
+    void        (*sws_freeContext)(struct SwsContext*);
+    int         (*sws_scale)(struct SwsContext*, const uint8_t* const[], const int[], int, int,
+                             uint8_t* const[], const int[]);
+    const int*  (*sws_getCoefficients)(int colorspace);
+    int         (*sws_setColorspaceDetails)(struct SwsContext*, const int inv_table[4], int srcRange,
+                                            const int table[4], int dstRange,
+                                            int brightness, int contrast, int saturation);
+    unsigned    (*swscale_version)(void);
+
+    int         (*swr_alloc_set_opts2)(struct SwrContext**,
+                                       const AVChannelLayout*, enum AVSampleFormat, int,
+                                       const AVChannelLayout*, enum AVSampleFormat, int,
+                                       int, void*);
+    int         (*swr_init)(struct SwrContext*);
+    void        (*swr_free)(struct SwrContext**);
+    int         (*swr_convert)(struct SwrContext*, uint8_t**, int, const uint8_t**, int);
+    int         (*swr_get_out_samples)(struct SwrContext*, int);
+    unsigned    (*swresample_version)(void);
+};
+
+static FfmpegApi s_ff;
+static int       s_ffState = 0; /* 0 = untried, 1 = usable, -1 = unavailable */
+
+/* ---------------------------------------------------------------------------
+ * Which ffmpeg builds we accept, and why it is a TABLE and not a range.
+ *
+ * The decoder below dereferences public libav structs. A released soname major
+ * never changes layout, but layout does change BETWEEN majors, so the only
+ * question that matters is whether each field we touch sits at the same offset
+ * in every major we are willing to load. That was measured with offsetof
+ * against the real 6.1 / 7.1 / 8.0 headers rather than assumed:
+ *
+ *   identical in avcodec 60/61/62, avformat 60/61/62, avutil 58/59/60 —
+ *     AVFrame.data/linesize/extended_data/width/height/nb_samples/format/pts
+ *     AVFormatContext.streams        AVStream.codecpar/time_base/avg_frame_rate
+ *     AVCodecParameters.codec_id     AVPacket.stream_index
+ *     AVChannelLayout (all members, and sizeof — we stack-allocate it)
+ *   MOVED, so they are NOT touched directly any more (AVOptions instead) —
+ *     AVCodecContext.ch_layout   912 -> 352 -> 352   (past the end of the
+ *                                                     struct in 7/8: sizeof
+ *                                                     dropped 944 -> 864)
+ *     AVCodecContext.sample_rate 352 -> 344, .sample_fmt 360 -> 348,
+ *     .thread_count 636 -> 656,  .thread_type 640 -> 660,
+ *     .width/.height 116/120 -> 112/116 in 8
+ *     AVFrame.colorspace 332 -> 308 -> 292, .color_range 320 -> 296 -> 280,
+ *     .best_effort_timestamp 344 -> 320 -> 304
+ *
+ * The five majors move as a SET — avcodec 62 is only ever built against
+ * avutil 60 — so a generation is matched WHOLE. Mixing rows would hand a
+ * struct allocated by one major to code compiled against another.
+ *
+ * An unmeasured (newer) ffmpeg is refused rather than assumed safe. To add
+ * one, re-run the offsetof probe against its headers and add a row.
+ *
+ * DO NOT NARROW THIS TABLE TO ONE GENERATION. Linux distributions package
+ * exactly one ffmpeg major per release (Ubuntu 24.04 ships 6, 25.04 ships 7;
+ * Fedora and Arch track newer), so spanning 6-8 is precisely what lets a plain
+ * "apt install ffmpeg" satisfy this on every supported release. Drop to a
+ * single generation and the failure message below has to start naming
+ * per-distro libavcodecNN packages instead, which rots with every distro
+ * release. On Windows the 6.x row is legacy support for existing installs
+ * rather than a fresh download — BtbN no longer publishes ffmpeg 6 LGPL
+ * shared builds (only n7.1 and n8.1 remain) — but it costs nothing to keep.
+ * ------------------------------------------------------------------------ */
+enum {
+    FF_LIB_AVFORMAT = 0,
+    FF_LIB_AVCODEC,
+    FF_LIB_AVUTIL,
+    FF_LIB_SWSCALE,
+    FF_LIB_SWRESAMPLE,
+    FF_LIB_COUNT
+};
+
+static const char* const kFfmpegLibBase[FF_LIB_COUNT] = {
+    "avformat", "avcodec", "avutil", "swscale", "swresample"
+};
+
+typedef struct {
+    const char* release;             /* FFmpeg release this set ships with */
+    int         major[FF_LIB_COUNT];
+} FfmpegAbiGen;
+
+/* Newest first: when several are installed, prefer the one that decodes the
+ * most formats. All rows are equally safe by construction. */
+static const FfmpegAbiGen kFfmpegGens[] = {
+    { "8", { 62, 62, 60, 9, 6 } },
+    { "7", { 61, 61, 59, 8, 5 } },
+    { "6", { 60, 60, 58, 7, 4 } },
+};
+#define FF_GEN_COUNT ((int)(sizeof(kFfmpegGens) / sizeof(kFfmpegGens[0])))
+
+/* Bare names first: the OS then searches the exe's directory, so a user can
+ * either drop the DLLs next to the game or rely on a system-wide ffmpeg.
+ * On macOS a bare name only reaches the DYLD fallback paths (~/lib, /usr/local/lib,
+ * /usr/lib), which miss Homebrew's Apple Silicon prefix — so those are listed
+ * explicitly as absolute-path candidates. */
+static DllHandle FfmpegOpenVersioned(const char* base, int major)
+{
+    char names[3][96];
+    int  count;
+
+#if defined(_WIN32)
+    snprintf(names[0], sizeof(names[0]), "%s-%d.dll", base, major);
+    snprintf(names[1], sizeof(names[1]), "lib%s-%d.dll", base, major);
+    count = 2;
+#elif defined(__APPLE__)
+    snprintf(names[0], sizeof(names[0]), "lib%s.%d.dylib", base, major);
+    snprintf(names[1], sizeof(names[1]), "/opt/homebrew/lib/lib%s.%d.dylib", base, major);
+    snprintf(names[2], sizeof(names[2]), "/usr/local/lib/lib%s.%d.dylib", base, major);
+    count = 3;
+#else
+    snprintf(names[0], sizeof(names[0]), "lib%s.so.%d", base, major);
+    count = 1;
+#endif
+
+    for (int i = 0; i < count; i++) {
+        DllHandle h = DllLoader_Open(names[i]);
+        if (h)
+            return h;
+    }
+    return NULL;
+}
+
+/* The old message only listed what was MISSING, so a user with avcodec-62
+ * sitting next to the exe was told nothing useful. Name what is actually on
+ * disk next to what would be accepted, then say what to do about it — the
+ * Windows launcher can install a set itself, but Linux/macOS users only ever
+ * see this log, so the remedy has to be in here. */
+static void FfmpegReportInstalled(void)
+{
+    printf("[FMV] No supported ffmpeg found (need 6, 7 or 8) — mp4/mkv/webm overrides disabled.\n");
+    printf("[FMV] Found next to the game exe or on PATH:\n");
+    for (int l = 0; l < FF_LIB_COUNT; l++) {
+        char found[96];
+        char want[96];
+        int  fn = 0, wn = 0;
+
+        found[0] = '\0';
+        want[0]  = '\0';
+        for (int g = 0; g < FF_GEN_COUNT; g++) {
+            int major = kFfmpegGens[g].major[l];
+            if (wn >= 0 && wn < (int)sizeof(want))
+                wn += snprintf(want + wn, sizeof(want) - (size_t)wn, "%s%d", wn ? ", " : "", major);
+            DllHandle h = FfmpegOpenVersioned(kFfmpegLibBase[l], major);
+            if (h) {
+                if (fn >= 0 && fn < (int)sizeof(found))
+                    fn += snprintf(found + fn, sizeof(found) - (size_t)fn, "%s%d", fn ? ", " : "", major);
+                DllLoader_Close(h);
+            }
+        }
+        printf("[FMV]   %-11s have: %-12s accepted: %s\n",
+               kFfmpegLibBase[l], fn > 0 ? found : "(none)", want);
+    }
+    printf("[FMV] All five must come from the SAME FFmpeg release — any one of:\n");
+    for (int g = 0; g < FF_GEN_COUNT; g++)
+        printf("[FMV]   FFmpeg %s.x: avformat-%d avcodec-%d avutil-%d swscale-%d swresample-%d\n",
+               kFfmpegGens[g].release,
+               kFfmpegGens[g].major[FF_LIB_AVFORMAT], kFfmpegGens[g].major[FF_LIB_AVCODEC],
+               kFfmpegGens[g].major[FF_LIB_AVUTIL],   kFfmpegGens[g].major[FF_LIB_SWSCALE],
+               kFfmpegGens[g].major[FF_LIB_SWRESAMPLE]);
+
+    /* Any distro's stock ffmpeg package satisfies one of the rows above — that
+     * is exactly why the table spans 6-8 and must not be narrowed. */
+#if defined(_WIN32)
+    printf("[FMV] The launcher can download and install a matching set for you, or drop the\n"
+           "[FMV] DLLs next to the game exe yourself (LGPL shared builds: github.com/BtbN/FFmpeg-Builds).\n");
+#else
+    printf("[FMV]   Debian/Ubuntu: sudo apt install ffmpeg\n");
+    printf("[FMV]   Fedora:        sudo dnf install ffmpeg-free\n");
+    printf("[FMV]   Arch:          sudo pacman -S ffmpeg\n");
+    printf("[FMV]   macOS:         brew install ffmpeg\n");
+#endif
+    printf("[FMV] Only the shared libraries are needed, not the ffmpeg command-line tool.\n");
+}
+
+static int FfmpegCheckMajor(const char* lib, unsigned got, int want)
+{
+    if ((int)(got >> 16) == want)
+        return 0;
+    printf("[FMV] ffmpeg: %s reports major %u but its soname says %d — refusing (ABI mismatch)\n",
+           lib, got >> 16, want);
+    return -1;
+}
+
+static int FfmpegLoad(void)
+{
+    DllHandle           h[FF_LIB_COUNT];
+    const FfmpegAbiGen* gen     = NULL;
+    const char*         missing = NULL;
+
+    memset(&s_ff, 0, sizeof(s_ff));
+    memset(h, 0, sizeof(h));
+
+    /* Accept the first generation whose whole set is present. */
+    for (int g = 0; g < FF_GEN_COUNT && !gen; g++) {
+        int complete = 1;
+        for (int l = 0; l < FF_LIB_COUNT; l++) {
+            h[l] = FfmpegOpenVersioned(kFfmpegLibBase[l], kFfmpegGens[g].major[l]);
+            if (!h[l])
+                complete = 0;
+        }
+        if (complete) {
+            gen = &kFfmpegGens[g];
+        } else {
+            for (int l = 0; l < FF_LIB_COUNT; l++) {
+                DllLoader_Close(h[l]);
+                h[l] = NULL;
+            }
+        }
+    }
+
+    if (!gen) {
+        FfmpegReportInstalled();
+        goto fail;
+    }
+
+#define FF_SYM(lib, name)                                                        \
+    do {                                                                         \
+        *(void**)&s_ff.name = DllLoader_GetSymbol(h[lib], #name);                \
+        if (!s_ff.name) { missing = #name; goto missing_symbol; }                \
+    } while (0)
+
+    FF_SYM(FF_LIB_AVFORMAT, avformat_open_input);
+    FF_SYM(FF_LIB_AVFORMAT, avformat_find_stream_info);
+    FF_SYM(FF_LIB_AVFORMAT, avformat_close_input);
+    FF_SYM(FF_LIB_AVFORMAT, av_read_frame);
+    FF_SYM(FF_LIB_AVFORMAT, av_find_best_stream);
+    FF_SYM(FF_LIB_AVFORMAT, avformat_version);
+
+    FF_SYM(FF_LIB_AVCODEC, avcodec_find_decoder);
+    FF_SYM(FF_LIB_AVCODEC, avcodec_alloc_context3);
+    FF_SYM(FF_LIB_AVCODEC, avcodec_free_context);
+    FF_SYM(FF_LIB_AVCODEC, avcodec_parameters_to_context);
+    FF_SYM(FF_LIB_AVCODEC, avcodec_open2);
+    FF_SYM(FF_LIB_AVCODEC, avcodec_send_packet);
+    FF_SYM(FF_LIB_AVCODEC, avcodec_receive_frame);
+    FF_SYM(FF_LIB_AVCODEC, avcodec_get_name);
+    FF_SYM(FF_LIB_AVCODEC, av_packet_alloc);
+    FF_SYM(FF_LIB_AVCODEC, av_packet_free);
+    FF_SYM(FF_LIB_AVCODEC, av_packet_unref);
+    FF_SYM(FF_LIB_AVCODEC, avcodec_version);
+
+    FF_SYM(FF_LIB_AVUTIL, av_frame_alloc);
+    FF_SYM(FF_LIB_AVUTIL, av_frame_free);
+    FF_SYM(FF_LIB_AVUTIL, av_frame_unref);
+    FF_SYM(FF_LIB_AVUTIL, av_channel_layout_default);
+    FF_SYM(FF_LIB_AVUTIL, av_channel_layout_uninit);
+    FF_SYM(FF_LIB_AVUTIL, av_opt_get_int);
+    FF_SYM(FF_LIB_AVUTIL, av_opt_set_int);
+    FF_SYM(FF_LIB_AVUTIL, av_opt_get_chlayout);
+    FF_SYM(FF_LIB_AVUTIL, avutil_version);
+
+    FF_SYM(FF_LIB_SWSCALE, sws_getContext);
+    FF_SYM(FF_LIB_SWSCALE, sws_freeContext);
+    FF_SYM(FF_LIB_SWSCALE, sws_scale);
+    FF_SYM(FF_LIB_SWSCALE, sws_getCoefficients);
+    FF_SYM(FF_LIB_SWSCALE, sws_setColorspaceDetails);
+    FF_SYM(FF_LIB_SWSCALE, swscale_version);
+
+    FF_SYM(FF_LIB_SWRESAMPLE, swr_alloc_set_opts2);
+    FF_SYM(FF_LIB_SWRESAMPLE, swr_init);
+    FF_SYM(FF_LIB_SWRESAMPLE, swr_free);
+    FF_SYM(FF_LIB_SWRESAMPLE, swr_convert);
+    FF_SYM(FF_LIB_SWRESAMPLE, swr_get_out_samples);
+    FF_SYM(FF_LIB_SWRESAMPLE, swresample_version);
+#undef FF_SYM
+
+    /* A DLL whose soname lies about its contents would defeat the table. */
+    if (FfmpegCheckMajor("avformat",   s_ff.avformat_version(),   gen->major[FF_LIB_AVFORMAT])   != 0 ||
+        FfmpegCheckMajor("avcodec",    s_ff.avcodec_version(),    gen->major[FF_LIB_AVCODEC])    != 0 ||
+        FfmpegCheckMajor("avutil",     s_ff.avutil_version(),     gen->major[FF_LIB_AVUTIL])     != 0 ||
+        FfmpegCheckMajor("swscale",    s_ff.swscale_version(),    gen->major[FF_LIB_SWSCALE])    != 0 ||
+        FfmpegCheckMajor("swresample", s_ff.swresample_version(), gen->major[FF_LIB_SWRESAMPLE]) != 0)
+        goto version_mismatch;
+
+    printf("[FMV] ffmpeg runtime loaded: FFmpeg %s.x set — avformat %u.%u, avcodec %u.%u, "
+           "avutil %u.%u, swscale %u.%u, swresample %u.%u\n",
+           gen->release,
+           s_ff.avformat_version()   >> 16, (s_ff.avformat_version()   >> 8) & 0xFF,
+           s_ff.avcodec_version()    >> 16, (s_ff.avcodec_version()    >> 8) & 0xFF,
+           s_ff.avutil_version()     >> 16, (s_ff.avutil_version()     >> 8) & 0xFF,
+           s_ff.swscale_version()    >> 16, (s_ff.swscale_version()    >> 8) & 0xFF,
+           s_ff.swresample_version() >> 16, (s_ff.swresample_version() >> 8) & 0xFF);
+    return 0;
+
+missing_symbol:
+    printf("[FMV] ffmpeg: symbol '%s' missing from the FFmpeg %s.x set — container overrides disabled\n",
+           missing, gen->release);
+    printf("[FMV] Those libraries are not a complete stock FFmpeg build.\n");
+    goto fail;
+
+version_mismatch:
+    printf("[FMV] ffmpeg: the FFmpeg %s.x set did not report the versions its filenames claim —\n"
+           "[FMV] container overrides disabled (see the per-library line above).\n", gen->release);
+
+fail:
+    memset(&s_ff, 0, sizeof(s_ff));
+    for (int l = 0; l < FF_LIB_COUNT; l++)
+        DllLoader_Close(h[l]);
+    return -1;
+}
+
+static int FfmpegAvailable(void)
+{
+    if (s_ffState == 0)
+        s_ffState = (FfmpegLoad() == 0) ? 1 : -1;
+    return s_ffState > 0;
+}
+
+/* Route the decoder body below through the loaded table instead of the (absent)
+ * import stubs. av_q2d stays a real call — it is a static inline in rational.h. */
+#define avformat_open_input           s_ff.avformat_open_input
+#define avformat_find_stream_info     s_ff.avformat_find_stream_info
+#define avformat_close_input          s_ff.avformat_close_input
+#define av_read_frame                 s_ff.av_read_frame
+#define av_find_best_stream           s_ff.av_find_best_stream
+#define avcodec_find_decoder          s_ff.avcodec_find_decoder
+#define avcodec_alloc_context3        s_ff.avcodec_alloc_context3
+#define avcodec_free_context          s_ff.avcodec_free_context
+#define avcodec_parameters_to_context s_ff.avcodec_parameters_to_context
+#define avcodec_open2                 s_ff.avcodec_open2
+#define avcodec_send_packet           s_ff.avcodec_send_packet
+#define avcodec_receive_frame         s_ff.avcodec_receive_frame
+#define avcodec_get_name              s_ff.avcodec_get_name
+#define av_packet_alloc               s_ff.av_packet_alloc
+#define av_packet_free                s_ff.av_packet_free
+#define av_packet_unref               s_ff.av_packet_unref
+#define av_frame_alloc                s_ff.av_frame_alloc
+#define av_frame_free                 s_ff.av_frame_free
+#define av_frame_unref                s_ff.av_frame_unref
+#define av_channel_layout_default     s_ff.av_channel_layout_default
+#define av_channel_layout_uninit      s_ff.av_channel_layout_uninit
+#define av_opt_get_int                s_ff.av_opt_get_int
+#define av_opt_set_int                s_ff.av_opt_set_int
+#define av_opt_get_chlayout           s_ff.av_opt_get_chlayout
+#define sws_getContext                s_ff.sws_getContext
+#define sws_freeContext               s_ff.sws_freeContext
+#define sws_scale                     s_ff.sws_scale
+#define sws_getCoefficients           s_ff.sws_getCoefficients
+#define sws_setColorspaceDetails      s_ff.sws_setColorspaceDetails
+#define swr_alloc_set_opts2           s_ff.swr_alloc_set_opts2
+#define swr_init                      s_ff.swr_init
+#define swr_free                      s_ff.swr_free
+#define swr_convert                   s_ff.swr_convert
+#define swr_get_out_samples           s_ff.swr_get_out_samples
+
+static int FindContainerFile(const char* basename, char* out_path, int out_path_size)
+{
+    const char* dirs[] = { "gamedata/fmv/", "../gamedata/fmv/", "" };
+    const char* exts[] = { ".mp4", ".MP4", ".mkv", ".MKV",
+                           ".webm", ".WEBM", ".mov", ".MOV" };
+    for (int d = 0; d < 3; d++) {
+        for (int e = 0; e < (int)(sizeof(exts) / sizeof(exts[0])); e++) {
+            snprintf(out_path, out_path_size, "%s%s%s", dirs[d], basename, exts[e]);
+            FILE* f = fopen(out_path, "rb");
+            if (f) { fclose(f); return 0; }
+        }
+        if (dirs[d][0] == '\0') break;
+    }
+    return -1;
+}
+
+/* Poll the same skip inputs the AVI/BIN paths use. */
+static int FfmpegSkipHeld(void)
+{
+    SDL_PumpEvents();
+    const Uint8* ks = SDL_GetKeyboardState(NULL);
+    return ks[SDL_SCANCODE_RETURN] || ks[SDL_SCANCODE_ESCAPE] ||
+           ks[SDL_SCANCODE_SPACE] || PsyX_Pad_SkipButtonHeld() ||
+           FmvTouchHeld();
+}
+
+/* ===== Decode-ahead pipeline =====
+ *
+ * A worker thread does all libav work (demux, decode, swresample+SDL_QueueAudio,
+ * sws to RGBA) into a small ring of converted frames; the main thread only
+ * paces, uploads and presents. A decode spike then eats into the queued
+ * lead instead of stalling the present.
+ *
+ * PACING IS UNCHANGED: presentation still runs on the free-running HPC wall
+ * clock against container PTS (the audio-clock-slaved variant f66147ea5 broke
+ * playback outright and was reverted — if the audio device stalls, a clock
+ * derived from bytes-played stalls with it and video never advances; the wall
+ * clock cannot stall). The only clock change is WHEN it starts: at
+ * first-decoded-frame-ready instead of at codec-open, so open/probe/warm-up
+ * time no longer counts as "elapsed" (it made every early frame late enough
+ * to trip the >100ms drop rule and start 4K movies choppy). */
+#define FMV_QUEUE_SLOTS 3
+
+typedef struct {
+    uint8_t* rgba;   /* worker-converted frame, tightly packed w*4 */
+    size_t   cap;
+    int      w, h;
+    double   target; /* presentation time, seconds from first PTS */
+} FmvQueuedFrame;
+
+typedef struct {
+    /* ring: worker advances head, presenter advances tail */
+    FmvQueuedFrame slots[FMV_QUEUE_SLOTS];
+    int            head, tail, count; /* count guarded by mtx */
+    SDL_mutex*     mtx;
+    SDL_cond*      canPush;
+    SDL_atomic_t   abort;  /* presenter asks the worker to bail */
+    int            eof;    /* worker finished (EOF, error) — guarded by mtx */
+
+    /* decode state, worker-owned while the thread runs */
+    AVFormatContext*  fmt;
+    AVCodecContext*   vctx;
+    AVCodecContext*   actx;
+    SwrContext*       swr;
+    SDL_AudioDeviceID audioDev;
+    int               vs, as, ach;
+    struct SwsContext* sws;
+    int               swsW, swsH, swsFmt;
+    uint8_t*          audioBuf;
+    int               audioBufBytes;
+    /* Decoder's real audio format, read through AVOptions because the matching
+     * AVCodecContext fields sit at a different offset in every major. */
+    AVChannelLayout   aInLayout;
+    int               aSampleRate;
+    int               swrFailed;
+    double            vtb;        /* video stream time_base in seconds */
+    double            defaultDur; /* frame duration guess for NOPTS frames */
+    double            lastTarget;
+    int64_t           firstPts;
+} FmvDecodeCtx;
+
+/* (Re)build the RGBA converter from the DECODED frame's format, not the
+ * container's codecpar: for 10-bit HEVC (yuv420p10le) or a mid-stream
+ * format/size switch, codecpar and the real frames can disagree, and a
+ * mismatched SwsContext produces garbage. Also program the real matrix and
+ * range — swscale defaults to BT.601 limited, which visibly shifts colors on
+ * BT.709/full-range HD/4K re-encodes. */
+static void FmvWorkerEnsureSws(FmvDecodeCtx* dc, const AVFrame* frm)
+{
+    if (dc->sws && dc->swsW == frm->width && dc->swsH == frm->height &&
+        dc->swsFmt == frm->format)
+        return;
+
+    if (dc->sws) {
+        sws_freeContext(dc->sws);
+        dc->sws = NULL;
+    }
+    /* 1:1 size (GPU does the fit-to-window scaling at draw), so the scaler
+     * flag only drives chroma upsampling — take the cheapest one. */
+    dc->sws = sws_getContext(frm->width, frm->height, (enum AVPixelFormat)frm->format,
+                             frm->width, frm->height, AV_PIX_FMT_RGBA,
+                             SWS_FAST_BILINEAR, NULL, NULL, NULL);
+    dc->swsW   = frm->width;
+    dc->swsH   = frm->height;
+    dc->swsFmt = frm->format;
+    if (!dc->sws) {
+        printf("[FMV] ffmpeg: sws_getContext failed (%dx%d pixfmt=%d)\n",
+               frm->width, frm->height, frm->format);
+        return;
+    }
+
+    /* Colour tagging comes from the decoder context, not the frame: AVFrame's
+     * colorspace and color_range moved offset in BOTH 7.0 and 8.0, while the
+     * AVCodecContext AVOption of the same name is resolved inside the library
+     * and so reads correctly on every accepted major. The decoder has already
+     * filled these in from the bitstream by the time a frame comes out. */
+    int64_t csRaw = AVCOL_SPC_UNSPECIFIED;
+    int64_t crRaw = AVCOL_RANGE_UNSPECIFIED;
+    av_opt_get_int(dc->vctx, "colorspace",  0, &csRaw);
+    av_opt_get_int(dc->vctx, "color_range", 0, &crRaw);
+
+    int csp;
+    switch ((int)csRaw) {
+        case AVCOL_SPC_BT709:      csp = SWS_CS_ITU709; break;
+        case AVCOL_SPC_BT2020_NCL:
+        case AVCOL_SPC_BT2020_CL:  csp = SWS_CS_BT2020; break;
+        case AVCOL_SPC_SMPTE170M:
+        case AVCOL_SPC_BT470BG:    csp = SWS_CS_ITU601; break;
+        /* untagged: HD content is near-universally BT.709 */
+        default: csp = (frm->height >= 720) ? SWS_CS_ITU709 : SWS_CS_ITU601; break;
+    }
+    int srcRange = (crRaw == AVCOL_RANGE_JPEG) ? 1 : 0;
+    /* Failure just keeps swscale's 601/limited default — same as before. */
+    sws_setColorspaceDetails(dc->sws, sws_getCoefficients(csp), srcRange,
+                             sws_getCoefficients(csp), 1, 0, 1 << 16, 1 << 16);
+
+    printf("[FMV] ffmpeg: convert %dx%d pixfmt=%d matrix=%s range=%s -> RGBA\n",
+           frm->width, frm->height, frm->format,
+           (csp == SWS_CS_ITU709) ? "709" : (csp == SWS_CS_BT2020) ? "2020" : "601",
+           srcRange ? "full" : "limited");
+}
+
+/* Convert + enqueue one video frame. Blocks while the ring is full.
+ * Returns 0 to continue decoding, -1 to stop (abort or fatal). */
+static int FmvWorkerPushFrame(FmvDecodeCtx* dc, AVFrame* frm)
+{
+    /* AVFrame.pts is at the same offset on every accepted major;
+     * best_effort_timestamp is not, and the NOPTS branch below already covers
+     * the streams it used to rescue. */
+    int64_t pts = frm->pts;
+    double  target;
+    if (pts != AV_NOPTS_VALUE) {
+        if (dc->firstPts == AV_NOPTS_VALUE)
+            dc->firstPts = pts;
+        target = (double)(pts - dc->firstPts) * dc->vtb;
+    } else {
+        target = dc->lastTarget + dc->defaultDur;
+    }
+    dc->lastTarget = target;
+
+    SDL_LockMutex(dc->mtx);
+    while (dc->count == FMV_QUEUE_SLOTS && !SDL_AtomicGet(&dc->abort))
+        SDL_CondWait(dc->canPush, dc->mtx);
+    if (SDL_AtomicGet(&dc->abort)) {
+        SDL_UnlockMutex(dc->mtx);
+        return -1;
+    }
+    int idx = dc->head;
+    SDL_UnlockMutex(dc->mtx);
+
+    /* The head slot is invisible to the presenter until count++ below, so it
+     * is safe to fill outside the lock (single producer). */
+    FmvQueuedFrame* q = &dc->slots[idx];
+    size_t need = (size_t)frm->width * frm->height * 4u;
+    if (need > q->cap) {
+        uint8_t* nb = (uint8_t*)realloc(q->rgba, need);
+        if (!nb)
+            return 0; /* drop this frame, keep playing */
+        q->rgba = nb;
+        q->cap = need;
+    }
+
+    FmvWorkerEnsureSws(dc, frm);
+    if (!dc->sws)
+        return -1;
+
+    uint8_t* dst[4]       = { q->rgba, NULL, NULL, NULL };
+    int      dstStride[4] = { frm->width * 4, 0, 0, 0 };
+    sws_scale(dc->sws, frm->data, frm->linesize, 0, frm->height, dst, dstStride);
+    q->w = frm->width;
+    q->h = frm->height;
+    q->target = target;
+
+    SDL_LockMutex(dc->mtx);
+    dc->head = (dc->head + 1) % FMV_QUEUE_SLOTS;
+    dc->count++;
+    SDL_UnlockMutex(dc->mtx);
+    return 0;
+}
+
+/* swresample is configured from the DECODED frame's sample format rather than
+ * AVCodecContext.sample_fmt: that field has no AVOption and moved offset in
+ * 7.0, whereas AVFrame.format is identical on every accepted major. It is also
+ * the more correct source — decoders like HE-AAC only settle their true output
+ * format once the first frame comes out. */
+static int FmvWorkerInitSwr(FmvDecodeCtx* dc, enum AVSampleFormat inFmt)
+{
+    AVChannelLayout outLayout;
+    int             rc;
+
+    av_channel_layout_default(&outLayout, dc->ach);
+    rc = swr_alloc_set_opts2(&dc->swr,
+                             &outLayout,      AV_SAMPLE_FMT_S16, dc->aSampleRate,
+                             &dc->aInLayout,  inFmt,             dc->aSampleRate,
+                             0, NULL);
+    if (rc >= 0)
+        rc = swr_init(dc->swr);
+    av_channel_layout_uninit(&outLayout);
+
+    if (rc < 0) {
+        printf("[FMV] ffmpeg: swresample init failed (sample_fmt=%d) — playing silent\n", (int)inFmt);
+        if (dc->swr)
+            swr_free(&dc->swr);
+        return -1;
+    }
+    return 0;
+}
+
+/* Same audio convert+queue the old inline loop did; SDL_QueueAudio is
+ * thread-safe, and queueing to a still-paused device just buffers. */
+static void FmvWorkerQueueAudio(FmvDecodeCtx* dc, AVFrame* frm)
+{
+    if (!dc->swr) {
+        if (dc->swrFailed || FmvWorkerInitSwr(dc, (enum AVSampleFormat)frm->format) != 0) {
+            dc->swrFailed = 1;
+            return;
+        }
+    }
+
+    int outMax = (int)swr_get_out_samples(dc->swr, frm->nb_samples);
+    int need = outMax * dc->ach * (int)sizeof(int16_t);
+    if (need > dc->audioBufBytes) {
+        uint8_t* nb = (uint8_t*)realloc(dc->audioBuf, (size_t)need);
+        if (nb) { dc->audioBuf = nb; dc->audioBufBytes = need; }
+    }
+    /* A failed realloc leaves audioBuf at its old, smaller size — converting
+     * into it with the larger outMax would overflow the heap, so drop the
+     * frame instead. */
+    if (dc->audioBuf && dc->audioBufBytes >= need) {
+        uint8_t* out[1] = { dc->audioBuf };
+        int n = swr_convert(dc->swr, out, outMax,
+                            (const uint8_t**)frm->extended_data, frm->nb_samples);
+        if (n > 0) {
+            int bytes = n * dc->ach * (int)sizeof(int16_t);
+            FmvApplyVolume(dc->audioBuf, bytes, AUDIO_S16LSB);
+            SDL_QueueAudio(dc->audioDev, dc->audioBuf, (Uint32)bytes);
+        }
+    }
+}
+
+static int SDLCALL FmvDecodeWorker(void* ud)
+{
+    FmvDecodeCtx* dc = (FmvDecodeCtx*)ud;
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame*  frm = av_frame_alloc();
+    int reading = (pkt && frm) ? 1 : 0;
+    int fatal = !reading;
+
+    while (!fatal && !SDL_AtomicGet(&dc->abort)) {
+        int haveVideo = 0, haveAudio = 0;
+
+        int rr = av_read_frame(dc->fmt, pkt);
+        if (rr < 0) {
+            /* Drain: flush both decoders, then finish. */
+            avcodec_send_packet(dc->vctx, NULL);
+            if (dc->actx) avcodec_send_packet(dc->actx, NULL);
+            reading = 0;
+            haveVideo = 1;
+            haveAudio = (dc->actx != NULL);
+        } else if (pkt->stream_index == dc->vs) {
+            if (avcodec_send_packet(dc->vctx, pkt) >= 0) haveVideo = 1;
+            av_packet_unref(pkt);
+        } else if (dc->as >= 0 && pkt->stream_index == dc->as) {
+            if (avcodec_send_packet(dc->actx, pkt) >= 0) haveAudio = 1;
+            av_packet_unref(pkt);
+        } else {
+            av_packet_unref(pkt);
+            continue;
+        }
+
+        if (haveAudio && dc->audioDev) {
+            while (avcodec_receive_frame(dc->actx, frm) == 0) {
+                FmvWorkerQueueAudio(dc, frm);
+                av_frame_unref(frm);
+            }
+        }
+
+        if (haveVideo) {
+            while (avcodec_receive_frame(dc->vctx, frm) == 0) {
+                int r = FmvWorkerPushFrame(dc, frm);
+                av_frame_unref(frm);
+                if (r != 0) { fatal = 1; break; }
+            }
+        }
+
+        if (!reading)
+            break; /* EOF drain pass done */
+    }
+
+    if (frm) av_frame_free(&frm);
+    if (pkt) av_packet_free(&pkt);
+
+    SDL_LockMutex(dc->mtx);
+    dc->eof = 1;
+    SDL_UnlockMutex(dc->mtx);
+    return 0;
+}
+
+/* Returns 0 if the file was played (or skipped) — caller must NOT fall back to
+ * the disc STR — or -1 if it could not be opened/decoded (caller falls back). */
+static int PlayFromFFmpeg(const char* path)
+{
+    AVFormatContext*   fmt = NULL;
+    AVCodecContext*    vctx = NULL;
+    AVCodecContext*    actx = NULL;
+    SDL_AudioDeviceID  audioDev = 0;
+    SDL_Thread*        worker = NULL;
+    int                vs = -1, as = -1, ach = 0;
+    int                played = -1;
+    FmvDecodeCtx       dc;
+
+    memset(&dc, 0, sizeof(dc));
+
+    if (!FfmpegAvailable())
+        return -1;
+
+    if (avformat_open_input(&fmt, path, NULL, NULL) != 0) {
+        printf("[FMV] ffmpeg: cannot open '%s'\n", path);
+        return -1;
+    }
+    /* Cap how far ffmpeg analyses before it will report the streams.
+     *
+     * These bound STREAM DISCOVERY only, so nothing here can shorten playback:
+     * once the streams are known the demuxer reads the whole file exactly as
+     * before, and the frame loop still ends on EOF rather than on any byte
+     * budget.
+     *
+     * The default analyzeduration is 5 s, sized for formats that genuinely
+     * have to be scanned (MPEG-TS and friends). Our containers are MP4 and
+     * AVI, whose headers already declare every codec parameter, so 2 s is
+     * generous and simply stops a badly muxed file from spending the whole
+     * budget before the first frame can appear.
+     *
+     * The retry is what makes this safe rather than merely likely-safe: if the
+     * tighter budget ever fails to identify the streams, the caps are lifted
+     * and the probe runs again exactly as it used to. The worst case is
+     * today's behaviour plus one cheap failed attempt. */
+    {
+        Uint32 probeStart = SDL_GetTicks();
+        int    rc;
+
+        av_opt_set_int(fmt, "probesize",       8 * 1024 * 1024, 0);
+        av_opt_set_int(fmt, "analyzeduration", 2 * 1000 * 1000, 0);
+
+        rc = avformat_find_stream_info(fmt, NULL);
+        if (rc < 0) {
+            printf("[FMV] ffmpeg: capped probe found no stream info, retrying uncapped\n");
+            av_opt_set_int(fmt, "probesize",       5 * 1000 * 1000, 0);
+            av_opt_set_int(fmt, "analyzeduration", 5 * 1000 * 1000, 0);
+            rc = avformat_find_stream_info(fmt, NULL);
+        }
+        if (rc < 0) {
+            printf("[FMV] ffmpeg: no stream info in '%s'\n", path);
+            goto cleanup;
+        }
+        printf("[FMV] ffmpeg: probe %u ms\n", (unsigned)(SDL_GetTicks() - probeStart));
+    }
+
+    vs = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+    if (vs < 0) {
+        printf("[FMV] ffmpeg: no video stream in '%s'\n", path);
+        goto cleanup;
+    }
+    as = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
+
+    {
+        const AVCodec* vc = avcodec_find_decoder(fmt->streams[vs]->codecpar->codec_id);
+        if (!vc) { printf("[FMV] ffmpeg: no video decoder built in\n"); goto cleanup; }
+        vctx = avcodec_alloc_context3(vc);
+        if (!vctx) goto cleanup;
+        avcodec_parameters_to_context(vctx, fmt->streams[vs]->codecpar);
+        /* Multithreaded decode: one core cannot hold 4K HEVC at speed.
+         * 0 = auto (core count); the codec picks frame and/or slice
+         * threading from the allowed mask. Set through AVOptions — both
+         * fields moved offset in 7.0, the option names did not. */
+        av_opt_set_int(vctx, "threads",     0, 0);
+        av_opt_set_int(vctx, "thread_type", FF_THREAD_FRAME | FF_THREAD_SLICE, 0);
+        if (avcodec_open2(vctx, vc, NULL) < 0) {
+            printf("[FMV] ffmpeg: cannot open video decoder\n"); goto cleanup;
+        }
+    }
+
+    if (as >= 0) {
+        const AVCodec* ac = avcodec_find_decoder(fmt->streams[as]->codecpar->codec_id);
+        if (ac) {
+            actx = avcodec_alloc_context3(ac);
+            if (actx) {
+                avcodec_parameters_to_context(actx, fmt->streams[as]->codecpar);
+                if (avcodec_open2(actx, ac, NULL) < 0) {
+                    avcodec_free_context(&actx);
+                    actx = NULL;
+                }
+            }
+        }
+        if (!actx) {
+            printf("[FMV] ffmpeg: audio decoder unavailable — playing silent\n");
+            as = -1;
+        }
+    }
+
+    {
+        /* Resolution is reported by the per-frame "convert ..." line below, from
+         * AVFrame — AVCodecContext.width/height moved in 8.0 and have no
+         * AVOption, and codecpar->codec_id is offset-stable on every major. */
+        int64_t threads = 0;
+        av_opt_get_int(vctx, "threads", 0, &threads);
+        printf("[FMV] ffmpeg: %s%s, threads=%d\n",
+               avcodec_get_name(fmt->streams[vs]->codecpar->codec_id),
+               (as >= 0) ? " + audio" : "", (int)threads);
+    }
+
+    FMV_Init();
+
+    if (as >= 0) {
+        int64_t optRate = 0;
+        if (av_opt_get_int(actx, "ar", 0, &optRate) < 0 ||
+            av_opt_get_chlayout(actx, "ch_layout", 0, &dc.aInLayout) < 0 ||
+            optRate <= 0 || dc.aInLayout.nb_channels <= 0) {
+            printf("[FMV] ffmpeg: could not query the audio format — playing silent\n");
+            as = -1;
+        } else {
+            dc.aSampleRate = (int)optRate;
+            ach = dc.aInLayout.nb_channels;
+
+            /* The game runs its own audio through OpenAL, so SDL's audio subsystem is
+             * never brought up at startup — open it here exactly as the AVI/STR paths
+             * do, or SDL_OpenAudioDevice fails and every container plays silent. */
+            if (!(SDL_WasInit(SDL_INIT_AUDIO) & SDL_INIT_AUDIO))
+                SDL_InitSubSystem(SDL_INIT_AUDIO);
+            SDL_AudioSpec want, got;
+            SDL_memset(&want, 0, sizeof(want));
+            want.freq = dc.aSampleRate;
+            want.channels = (Uint8)ach;
+            want.format = AUDIO_S16LSB;
+            want.samples = 4096;
+            /* Device stays PAUSED (queued audio just buffers) until the first
+             * video frame is ready, so decoder warm-up cannot put audio ahead
+             * of the video clock for the whole movie. swresample itself is built
+             * by the worker off the first decoded frame. */
+            audioDev = SDL_OpenAudioDevice(NULL, 0, &want, &got, 0);
+            if (!audioDev)
+                printf("[FMV] ffmpeg: audio device open failed — silent\n");
+        }
+    }
+
+    dc.mtx = SDL_CreateMutex();
+    dc.canPush = SDL_CreateCond();
+    if (!dc.mtx || !dc.canPush) goto cleanup;
+    dc.fmt = fmt;
+    dc.vctx = vctx;
+    dc.actx = actx;
+    dc.audioDev = audioDev;
+    dc.vs = vs;
+    dc.as = as;
+    dc.ach = ach;
+    dc.vtb = av_q2d(fmt->streams[vs]->time_base);
+    dc.firstPts = AV_NOPTS_VALUE;
+    {
+        double fps = av_q2d(fmt->streams[vs]->avg_frame_rate);
+        dc.defaultDur = (fps > 1.0) ? 1.0 / fps : 1.0 / 30.0;
+    }
+    SDL_AtomicSet(&dc.abort, 0);
+
+    worker = SDL_CreateThread(FmvDecodeWorker, "fmv_decode", &dc);
+    if (!worker) {
+        printf("[FMV] ffmpeg: decode thread creation failed\n");
+        goto cleanup;
+    }
+
+    /* From here the file is ours: even a skip counts as "played", so the caller
+     * must not also run the disc STR. (Decoding NOTHING demotes this back to -1
+     * below so the caller can still fall back.) */
+    played = 0;
+
+    {
+        timerCtx_t tmr;
+        Util_InitHPCTimer(&tmr);
+        double elapsed = 0.0;
+        int    skip_armed = 0;
+        int    stop = 0;   /* skip or SDL_QUIT */
+        int    clockStarted = 0;
+        int    framesShown = 0;
+
+        SDL_PumpEvents();
+        SDL_FlushEvent(SDL_KEYDOWN);
+        SDL_FlushEvent(SDL_KEYUP);
+
+        while (!stop) {
+            /* Wait for a converted frame from the worker (or its EOF). */
+            int queued = 0, done = 0;
+            for (;;) {
+                SDL_LockMutex(dc.mtx);
+                queued = dc.count;
+                done = dc.eof;
+                SDL_UnlockMutex(dc.mtx);
+                if (queued > 0 || done) break;
+                int held = FfmpegSkipHeld();
+                if (!skip_armed) { if (!held) skip_armed = 1; }
+                else if (held) { printf("[FMV] ffmpeg: skipped\n"); stop = 1; break; }
+                SDL_Event ev;
+                while (SDL_PollEvent(&ev)) if (ev.type == SDL_QUIT) FmvQuitNow("ffmpeg playback");
+                SDL_Delay(1);
+            }
+            if (stop || queued == 0)
+                break; /* skip, or worker done and ring drained */
+
+            /* tail is only ever advanced by this thread — safe unlocked. */
+            FmvQueuedFrame* q = &dc.slots[dc.tail];
+
+            /* The clock starts at first-frame-READY and audio starts with it —
+             * open/probe/decoder-warm-up time must not count as elapsed playback
+             * (it made every early frame "late" → dropped → choppy 4K starts,
+             * and would put audio ahead of video by the warm-up time). */
+            if (!clockStarted) {
+                if (audioDev) SDL_PauseAudioDevice(audioDev, 0);
+                Util_GetHPCTime(&tmr, 1); /* zero the clock */
+                clockStarted = 1;
+            } else {
+                elapsed += Util_GetHPCTime(&tmr, 1);
+            }
+
+            /* Pace to PTS on the free-running wall clock (NOT the audio clock —
+             * see the pipeline comment above). Poll skip + pump events at least
+             * ONCE per frame, even when the frame is already late, or a slow
+             * stretch would hammer full-speed with no event pump — the window
+             * stopped responding and the movie couldn't be skipped. */
+            for (;;) {
+                int held = FfmpegSkipHeld();
+                if (!skip_armed) { if (!held) skip_armed = 1; }
+                else if (held) { printf("[FMV] ffmpeg: skipped\n"); stop = 1; }
+                SDL_Event ev;
+                while (SDL_PollEvent(&ev)) if (ev.type == SDL_QUIT) FmvQuitNow("ffmpeg playback");
+                if (stop || elapsed >= q->target) break;
+                SDL_Delay(1);
+                elapsed += Util_GetHPCTime(&tmr, 1);
+            }
+            if (stop)
+                break;
+
+            /* A frame that has fallen well behind realtime is dropped so a slow
+             * decode catches up (plays near real speed, just choppier) instead
+             * of crawling at 100% CPU. The final frame always shows. */
+            SDL_LockMutex(dc.mtx);
+            int lastFrame = (dc.count <= 1 && dc.eof);
+            SDL_UnlockMutex(dc.mtx);
+            if (lastFrame || q->target >= elapsed - 0.10) {
+                DrawVideoFrameEx(q->rgba, q->w, q->h, 1);
+                framesShown++;
+                elapsed += Util_GetHPCTime(&tmr, 1);
+            }
+
+            SDL_LockMutex(dc.mtx);
+            dc.tail = (dc.tail + 1) % FMV_QUEUE_SLOTS;
+            dc.count--;
+            SDL_CondSignal(dc.canPush);
+            SDL_UnlockMutex(dc.mtx);
+        }
+
+        /* Retire the worker before touching any libav state below. */
+        SDL_LockMutex(dc.mtx);
+        SDL_AtomicSet(&dc.abort, 1);
+        SDL_CondSignal(dc.canPush);
+        SDL_UnlockMutex(dc.mtx);
+        SDL_WaitThread(worker, NULL);
+        worker = NULL;
+
+        /* Match the AVI/BIN paths: don't let the key that skipped/ended the movie
+         * bleed a phantom Confirm into the next game state. */
+        if (audioDev) SDL_PauseAudioDevice(audioDev, 1);
+        for (int w = 0; w < 30 && FfmpegSkipHeld(); w++)
+            SDL_Delay(16);
+        SDL_PumpEvents();
+        SDL_FlushEvent(SDL_KEYDOWN);
+        SDL_FlushEvent(SDL_KEYUP);
+
+        if (framesShown == 0 && !stop) {
+            /* Opened fine but produced nothing (codec present, stream broken —
+             * e.g. a truncated re-encode): let the caller run the disc STR. */
+            printf("[FMV] ffmpeg: no video frames decoded from '%s' — falling back\n", path);
+            played = -1;
+        } else {
+            printf("[FMV] ffmpeg playback complete: %s (%d frames%s)\n",
+                   path, framesShown, stop ? ", stopped early" : "");
+        }
+    }
+
+cleanup:
+    if (worker) {
+        SDL_LockMutex(dc.mtx);
+        SDL_AtomicSet(&dc.abort, 1);
+        SDL_CondSignal(dc.canPush);
+        SDL_UnlockMutex(dc.mtx);
+        SDL_WaitThread(worker, NULL);
+    }
+    for (int i = 0; i < FMV_QUEUE_SLOTS; i++)
+        if (dc.slots[i].rgba) ::free(dc.slots[i].rgba);
+    if (dc.audioBuf) ::free(dc.audioBuf);
+    if (dc.sws) sws_freeContext(dc.sws);
+    if (dc.canPush) SDL_DestroyCond(dc.canPush);
+    if (dc.mtx) SDL_DestroyMutex(dc.mtx);
+    if (audioDev) SDL_CloseAudioDevice(audioDev);
+    if (dc.swr) swr_free(&dc.swr);
+    /* Zeroed by the memset above on the early-goto paths, and uninit of a
+     * zeroed layout is a no-op — safe to call unconditionally. */
+    av_channel_layout_uninit(&dc.aInLayout);
+    if (vctx) avcodec_free_context(&vctx);
+    if (actx) avcodec_free_context(&actx);
+    if (fmt) avformat_close_input(&fmt);
+    return played;
+}
+
+/* Confine the dispatch-table redirection to the decoder body above — anything
+ * below (or any later #include) must see the real names again. */
+#undef avformat_open_input
+#undef avformat_find_stream_info
+#undef avformat_close_input
+#undef av_read_frame
+#undef av_find_best_stream
+#undef avcodec_find_decoder
+#undef avcodec_alloc_context3
+#undef avcodec_free_context
+#undef avcodec_parameters_to_context
+#undef avcodec_open2
+#undef avcodec_send_packet
+#undef avcodec_receive_frame
+#undef avcodec_get_name
+#undef av_packet_alloc
+#undef av_packet_free
+#undef av_packet_unref
+#undef av_frame_alloc
+#undef av_frame_free
+#undef av_frame_unref
+#undef av_channel_layout_default
+#undef av_channel_layout_uninit
+#undef av_opt_get_int
+#undef av_opt_set_int
+#undef av_opt_get_chlayout
+#undef sws_getContext
+#undef sws_freeContext
+#undef sws_scale
+#undef sws_getCoefficients
+#undef sws_setColorspaceDetails
+#undef swr_alloc_set_opts2
+#undef swr_init
+#undef swr_free
+#undef swr_convert
+#undef swr_get_out_samples
+#endif /* SH_FMV_FFMPEG */
+
+extern "C" void Joy_SwallowNextEdges(void);
+
+static int FMV_PlayImpl(int file_idx, int max_frames);
+
+/* Every exit from playback — finished, skipped, override failed, file missing
+ * — leaves whatever button the user was holding still down. Swallow the edge
+ * here, once, rather than in each playback path's release-wait: those wait on
+ * a timeout and on a pad check that is dead on Android, so a press held longer
+ * than 480ms bled a Confirm into the title screen. */
+extern "C" int FMV_Play(int file_idx, int max_frames)
+{
+    int rc = FMV_PlayImpl(file_idx, max_frames);
+    Joy_SwallowNextEdges();
+    return rc;
+}
+
+static int FMV_PlayImpl(int file_idx, int max_frames)
+{
+    int table_idx = file_idx - FIRST_XA_FILE_IDX;
+    if (table_idx < 0 || table_idx >= (int)FMV_FILE_COUNT) {
+        printf("[FMV] File index %d out of range (table_idx=%d)\n", file_idx, table_idx);
+        return -1;
+    }
+
+    const char* basename = s_fmvFiles[table_idx].name;
+    char filepath[512];
+
+    /* Try AVI override first — users can drop upscaled MJPG AVIs under
+     * gamedata/fmv/ to replace any cutscene. If no override exists we
+     * fall back to decoding the original STR straight from the BIN. */
+    if (FindAviFile(basename, filepath, sizeof(filepath)) != 0) {
+#if defined(SH_FMV_FFMPEG)
+        /* No .avi override — look for a modern container (mp4/mkv/webm/mov) and
+         * decode it with ffmpeg before falling back to the disc movie. */
+        char cpath[512];
+        if (FindContainerFile(basename, cpath, sizeof(cpath)) == 0) {
+            printf("[FMV] Container override: %s\n", cpath);
+            if (PlayFromFFmpeg(cpath) == 0)
+                return 0;
+            printf("[FMV] ffmpeg failed for '%s' — decoding from BIN\n", cpath);
+            return PlayFromBin(table_idx, max_frames);
+        }
+#endif
+        printf("[FMV] No AVI override for '%s' — decoding from BIN\n", basename);
+        return PlayFromBin(table_idx, max_frames);
+    }
+
+    printf("[FMV] Playing: %s\n", filepath);
+
+    FMV_Init();
+
+    ReadAVI readAVI(filepath);
+    if (!readAVI.IsOpen()) {
+        printf("[FMV] Failed to parse AVI '%s' — falling back to the disc movie\n", filepath);
+#if defined(SH_FMV_FFMPEG)
+        /* A container misnamed .avi (or an AVI the built-in parser rejects) can
+         * still open through ffmpeg. */
+        if (PlayFromFFmpeg(filepath) == 0)
+            return 0;
+#endif
+        return PlayFromBin(table_idx, max_frames);
+    }
+
+    ReadAVI::avi_header_t avi_header = readAVI.GetAviHeader();
+    ReadAVI::stream_format_t stream_format = readAVI.GetVideoFormat();
+
+    FmvCodec codec = IdentifyCodec(&stream_format);
+    if (codec == FMV_CODEC_UNSUPPORTED) {
+        printf("[FMV] Unsupported video codec '%.4s' (%d bpp) in %s — falling back to the disc movie.\n"
+               "[FMV] Supported: MJPEG (MJPG/dmb1/jpeg), uncompressed RGB, YUY2/UYVY/I420/YV12/NV12.\n"
+               "[FMV] Re-encode with: ffmpeg -i in.mp4 -c:v mjpeg -q:v 3 -c:a pcm_s16le out.avi\n",
+               stream_format.compression_type, stream_format.bits_per_pixel, filepath);
+#if defined(SH_FMV_FFMPEG)
+        /* h264/h265/etc. inside an AVI wrapper: hand the same file to ffmpeg. */
+        if (PlayFromFFmpeg(filepath) == 0)
+            return 0;
+#endif
+        return PlayFromBin(table_idx, max_frames);
+    }
+
+    printf("[FMV] Video: %dx%d '%.4s', %d frames indexed, %.1f fps\n",
+           stream_format.image_width, stream_format.image_height,
+           stream_format.compression_type[0] ? stream_format.compression_type : "RGB",
+           avi_header.TotalNumberOfFrames,
+           avi_header.TimeBetweenFrames > 0 ? 1000000.0 / avi_header.TimeBetweenFrames : 0);
+
+    /* Set up audio */
+    ReadAVI::stream_format_auds_t audio_fmt = readAVI.GetAudioFormat();
+    FmvAviAudio aviAudio;
+    SDL_AudioDeviceID audioDev = (OpenFmvAudio(&audio_fmt, &aviAudio) == 0) ? aviAudio.dev : 0;
+
+    if (audioDev)
+        SDL_PauseAudioDevice(audioDev, 0); /* Start playback */
+
+    /* Use combined type mask to read both video and audio in one pass */
+    const int FRAME_TYPE_ALL = ReadAVI::ctype_video_data | ReadAVI::ctype_audio_data;
+
+    ReadAVI::frame_entry_t frame_entry;
+    frame_entry.type = (ReadAVI::chunk_type_t)FRAME_TYPE_ALL;
+    frame_entry.pointer = 0;
+
+    timerCtx_t fmvTimer;
+    Util_InitHPCTimer(&fmvTimer);
+
+    double nextFrameDelay = 0.0;
+    int done_frames = 0;
+
+    Util_GetHPCTime(&fmvTimer, 1);
+
+    /* Flush any pending key events before playback */
+    SDL_PumpEvents();
+    SDL_FlushEvent(SDL_KEYDOWN);
+    SDL_FlushEvent(SDL_KEYUP);
+
+    /* Skip is armed only after the skip keys have been seen released once —
+     * see PlayFromBin for why (keystroke that started playback still held). */
+    int skip_armed = 0;
+
+    /* Main playback loop */
+    while (1)
+    {
+        double delta = Util_GetHPCTime(&fmvTimer, 1);
+        if (delta > 1.0)
+            delta = 0.0;
+
+        nextFrameDelay -= delta;
+
+        /* Check for skip using keyboard state (event-independent) */
+        SDL_PumpEvents();
+        const Uint8* keystate = SDL_GetKeyboardState(NULL);
+        int skipHeld = keystate[SDL_SCANCODE_RETURN] || keystate[SDL_SCANCODE_ESCAPE] ||
+                       keystate[SDL_SCANCODE_SPACE] || PsyX_Pad_SkipButtonHeld() ||
+                       FmvTouchHeld();
+        if (!skip_armed) {
+            if (!skipHeld)
+                skip_armed = 1;
+        } else if (skipHeld) {
+            printf("[FMV] Skipped at frame %d/%d\n", done_frames, avi_header.TotalNumberOfFrames);
+            break;
+        }
+
+        /* Drain event queue to keep window responsive */
+        SDL_Event evt;
+        while (SDL_PollEvent(&evt)) {
+            if (evt.type == SDL_QUIT) {
+                FmvQuitNow("AVI playback");
+                goto done;
+            }
+        }
+
+        if (nextFrameDelay > 0) {
+            SDL_Delay(1);
+            continue;
+        }
+
+        /* Read next frame (video or audio) */
+        frame_entry.type = (ReadAVI::chunk_type_t)FRAME_TYPE_ALL;
+        int frame_size = readAVI.GetFrameFromIndex(&frame_entry);
+
+        if (frame_size < 0)
+            break;
+
+        if (frame_entry.type == ReadAVI::ctype_audio_data) {
+            /* Queue audio data to SDL */
+            if (audioDev && frame_size > 0) {
+                unsigned char* abuf = frame_entry.buf;
+                int abytes = frame_size;
+
+                if (aviAudio.convertFrom != 0 &&
+                    ConvertPcmToS16(frame_entry.buf, frame_size, aviAudio.convertFrom,
+                                    &abuf, &abytes) != 0)
+                    continue;
+
+                FmvApplyVolume(abuf, abytes, aviAudio.spec.format);
+                SDL_QueueAudio(audioDev, abuf, abytes);
+            }
+            /* Don't apply video timing for audio frames - immediately read next */
+            continue;
+        }
+
+        /* Video frame. Unlike the BIN/STR path, an AVI override is a standalone
+         * file the user encoded to replace this cutscene — play it to its own
+         * EOF (GetFrameFromIndex returns < 0 when the movi index is exhausted).
+         * max_frames here is the ORIGINAL STR's frame count (PSX ~15 fps); a
+         * re-encode at a higher fps or a different length has more video frames,
+         * so applying that cap cut the custom AVI off early. */
+
+        if (frame_size > 0 &&
+            (frame_entry.type == ReadAVI::ctype_compressed_video_frame ||
+             frame_entry.type == ReadAVI::ctype_uncompressed_video_frame))
+        {
+            int real_w, real_h;
+            if (DecodeVideoFrame(codec, frame_entry.buf, (unsigned)frame_size,
+                                 &stream_format, &real_w, &real_h) == 0)
+            {
+                DrawVideoFrame(real_w, real_h);
+            }
+
+            if (avi_header.TimeBetweenFrames > 0)
+                nextFrameDelay += (double)avi_header.TimeBetweenFrames / 1000000.0;
+            else
+                nextFrameDelay += 1.0 / 15.0; /* fallback: 15fps (PSX STR default) */
+
+            done_frames++;
+        }
+    }
+
+done:
+    /* Clean up audio */
+    if (audioDev) {
+        SDL_PauseAudioDevice(audioDev, 1);
+        SDL_CloseAudioDevice(audioDev);
+    }
+
+    /* Wait for skip keys to release before returning. Otherwise the still-held
+     * key would carry into the next state's first Joy_Update, which sees the
+     * 0→held edge as a fresh clickedBtnFlags and bleeds into the main menu (e.g.
+     * Enter to skip intro = phantom Confirm on the title). Capped so a stuck
+     * key can't hang the boot. */
+    {
+        int wait_frames = 0;
+        while (wait_frames < 30) /* ~500ms at 60fps */
+        {
+            SDL_PumpEvents();
+            const Uint8* ks = SDL_GetKeyboardState(NULL);
+            if (!ks[SDL_SCANCODE_RETURN] && !ks[SDL_SCANCODE_ESCAPE] &&
+                !ks[SDL_SCANCODE_SPACE] && !PsyX_Pad_SkipButtonHeld() &&
+                !FmvTouchHeld())
+                break;
+            SDL_Delay(16);
+            wait_frames++;
+        }
+        SDL_PumpEvents();
+        SDL_FlushEvent(SDL_KEYDOWN);
+        SDL_FlushEvent(SDL_KEYUP);
+    }
+
+    printf("[FMV] Playback complete (%d frames)\n", done_frames);
+    return 0;
+}

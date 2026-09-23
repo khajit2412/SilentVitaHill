@@ -1,0 +1,20 @@
+    // TODO: no associated `charaGroupIds`? Does it get set in code?
+    {
+      { Q12(-60.6f), Chara_None, Q8_ANGLE(45.0f), 0, GameDifficulty_Easy, Q12(-23.5f) },
+      { Q12(-64.5f), Chara_None, Q8_ANGLE(90.0f), 0, GameDifficulty_Easy, Q12(-27.9f) },
+      { Q12(-60.6f), Chara_None, Q8_ANGLE(45.0f), 0, GameDifficulty_Easy, Q12(-23.5f) },
+      { Q12(-102.3f), Chara_None, Q8_ANGLE(180.0f), 0, GameDifficulty_Easy, Q12(-141.8f) },
+      { Q12(-101.0f), Chara_None, Q8_ANGLE(0.0f), 23, GameDifficulty_Easy, Q12(-95.8f) },
+      { Q12(-98.5f), Chara_None, Q8_ANGLE(135.0f), 23, GameDifficulty_Easy, Q12(-95.3f) },
+      { Q12(-60.6f), Chara_None, Q8_ANGLE(180.0f), 27, GameDifficulty_Easy, Q12(-91.2f) },
+      { Q12(-59.1f), Chara_None, Q8_ANGLE(225.0f), 19, GameDifficulty_Easy, Q12(-91.8f) },
+      { Q12(-58.9f), Chara_None, Q8_ANGLE(90.0f), 19, GameDifficulty_Easy, Q12(-105.8f) },
+      { Q12(-99.8f), Chara_None, Q8_ANGLE(180.0f), 0, GameDifficulty_Easy, Q12(-16.3f) },
+      { Q12(-99.9f), Chara_None, Q8_ANGLE(180.0f), 0, GameDifficulty_Easy, Q12(-96.4f) },
+      { Q12(-102.1f), Chara_None, Q8_ANGLE(270.0f), 0, GameDifficulty_Easy, Q12(-99.7f) },
+      { Q12(-140.7f), Chara_None, Q8_ANGLE(0.0f), 0, GameDifficulty_Easy, Q12(-21.6f) },
+      { Q12(-139.0f), Chara_None, Q8_ANGLE(0.0f), 0, GameDifficulty_Easy, Q12(-20.2f) },
+      { Q12(-141.2f), Chara_None, Q8_ANGLE(45.0f), 0, GameDifficulty_Easy, Q12(-18.9f) },
+    },
+    {
+    },

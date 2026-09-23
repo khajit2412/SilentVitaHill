@@ -1,0 +1,982 @@
+#include "game.h"
+
+#include <psyq/libetc.h>
+#include <psyq/libpad.h>
+#include <psyq/strings.h>
+
+#include "bodyprog/bodyprog.h"
+#include "bodyprog/gfx/map_effects.h"
+#include "bodyprog/memcard.h"
+#include "bodyprog/screen/screen_data.h"
+#include "bodyprog/screen/screen_draw.h"
+#include "bodyprog/text/text_draw.h"
+#ifdef SH_PC_PORT
+#include "sh_log.h"
+#endif
+#include "bodyprog/math/math.h"
+#include "bodyprog/sound/sound_system.h"
+#include "main/fsqueue.h"
+#include "main/rng.h"
+#ifdef SH_PC_PORT
+#include "main/fileinfo.h" /* g_GameRegion — PAL FLAME relocation */
+#endif
+#include "screens/stream/stream.h"
+#ifdef SH_PC_PORT
+#include <stdio.h>
+#endif
+
+extern s_WorldEnvWork const g_WorldEnvWork;
+
+s16 D_800BCDE8[8];
+
+static s_MapEffectsPresetIdxs D_800A9F80 = { 1, 1  };
+static s_MapEffectsPresetIdxs D_800A9F84 = { 2, 2  };
+static s_MapEffectsPresetIdxs D_800A9F88 = { 6, 3  };
+static s_MapEffectsPresetIdxs D_800A9F8C = { 7, 4  };
+static s_MapEffectsPresetIdxs D_800A9F90 = { 6, 10 };
+static s_MapEffectsPresetIdxs D_800A9F94 = { 6, 5  };
+static s_MapEffectsPresetIdxs D_800A9F98 = { 9, 9  };
+static s_MapEffectsPresetIdxs D_800A9F9C = { 6, 6  };
+static s_MapEffectsPresetIdxs D_800A9FA0 = { 3, 3  };
+static s_MapEffectsPresetIdxs D_800A9FA4 = { 5, 5  };
+
+// ========================================
+// OPTIONS
+// ========================================
+// Possibly the options overlay was at some point part of the engine like `SAVELOAD.BIN` was.
+// Jan 16 Demo (demo where the option overlay is mixed inside engine [bodyprog.bin]) doesn't
+// tells that, this function remains between `GameFs_FlameGfxLoad` and `func_8003E544`.
+// With this in mind there are two possible variables for this function:
+// - It is inside a unique split
+// - It is part of this split
+// 0x80036c48 is the memory address for this function in the Jan 16 Demo.
+
+// ========================================
+// EFFECTS (FOG AND LIGHT)
+// ========================================
+
+void GameFs_FlameGfxLoad(void) // 0x8003E710
+{
+    static s_FsImageDesc IMG_FLAME = {
+        .tPage = { 0, 12 },
+        .u     = 32,
+        .v     = 0,
+        .clutX = 800,
+        .clutY = 64
+    };
+
+#ifdef SH_PC_PORT
+    /* The PAL-shaped BG_ETC (256x128 at (768,0)) covers the US FLAME home
+     * (800,0) and its CLUT row; retail SLES moved FLAME to tpage 13:
+     * dest (832,0), CLUT (832,64). The draw site in func_8003E740 switches
+     * its tpage/clut/UVs to match. */
+    if (g_GameRegion == Region_EUR)
+    {
+        IMG_FLAME.tPage[1] = 13;
+        IMG_FLAME.u        = 0;
+        IMG_FLAME.clutX    = 832;
+    }
+    else
+    {
+        IMG_FLAME.tPage[1] = 12;
+        IMG_FLAME.u        = 32;
+        IMG_FLAME.clutX    = 800;
+    }
+#endif
+
+    Fs_QueueStartReadTim(FILE_TIM_FLAME_TIM, FS_BUFFER_1, &IMG_FLAME);
+}
+
+void func_8003E740(void) // 0x8003E740
+{
+    DVECTOR   sp10;
+    MATRIX    sp18;
+    SVECTOR   sp38;
+    s32       sp40[4];
+    SVECTOR   sp50;
+    DVECTOR   sp58;
+#ifdef SH_PC_PORT
+    DVECTOR   sp5C_ofs = { 0, 0 }; /* projected quad centre; the constant to remove */
+#endif
+    s32       sp60;
+    s32       temp_a0;
+    s32       temp_s6;
+    s32       i;
+    s32       var_s5;
+    s16*      var_a0;
+    POLY_FT4* poly;
+    s32       idx = 0;
+
+    static u32 D_800A9FB0 = 0;
+
+    if (g_DeltaTime != Q12(0.0f))
+    {
+        D_800A9FB0 += 8;
+        for (i = 0; i < 8; i++)
+        {
+            D_800BCDE8[i] = Rng_Rand16();
+        }
+    }
+
+    sp38.vx = 1;
+    sp38.vy = -7;
+    sp38.vz = 33;
+    sp38.vx = Q12_MULT(Math_AngleNormalize(D_800BCDE8[idx++]), 5) + 1;
+    sp38.vz = Q12_MULT(Math_AngleNormalize(D_800BCDE8[idx++]), 5) + 33;
+
+    poly = (POLY_FT4*)GsOUT_PACKET_P;
+
+    Vw_CoordToViewSpaceMatrix(&g_SysWork.playerBoneCoords[HarryBone_RightHand], &sp18);
+    SetRotMatrix(&sp18);
+    SetTransMatrix(&sp18);
+
+    var_s5 = RotTransPers(&sp38, &sp10, &sp60, &sp60);
+
+    temp_s6  = var_s5 * 4;
+    var_s5 >>= 1;
+    var_s5  -= 2;
+
+    if (var_s5 < 0)
+    {
+        var_s5 = 0;
+    }
+
+    if (temp_s6 > 128 && var_s5 < ORDERING_TABLE_SIZE - 1)
+    {
+        SetPolyFT4(poly);
+        setSemiTrans(poly, true);
+
+        temp_a0 = D_800BCDE8[idx++];
+        if ((temp_a0 & 0xFFF) >= 3482) // TODO: `> Q12(0.85f)` also matches, but this gets used for `setRGB0` color?
+        {
+            D_800A9FB0 -= 16 + (temp_a0 & 0xF);
+        }
+
+        if (D_800A9FB0 >= 33)
+        {
+            D_800A9FB0 = 0;
+        }
+
+        setRGB0(poly, D_800A9FB0 + 48, D_800A9FB0 + 48, D_800A9FB0 + 48);
+#ifdef SH_PC_PORT
+        /* FLAME lives in tpage 13 (832,0) clut (832,64) on PAL — see
+         * GameFs_FlameGfxLoad. */
+        poly->tpage = (g_GameRegion == Region_EUR) ? 45 : 44;
+        poly->clut  = (g_GameRegion == Region_EUR) ? 4148 : 4146;
+#else
+        poly->tpage = 44;
+        poly->clut  = 4146;
+#endif
+
+        var_a0 = &D_800BCDE8[idx++];
+
+        for (i = 0; i < 4; i++)
+        {
+            sp40[i] = (var_a0[i] & 0xF) - 8;
+        }
+
+        SetRotMatrix(&GsIDMATRIX);
+        SetTransMatrix(&GsIDMATRIX);
+
+        sp50.vz = temp_s6;
+#ifdef SH_PC_PORT
+        /* The corner projections below are only used as a screen-space SIZE, added
+         * to sp10 (the hand position, already projected). Every RotTransPers adds
+         * the projection centre, so the sum counts it twice -- harmless on PSX,
+         * where it is always 0, but the port shifts it down by g_PsxWorldVShift on
+         * a fixed-angle camera. That is the alley match flame sitting below Harry's
+         * hand: correct through the letterboxed scene (cutscenes zero the shift),
+         * offset the moment the letterbox ends and gameplay's fixed cam restores
+         * it, and correct again at the next camera angle that is not FIX_ANG.
+         *
+         * The matrices here are identity and the depth is constant, so projecting
+         * the quad centre gives exactly the constant both corners carry; subtracting
+         * it leaves the pure size. Zero offset makes this projection (0,0), so the
+         * arithmetic is unchanged where the original ran. */
+        {
+            SVECTOR ctr;
+            ctr.vx = 0;
+            ctr.vy = 0;
+            ctr.vz = temp_s6;
+            ctr.pad = 0;
+            RotTransPers(&ctr, &sp5C_ofs, &sp60, &sp60);
+        }
+#endif
+        sp50.vx = sp40[0] - 51;
+        sp50.vy = sp40[2] - 51;
+
+        RotTransPers(&sp50, &sp58, &sp60, &sp60);
+
+#ifdef SH_PC_PORT
+        poly->x0 = sp10.vx + (sp58.vx - sp5C_ofs.vx);
+        poly->y0 = sp10.vy + (sp58.vy - sp5C_ofs.vy);
+#else
+        poly->x0 = sp10.vx + sp58.vx;
+        poly->y0 = sp10.vy + sp58.vy;
+#endif
+        sp50.vx  = sp40[1] + 51;
+        sp50.vy  = sp40[3] - 51;
+
+        RotTransPers(&sp50, &sp58, &sp60, &sp60);
+
+#ifdef SH_PC_PORT
+        poly->x1 = sp10.vx + (sp58.vx - sp5C_ofs.vx);
+        poly->y1 = sp10.vy + (sp58.vy - sp5C_ofs.vy);
+#else
+        poly->x1 = sp10.vx + sp58.vx;
+        poly->y1 = sp10.vy + sp58.vy;
+#endif
+        sp50.vx  = -51 - sp40[1];
+        sp50.vy  = 51 - sp40[3];
+
+        RotTransPers(&sp50, &sp58, &sp60, &sp60);
+
+#ifdef SH_PC_PORT
+        poly->x2 = sp10.vx + (sp58.vx - sp5C_ofs.vx);
+        poly->y2 = sp10.vy + (sp58.vy - sp5C_ofs.vy);
+#else
+        poly->x2 = sp10.vx + sp58.vx;
+        poly->y2 = sp10.vy + sp58.vy;
+#endif
+        sp50.vx  = 51 - sp40[0];
+        sp50.vy  = 51 - sp40[2];
+
+        RotTransPers(&sp50, &sp58, &sp60, &sp60);
+
+#ifdef SH_PC_PORT
+        poly->x3 = sp10.vx + (sp58.vx - sp5C_ofs.vx);
+        poly->y3 = sp10.vy + (sp58.vy - sp5C_ofs.vy);
+#else
+        poly->x3 = sp10.vx + sp58.vx;
+        poly->y3 = sp10.vy + sp58.vy;
+#endif
+
+#ifdef SH_PC_PORT
+        /* PAL FLAME sits at u=0 of its own tpage instead of u=128 of BG_ETC's. */
+        poly->u0 = (g_GameRegion == Region_EUR) ? 0 : 128;
+        poly->u1 = poly->u0 + 63;
+        poly->u2 = poly->u0;
+        poly->u3 = poly->u0 + 63;
+#else
+        poly->u0 = 128;
+        poly->u1 = 191;
+        poly->u2 = 128;
+        poly->u3 = 191;
+#endif
+
+        poly->v0 = 0;
+        poly->v1 = 0;
+        poly->v2 = 63;
+        poly->v3 = 63;
+
+        AddPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[var_s5], poly);
+        GsOUT_PACKET_P = (PACKET*)poly + sizeof(POLY_FT4);
+    }
+}
+
+void Game_SpotlightLoadScreenAttribsFix(void) // 0x8003EB54
+{
+    g_SysWork.lightIntensity = Q12(1.0f);
+
+    g_SysWork.lightBoneCoord = &g_SysWork.playerBoneCoords[HarryBone_Root];
+    g_SysWork.lensFlareBoneCoord = &g_SysWork.playerBoneCoords[HarryBone_Root];
+
+    Math_Vector3Set(&g_SysWork.lightPosition, Q12(0.0f), Q12(-0.2f), Q12(-2.0f));
+    Math_SVectorSet(&g_SysWork.lightRotation, Q12_ANGLE(10.0f), Q12_ANGLE(0.0f), Q12_ANGLE(0.0f));
+}
+
+void Game_FlashlightAttributesFix(void) // 0x8003EBA0
+{
+    g_SysWork.lightIntensity = Q12(1.0f);
+
+    g_SysWork.lightBoneCoord = &g_SysWork.playerBoneCoords[HarryBone_Torso];
+    g_SysWork.lensFlareBoneCoord = &g_SysWork.playerBoneCoords[HarryBone_Root];
+
+    Math_Vector3Set(&g_SysWork.lightPosition, Q12(-0.08f), Q12(-0.28f), Q12(0.12f));
+    Math_SVectorSet(&g_SysWork.lightRotation, Q12_ANGLE(-15.0f), Q12_ANGLE(0.0f), Q12_ANGLE(0.0f));
+}
+
+void Gfx_MapEffectsAssign(s_MapOverlayHdr* mapHdr) // 0x8003EBF4
+{
+    bool                    hasActiveChunk;
+    u8                      flags;
+    s_MapEffectsPresetIdxs* presetIdxPtr;
+
+    flags          = mapHdr->mapInfo->flags;
+    hasActiveChunk = false;
+    if (flags & MapFlag_Interior)
+    {
+        hasActiveChunk = (flags & (MapFlag_OneActiveChunk | MapFlag_TwoActiveChunks)) > 0;
+    }
+
+    switch (mapHdr->field_16)
+    {
+        case 1:
+            if (hasActiveChunk)
+            {
+                presetIdxPtr = &D_800A9F84;
+            }
+            else
+            {
+                presetIdxPtr = &D_800A9F80;
+            }
+            break;
+
+        case 2:
+            if (hasActiveChunk)
+            {
+                presetIdxPtr = &D_800A9F8C;
+            }
+            else
+            {
+                presetIdxPtr = &D_800A9F88;
+            }
+            break;
+
+        case 3:
+            presetIdxPtr = &D_800A9F98;
+            break;
+
+        default:
+            presetIdxPtr = &D_800A9F80;
+            break;
+    }
+
+    Gfx_MapInitMapEffectsUpdate(presetIdxPtr->presetIdx1_0, presetIdxPtr->presetIdx2_1);
+}
+
+void Game_TurnFlashlightOn(void) // 0x8003ECBC
+{
+    g_SysWork.field_2388.isFlashlightOn_15 = true;
+    g_SavegamePtr->itemToggleFlags     &= ~ItemToggleFlag_FlashlightOff;
+}
+
+void Game_TurnFlashlightOff(void) // 0x8003ECE4
+{
+    g_SysWork.field_2388.isFlashlightOn_15 = false;
+    g_SavegamePtr->itemToggleFlags     |= ItemToggleFlag_FlashlightOff;
+}
+
+void Game_FlashlightToggle(void) // 0x8003ED08
+{
+    // Awkward `isFlashlightOn_15` toggle.
+    g_SysWork.field_2388.isFlashlightOn_15 ^= true;
+    if (g_SysWork.field_2388.isFlashlightOn_15 == true)
+    {
+        g_SavegamePtr->itemToggleFlags &= ~ItemToggleFlag_FlashlightOff;
+    }
+    else
+    {
+        g_SavegamePtr->itemToggleFlags |= ItemToggleFlag_FlashlightOff;
+    }
+}
+
+bool Game_FlashlightIsOn(void) // 0x8003ED64
+{
+    return g_SysWork.field_2388.isFlashlightOn_15;
+}
+
+void Gfx_MapInitMapEffectsUpdate(s32 idx0, s32 idx1) // 0x8003ED74
+{
+    Gfx_MapEffectsUpdate(idx0, idx1, PrimitiveType_None, NULL, 0, 0);
+    Gfx_FlashlightUpdate();
+}
+
+void func_8003EDA8(void) // 0x8003EDA8
+{
+    g_SysWork.field_2388.field_14 = 1;
+}
+
+#ifdef SH_PC_PORT
+/* Console color overrides (set by pc_console_cmd.c). Applied in func_80055330:
+ *   `fl` / `flashlight` -> field_2C (the directional/point light the flashlight
+ *                          casts on surfaces),
+ *   `wl` / `worldlight` -> worldTintColor + field_24..26 (flat ambient tint).
+ * Each channel scales the map's value by the chosen color (keeps brightness). */
+s32 g_PcFlashlightColorActive = 0;
+u8  g_PcFlashlightColorR = 255, g_PcFlashlightColorG = 255, g_PcFlashlightColorB = 255;
+s32 g_PcWorldLightColorActive = 0;
+u8  g_PcWorldLightColorR = 255, g_PcWorldLightColorG = 255, g_PcWorldLightColorB = 255;
+#endif
+
+void func_8003EDB8(CVECTOR* color0, CVECTOR* color1) // 0x8003EDB8
+{
+    *color0 = g_SysWork.field_2388.field_1C[g_SysWork.field_2388.isFlashlightOn_15].effectsInfo_0.field_21;
+    *color1 = g_SysWork.field_2388.field_1C[g_SysWork.field_2388.isFlashlightOn_15].effectsInfo_0.field_25;
+}
+
+void func_8003EE30(s32 arg0, s32* arg1, s32 arg2, s32 arg3) // 0x8003EE30
+{
+    g_SysWork.field_2388.field_4    = (s8*)arg1;
+    g_SysWork.field_2388.primType_0 = PrimitiveType_S32;
+    g_SysWork.field_2388.field_8    = arg2;
+    g_SysWork.field_2388.field_C    = arg3;
+
+    g_SysWork.field_2388.field_EC[0] = g_SysWork.field_2388.field_1C[0];
+    g_SysWork.field_2388.field_EC[1] = g_SysWork.field_2388.field_1C[1];
+}
+
+void Gfx_LoadScreenMapEffectsUpdate(s32 arg0, s32 arg1) // 0x8003EEDC
+{
+    Gfx_MapEffectsUpdate(arg0, arg1, PrimitiveType_None, NULL, 0, 0);
+    Gfx_FlashlightUpdate();
+}
+
+void Gfx_MapEffectsUpdate(s32 idx0, s32 idx1, e_PrimitiveType primType, void* primData, s32 arg4, s32 arg5) // 0x8003EF10
+{
+    Gfx_MapEffectsStepUpdate(&MAP_EFFECTS_INFOS[idx0], &MAP_EFFECTS_INFOS[idx1], primType, primData, arg4, arg5);
+}
+
+void Gfx_MapEffectsStepUpdate(const s_MapEffectsInfo* preset0, const s_MapEffectsInfo* preset1,
+                              e_PrimitiveType primType, void* primData, s32 arg4, s32 arg5) // 0x8003EF74
+{
+    if (preset0 == preset1)
+    {
+        g_SysWork.field_2388.isFlashlightUnavailable_16 = true;
+    }
+    else
+    {
+        g_SysWork.field_2388.isFlashlightUnavailable_16 = false;
+    }
+
+    g_SysWork.field_2388.field_4 = primData;
+    g_SysWork.field_2388.primType_0 = primType;
+    g_SysWork.field_2388.field_8 = arg4;
+    g_SysWork.field_2388.field_C = arg5;
+
+    g_SysWork.field_2388.field_EC[0] = g_SysWork.field_2388.field_1C[0];
+    g_SysWork.field_2388.field_EC[1] = g_SysWork.field_2388.field_1C[1];
+
+    Gfx_FogParametersSet(&g_SysWork.field_2388.field_84[0], preset0);
+    Gfx_FogParametersSet(&g_SysWork.field_2388.field_84[1], preset1);
+}
+
+void Gfx_FogParametersSet(s_StructUnk3* arg0, const s_MapEffectsInfo* effectsInfo) // 0x8003F08C
+{
+    arg0->effectsInfo_0 = *effectsInfo;
+
+    if (effectsInfo->field_0.s_field_0.field_0 & (1 << 2))
+    {
+        arg0->brightnessIntensity_2E = Q12(1.0f);
+    }
+    else
+    {
+        arg0->brightnessIntensity_2E = Q12(0.0f);
+    }
+
+    if (effectsInfo->field_0.s_field_0.field_0 & (1 << 4))
+    {
+        arg0->flashlightLensFlareIntensity_2C = Q12(1.0f);
+    }
+    else
+    {
+        arg0->flashlightLensFlareIntensity_2C = Q12(0.0f);
+    }
+
+    switch (effectsInfo->field_E)
+    {
+        case 0:
+        case 1:
+            arg0->fogDistance_30 = effectsInfo->fogDistance_10;
+            break;
+
+        case 2:
+            arg0->fogDistance_30 = Q12(0.0f);
+            break;
+
+        case 3:
+            arg0->fogDistance_30 = effectsInfo->fogDistance_10;
+            break;
+    }
+}
+
+void Gfx_FlashlightUpdate(void) // 0x8003F170
+{
+    MATRIX          mat;
+    VECTOR          sp48;
+    SVECTOR         rot;
+    q19_12          weight;
+    u8              flags;
+    s32             temp;
+    GsCOORDINATE2*  coord;
+    s_StructUnk3*   ptr2;
+    s_SysWork_2388* ptr;
+
+    ptr = &g_SysWork.field_2388;
+
+    if (g_SysWork.field_2388.isFlashlightOn_15)
+    {
+        g_SysWork.field_2388.flashlightIntensity += Q12_MULT_FLOAT_PRECISE(g_DeltaTime, 4.0f);
+    }
+    else
+    {
+        g_SysWork.field_2388.flashlightIntensity -= Q12_MULT_FLOAT_PRECISE(g_DeltaTime, 4.0f);
+    }
+
+    g_SysWork.field_2388.flashlightIntensity = CLAMP(g_SysWork.field_2388.flashlightIntensity, Q12(0.0f), Q12(1.0f));
+
+    if (g_SysWork.field_2388.field_84[g_SysWork.field_2388.flashlightIntensity != 0].effectsInfo_0.field_E == 3)
+    {
+        Vw_CoordToViewSpaceMatrix(g_SysWork.lightBoneCoord, &mat);
+        ApplyMatrixLV(&mat, (VECTOR*)&g_SysWork.lightPosition, &sp48); // Bug? `g_SysWork.lightPosition` is `VECTOR3`.
+        ptr->field_84[g_SysWork.field_2388.flashlightIntensity != 0].fogDistance_30 = sp48.vz + (mat.t[2] * 16);
+    }
+
+    if (ptr->primType_0 == PrimitiveType_None)
+    {
+        ptr->field_1C[0] = ptr->field_84[0];
+        ptr->field_1C[1] = ptr->field_84[1];
+    }
+    else
+    {
+        weight = Gfx_ProgressAlphaGet(func_8003F654(ptr), ptr->field_8, ptr->field_C);
+
+        func_8003F838(&ptr->field_1C[0], &ptr->field_EC[0], &ptr->field_84[0], weight);
+        func_8003F838(&ptr->field_1C[1], &ptr->field_EC[1], &ptr->field_84[1], weight);
+
+        if (weight >= Q12(1.0f))
+        {
+            ptr->primType_0 = PrimitiveType_None;
+        }
+    }
+
+    func_8003F838(&ptr->field_154, &ptr->field_1C[0], &ptr->field_1C[1], ptr->flashlightIntensity);
+
+    ptr2 = &ptr->field_154;
+
+    if (ptr->field_14 != 0)
+    {
+        flags         = ptr->field_154.effectsInfo_0.field_0.s_field_0.field_0;
+        ptr->field_14 = 0;
+
+        if (flags & (1 << 0))
+        {
+            Gfx_FogParametersSet(ptr2, &MAP_EFFECTS_INFOS[8]);
+        }
+        else if (flags & (1 << 1))
+        {
+            ptr2->effectsInfo_0.field_4 += Q12(0.3f);
+        }
+    }
+
+    ptr->field_10 = func_8003FEC0(&ptr2->effectsInfo_0);
+    func_8003FF2C(ptr2);
+
+    temp = Q12_MULT(func_8003F4DC(&coord, &rot, ptr2->effectsInfo_0.field_4, ptr2->effectsInfo_0.field_0.s_field_0.field_2, Vc_LensFlareTypeGet(), &g_SysWork), g_SysWork.lightIntensity);
+
+    func_800554C4(temp, ptr2->flashlightLensFlareIntensity_2C, coord, g_SysWork.lightBoneCoord, &rot,
+                  g_SysWork.lightPosition.vx, g_SysWork.lightPosition.vy, g_SysWork.lightPosition.vz,
+#ifdef SH_PC_PORT
+                  g_WorldGfxWork.mapInfo ? g_WorldGfxWork.mapInfo->waterZones : NULL);
+#else
+                  g_WorldGfxWork.mapInfo->waterZones);
+#endif
+    func_80055814(ptr2->fogDistance_30);
+
+    if (ptr->field_154.effectsInfo_0.field_0.s_field_0.field_0 & (1 << 3))
+    {
+        func_8003E740();
+    }
+}
+
+q19_12 func_8003F4DC(GsCOORDINATE2** coords, SVECTOR* rot, q19_12 alpha, s32 arg3, u32 arg4, s_SysWork* sysWork) // 0x8003F4DC
+{
+    s32     temp;
+    q19_12  alphaCpy;
+    SVECTOR rot0;
+
+    if (arg3 != 2)
+    {
+        arg4 = 1;
+    }
+
+    alphaCpy = alpha;
+    if (arg4 == 0)
+    {
+        alphaCpy = Q12(0.0f);
+    }
+
+    switch (arg4)
+    {
+        default:
+        case 1:
+            *coords = sysWork->lensFlareBoneCoord;
+            break;
+
+        case 0:
+        case 2:
+        case 3:
+        case 4:
+        case 5:
+            *coords = NULL;
+            break;
+    }
+
+    switch (arg4)
+    {
+        default:
+        case 1:
+            rot0 = sysWork->lightRotation;
+            break;
+
+        case 0:
+            rot0.vx = Q12_ANGLE(0.0f);
+            rot0.vy = Q12_ANGLE(-90.0f);
+            rot0.vz = Q12_ANGLE(0.0f);
+            break;
+
+        case 2:
+            rot0.vx = Q12_ANGLE(-20.0f);
+            rot0.vy = Q12_ANGLE(195.0f);
+            rot0.vz = Q12_ANGLE(0.0f);
+            break;
+
+        case 3:
+            rot0.vx = Q12_ANGLE(-20.0f);
+            rot0.vy = Q12_ANGLE(-75.0f);
+            rot0.vz = Q12_ANGLE(0.0f);
+            break;
+
+        case 4:
+            rot0.vx = Q12_ANGLE(-20.0f);
+            rot0.vy = Q12_ANGLE(15.0f);
+            rot0.vz = Q12_ANGLE(0.0f);
+            break;
+
+        case 5:
+            rot0.vx = Q12_ANGLE(-20.0f);
+            rot0.vy = Q12_ANGLE(105.0f);
+            rot0.vz = Q12_ANGLE(0.0f);
+            break;
+    }
+
+    rot->vy = -Math_Sin(rot0.vx);
+    temp    = Math_Cos(rot0.vx);
+    rot->vz = Q12_MULT(temp, Math_Cos(rot0.vy));
+    rot->vx = Q12_MULT(temp, Math_Sin(rot0.vy));
+    return alphaCpy;
+}
+
+u32 func_8003F654(s_SysWork_2388* arg0)
+{
+    switch (arg0->primType_0)
+    {
+        default:
+        case PrimitiveType_None:
+            break;
+
+        case PrimitiveType_S8:
+            return *arg0->field_4;
+
+        case PrimitiveType_U8:
+            return *(u8*)arg0->field_4;
+
+        case PrimitiveType_S16:
+            return *(s16*)arg0->field_4;
+
+        case PrimitiveType_U16:
+            return *(u16*)arg0->field_4;
+
+        case PrimitiveType_S32:
+            return *(s32*)arg0->field_4;
+    }
+
+    return 0;
+}
+
+q19_12 Gfx_ProgressAlphaGet(s32 val, s32 min, s32 max) // 0x8003F6F0
+{
+    #define Q12_BITS     32
+    #define Q12_VAL_BITS 31
+    #define Q12_INT_BITS 19
+
+    s32 leadingZeros;
+    s32 shift;
+
+    if (min < max)
+    {
+        val = CLAMP(val, min, max);
+    }
+    else if (max < min)
+    {
+        val = CLAMP(val, max, min);
+    }
+    else
+    {
+        return Q12(1.0f);
+    }
+
+    leadingZeros = Q12_BITS - Lzc(max - min);
+    shift        = 0;
+
+    if ((leadingZeros + Q12_SHIFT) >= Q12_VAL_BITS)
+    {
+        shift = leadingZeros - Q12_INT_BITS;
+    }
+    shift = CLAMP(shift, 0, Q12_SHIFT);
+
+    return ((val - min) << (Q12_SHIFT - shift)) / ((max - min) >> shift);
+
+    #undef Q12_BITS
+    #undef Q12_VAL_BITS
+    #undef Q12_INT_BITS
+}
+
+q19_12 Math_WeightedAverageGet(s32 a, s32 b, q19_12 weight) // 0x8003F7E4
+{
+    return Math_MulFixed(a, Q12(1.0f) - weight, Q12_SHIFT) + Math_MulFixed(b, weight, Q12_SHIFT);
+}
+
+void func_8003F838(s_StructUnk3* arg0, s_StructUnk3* arg1, s_StructUnk3* arg2, q19_12 weight) // 0x8003F838
+{
+    q19_12 weight0;
+    q19_12 weight1;
+    q19_12 weight2;
+    u32    temp;
+
+    weight0 = weight * 2;
+    weight0 = CLAMP(weight0, Q12(0.0f), Q12(1.0f));
+    weight1 = (weight - Q12(0.5f)) * 2;
+    weight1 = CLAMP(weight1, Q12(0.0f), Q12(1.0f));
+
+    if (weight < Q12(0.5f))
+    {
+        arg0->effectsInfo_0.field_0.s_field_0.field_0 = arg1->effectsInfo_0.field_0.s_field_0.field_0;
+    }
+    else
+    {
+        arg0->effectsInfo_0.field_0.s_field_0.field_0 = arg2->effectsInfo_0.field_0.s_field_0.field_0;
+    }
+
+    func_8003FCB0(&arg0->effectsInfo_0, &arg1->effectsInfo_0, &arg2->effectsInfo_0, weight);
+
+    if (arg1->flashlightLensFlareIntensity_2C == Q12(0.0f))
+    {
+        arg0->flashlightLensFlareIntensity_2C = Math_WeightedAverageGet(0, arg2->flashlightLensFlareIntensity_2C, weight1);
+    }
+    else
+    {
+        arg0->flashlightLensFlareIntensity_2C = Math_WeightedAverageGet(arg1->flashlightLensFlareIntensity_2C, arg2->flashlightLensFlareIntensity_2C, weight0);
+    }
+
+    if (arg1->effectsInfo_0.field_0.s_field_0.field_0 & (1 << 0))
+    {
+        if (arg2->effectsInfo_0.field_0.s_field_0.field_0 & (1 << 0))
+        {
+            arg0->effectsInfo_0.field_0.s_field_0.field_1 = Math_WeightedAverageGet(arg1->effectsInfo_0.field_0.s_field_0.field_1, arg2->effectsInfo_0.field_0.s_field_0.field_1, weight);
+        }
+        else
+        {
+            arg0->effectsInfo_0.field_0.s_field_0.field_1 = Math_WeightedAverageGet(arg1->effectsInfo_0.field_0.s_field_0.field_1, arg2->effectsInfo_0.field_0.s_field_0.field_1, weight1);
+        }
+    }
+    else
+    {
+        if (arg2->effectsInfo_0.field_0.s_field_0.field_0 & (1 << 0))
+        {
+            arg0->effectsInfo_0.field_0.s_field_0.field_1 = Math_WeightedAverageGet(arg1->effectsInfo_0.field_0.s_field_0.field_1, arg2->effectsInfo_0.field_0.s_field_0.field_1, weight0);
+        }
+        else
+        {
+            arg0->effectsInfo_0.field_0.s_field_0.field_1 = Math_WeightedAverageGet(arg1->effectsInfo_0.field_0.s_field_0.field_1, arg2->effectsInfo_0.field_0.s_field_0.field_1, weight);
+        }
+    }
+
+    if (arg1->effectsInfo_0.field_E == 0)
+    {
+        if (arg2->effectsInfo_0.field_E != 0)
+        {
+            arg0->effectsInfo_0.field_E = arg2->effectsInfo_0.field_E;
+            func_8003FD38(arg0, arg1, arg2, weight, weight0, weight1);
+        }
+        else
+        {
+            temp                  = arg2->effectsInfo_0.field_E;
+            arg0->effectsInfo_0.field_E = temp;
+            func_8003FD38(arg0, arg1, arg2, weight, weight, weight);
+        }
+    }
+    else if (arg2->effectsInfo_0.field_E == 0)
+    {
+        if (weight1 >= Q12(1.0f))
+        {
+            arg0->effectsInfo_0.field_E = arg2->effectsInfo_0.field_E;
+        }
+        else
+        {
+            arg0->effectsInfo_0.field_E = arg1->effectsInfo_0.field_E;
+        }
+
+        func_8003FD38(arg0, arg1, arg2, weight, weight1, weight0);
+    }
+    else
+    {
+        temp                  = arg2->effectsInfo_0.field_E;
+        arg0->effectsInfo_0.field_E = temp;
+        func_8003FD38(arg0, arg1, arg2, weight, weight, weight);
+    }
+
+    arg0->effectsInfo_0.worldTintR_8 = Math_WeightedAverageGet(arg1->effectsInfo_0.worldTintR_8, arg2->effectsInfo_0.worldTintR_8, weight);
+    arg0->effectsInfo_0.worldTintG_A = Math_WeightedAverageGet(arg1->effectsInfo_0.worldTintG_A, arg2->effectsInfo_0.worldTintG_A, weight);
+    arg0->effectsInfo_0.worldTintB_C = Math_WeightedAverageGet(arg1->effectsInfo_0.worldTintB_C, arg2->effectsInfo_0.worldTintB_C, weight);
+
+    if (arg1->effectsInfo_0.field_0.s_field_0.field_2 == 1 && arg2->effectsInfo_0.field_0.s_field_0.field_2 == 2)
+    {
+        if (weight < Q12(5.0f / 6.0f))
+        {
+            weight2                                 = Q12_MULT(weight, Q12(1.2f));
+            weight2                                 = CLAMP(weight2, Q12(0.0f), Q12(1.0f));
+            arg0->effectsInfo_0.field_0.s_field_0.field_2 = arg1->effectsInfo_0.field_0.s_field_0.field_2;
+            arg0->effectsInfo_0.field_4                   = Math_WeightedAverageGet(arg1->effectsInfo_0.field_4, 0, weight2);
+        }
+        else
+        {
+            weight2                                 = (weight - Q12(5.0f / 6.0f)) * 6;
+            weight2                                 = CLAMP(weight2, Q12(0.0f), Q12(1.0f));
+            arg0->effectsInfo_0.field_0.s_field_0.field_2 = arg2->effectsInfo_0.field_0.s_field_0.field_2;
+            weight0                                 = arg2->effectsInfo_0.field_4;
+            arg0->effectsInfo_0.field_4                   = Math_WeightedAverageGet(Q12(0.0f), weight0, weight2);
+        }
+    }
+    else if (arg1->effectsInfo_0.field_0.s_field_0.field_2 == 2 && arg2->effectsInfo_0.field_0.s_field_0.field_2 == 1)
+    {
+        if (weight < Q12(1.0f / 6.0f))
+        {
+            weight2                                 = weight * 6;
+            weight2                                 = CLAMP(weight2, Q12(0.0f), Q12(1.0f));
+            arg0->effectsInfo_0.field_0.s_field_0.field_2 = arg1->effectsInfo_0.field_0.s_field_0.field_2;
+            arg0->effectsInfo_0.field_4                   = Math_WeightedAverageGet(arg1->effectsInfo_0.field_4, Q12(0.0f), weight2);
+        }
+        else
+        {
+            weight2                                 = Q12_MULT(weight - Q12(1.0f / 6.0f), Q12(1.2f));
+            weight2                                 = CLAMP(weight2, Q12(0.0f), Q12(1.0f));
+            arg0->effectsInfo_0.field_0.s_field_0.field_2 = arg2->effectsInfo_0.field_0.s_field_0.field_2;
+            arg0->effectsInfo_0.field_4                   = Math_WeightedAverageGet(Q12(0.0f), arg2->effectsInfo_0.field_4, weight2);
+        }
+    }
+    else
+    {
+        if (arg1->effectsInfo_0.field_0.s_field_0.field_2 != 0 && arg2->effectsInfo_0.field_0.s_field_0.field_2 == 0)
+        {
+            if (weight >= Q12(1.0f))
+            {
+                arg0->effectsInfo_0.field_0.s_field_0.field_2 = arg2->effectsInfo_0.field_0.s_field_0.field_2;
+            }
+            else
+            {
+                arg0->effectsInfo_0.field_0.s_field_0.field_2 = arg1->effectsInfo_0.field_0.s_field_0.field_2;
+            }
+        }
+        else
+        {
+            arg0->effectsInfo_0.field_0.s_field_0.field_2 = arg2->effectsInfo_0.field_0.s_field_0.field_2;
+        }
+
+        arg0->effectsInfo_0.field_4 = Math_WeightedAverageGet(arg1->effectsInfo_0.field_4, arg2->effectsInfo_0.field_4, weight);
+    }
+
+    if (arg1->effectsInfo_0.field_18 == 0 && arg2->effectsInfo_0.field_18 != 0)
+    {
+        func_8003FE04(&arg0->effectsInfo_0, &arg1->effectsInfo_0, &arg2->effectsInfo_0, weight1);
+    }
+    else
+    {
+        func_8003FE04(&arg0->effectsInfo_0, &arg1->effectsInfo_0, &arg2->effectsInfo_0, weight);
+    }
+}
+
+void func_8003FCB0(const s_MapEffectsInfo* arg0, const s_MapEffectsInfo* arg1, const s_MapEffectsInfo* arg2, q19_12 alphaTo) // 0x8003FCB0
+{
+    q19_12 alphaFrom;
+
+    alphaFrom = Q12(1.0f) - alphaTo;
+    LoadAverageCol(&arg1->field_21.r, &arg2->field_21.r, alphaFrom, alphaTo, &arg0->field_21.r);
+    LoadAverageCol(&arg1->field_25.r, &arg2->field_25.r, alphaFrom, alphaTo, &arg0->field_25.r);
+}
+
+void func_8003FD38(s_StructUnk3* arg0, s_StructUnk3* arg1, s_StructUnk3* arg2, q19_12 weight0, q19_12 weight1, q19_12 alphaTo) // 0x8003FD38
+{
+    if (arg1->brightnessIntensity_2E != arg2->brightnessIntensity_2E)
+    {
+        arg0->brightnessIntensity_2E = Math_WeightedAverageGet(arg1->brightnessIntensity_2E, arg2->brightnessIntensity_2E, weight0);
+    }
+    else
+    {
+        arg0->brightnessIntensity_2E = arg2->brightnessIntensity_2E;
+    }
+
+    arg0->fogDistance_30               = Math_WeightedAverageGet(arg1->fogDistance_30, arg2->fogDistance_30, weight0);
+    arg0->effectsInfo_0.fogDistance_10 = Math_WeightedAverageGet(arg1->effectsInfo_0.fogDistance_10, arg2->effectsInfo_0.fogDistance_10, weight1);
+    arg0->effectsInfo_0.field_6        = Math_WeightedAverageGet(arg1->effectsInfo_0.field_6, arg2->effectsInfo_0.field_6, weight0);
+
+    LoadAverageCol(&arg1->effectsInfo_0.fogColor_14.r, &arg2->effectsInfo_0.fogColor_14.r, Q12(1.0f) - alphaTo, alphaTo, &arg0->effectsInfo_0.fogColor_14.r);
+}
+
+void func_8003FE04(const s_MapEffectsInfo* arg0, const s_MapEffectsInfo* arg1, const s_MapEffectsInfo* arg2, q19_12 alphaTo) // 0x8003FE04
+{
+    q19_12 alphaFrom;
+
+    alphaFrom = Q12(1.0f) - alphaTo;
+    LoadAverageCol(&arg1->field_19.r, &arg2->field_19.r, alphaFrom, alphaTo, &arg0->field_19.r);
+    LoadAverageCol(&arg1->screenTint_1D.r, &arg2->screenTint_1D.r, alphaFrom, alphaTo, &arg0->screenTint_1D.r);
+
+    if ((arg0->field_19.r || arg0->field_19.g || arg0->field_19.b) ||
+        (arg0->screenTint_1D.r || arg0->screenTint_1D.g || arg0->screenTint_1D.b))
+    {
+#ifdef SH_PC_PORT
+        ((s_MapEffectsInfo*)arg0)->field_18 = 1;
+#else
+        arg0->field_18 = 1;
+#endif
+    }
+    else
+    {
+#ifdef SH_PC_PORT
+        ((s_MapEffectsInfo*)arg0)->field_18 = 0;
+#else
+        arg0->field_18 = 0;
+#endif
+    }
+}
+
+s32 func_8003FEC0(const s_MapEffectsInfo* arg0) // 0x8003FEC0
+{
+    static q19_12 Y_ARRAY[5] = {
+        Q12(1.75f),
+        Q12(6.0f),
+        Q12(9.5f),
+        Q12(12.5f),
+        Q12(15.0f)
+    };
+
+    if (g_WorldEnvWork.isFogEnabled)
+    {
+        return arg0->fogDistance_10;
+    }
+
+    if (g_WorldEnvWork.field_0 == 1)
+    {
+        return vwOresenHokan(Y_ARRAY, ARRAY_SIZE(Y_ARRAY), arg0->field_4, 0, Q12(2.0f));
+    }
+
+    return Q12(20.0f);
+}
+
+void func_8003FF2C(s_StructUnk3* arg0) // 0x8003FF2C
+{
+    s32   temp_a0;
+    s32   temp_v1;
+    q23_8 brightness;
+
+    temp_v1    = Q12_MULT(arg0->brightnessIntensity_2E, (g_GameWork.config.brightness * 8) + 4);
+    brightness = CLAMP(temp_v1, Q8_CLAMPED(0.0f), Q8_CLAMPED(1.0f));
+
+    func_80055330(arg0->effectsInfo_0.field_0.s_field_0.field_2, arg0->effectsInfo_0.field_6, arg0->effectsInfo_0.field_0.s_field_0.field_1, arg0->effectsInfo_0.worldTintR_8, arg0->effectsInfo_0.worldTintG_A, arg0->effectsInfo_0.worldTintB_C, brightness);
+    WorldEnv_FogParamsSet(arg0->effectsInfo_0.field_E != 0, arg0->effectsInfo_0.fogColor_14.r, arg0->effectsInfo_0.fogColor_14.g, arg0->effectsInfo_0.fogColor_14.b);
+
+    temp_a0 = arg0->effectsInfo_0.fogDistance_10;
+
+    WorldEnv_FogDistanceSet(temp_a0, temp_a0 + Q12(1.0f));
+    func_800553E0(arg0->effectsInfo_0.field_18, arg0->effectsInfo_0.field_19.r, arg0->effectsInfo_0.field_19.g, arg0->effectsInfo_0.field_19.b, arg0->effectsInfo_0.screenTint_1D.r, arg0->effectsInfo_0.screenTint_1D.g, arg0->effectsInfo_0.screenTint_1D.b);
+}

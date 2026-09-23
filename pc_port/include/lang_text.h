@@ -1,0 +1,91 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+#ifndef LANG_TEXT_H
+#define LANG_TEXT_H
+
+/* PAL language text (config `language`, EUR discs): item names/descriptions
+ * come from the disc's VIN/ITEM_<lang>.BIN, in-map messages from the
+ * VIN/VIN2..VIN5 localized overlays (file table already redirected by
+ * Fs_InitFileTableForRegion). This includes ENGLISH: PAL-EN is a distinct
+ * retranslation of the US script, so a PAL disc always shows its own text.
+ * PAL text uses a different markup dialect than the compiled US strings
+ * ({X} brace codes, real spaces, literal newlines, Latin-1 accents) —
+ * everything is translated to the US dialect at load so the stock renderer
+ * draws it; accent bytes pass through raw and resolve in text_draw via the
+ * region font layout (font_region.c). */
+
+/* Selectable languages, in options-menu (and config `language`) order:
+ * 0=en 1=de 2=fr 3=es 4=it are the PAL disc's own; LANG_PACK_FIRST and up are
+ * PC-side packs loaded from gamedata/lang (see lang_pack.h). */
+#define LANG_PACK_FIRST 5
+#define LANG_COUNT      6
+
+extern const char* const s_LangIds[LANG_COUNT];
+
+/* Non-zero when an EUR disc is active (localized text pipeline in use). */
+int Pc_LangActive(void);
+
+/* Non-zero when a fan-translated (modified) USA disc was detected: its
+ * BODYPROG kerning table or item text differed from the compiled originals.
+ * Story text self-detects per map in Pc_LangPatchMapMessages regardless.
+ * Also unlocks the port's menu translations (lang_menu.c) on USA discs via
+ * the `language` config key. */
+int Pc_FanTextActive(void);
+
+/* Non-zero when the options menu should show the Language row (EUR disc +
+ * menu entered from the title screen). */
+int Pc_LangMenuRowActive(void);
+
+/* Options-menu Language row, in SLOTS (0..Pc_LangSlotCount()-1) so the menu
+ * needs no region knowledge: EUR cycles the disc's five languages plus the
+ * PC-side packs, NTSC-J cycles Japanese and Chinese (a separate config key —
+ * the two lists share no ids), USA cycles the five for its menu translations.
+ * Pc_LangSlotName/NameX give the label to draw and its left edge. */
+int         Pc_LangSlotCount(void);
+int         Pc_LangSlotCurrent(void);
+void        Pc_LangSlotSet(int slot);
+const char* Pc_LangSlotName(int slot);
+int         Pc_LangSlotNameX(int slot);
+
+/* Live language switch (0=en 1=de 2=fr 3=es 4=it): persists the config key,
+ * rebinds the file table, reloads item text. Title-screen options only. */
+void Pc_LangSetLanguage(int lang);
+
+/* Live NTSC-J language switch (0=Japanese 1=Chinese): persists the config key
+ * and swaps the kanji rasterizer's glyph set. Nothing on the disc is rebound —
+ * the Chinese fan translation reuses the Japanese script's kuten codes. */
+void Pc_LangSetJpLanguage(int lang);
+
+/* Load + parse ITEM_<lang>.BIN once (call after Fs_InitFileTableForRegion). */
+void Pc_LangInit(void);
+
+/* Read a whole file out of the mounted raw-sector disc image (2352-byte
+ * sectors, 2048 data bytes at +24), given a file-table sector and byte size.
+ * Returns a malloc'd buffer the caller frees, or NULL when no disc is bound or
+ * the read ran short. */
+unsigned char* Pc_LangReadDiscFile(unsigned int sector, unsigned int size);
+
+/* Localized item text for inventory index 0..194, or NULL to use the US
+ * string (PAL leaves some entries untranslated/NULL — English fallback). */
+const char* Pc_LangItemName(int itemIdx);
+const char* Pc_LangItemDesc(int itemIdx);
+
+/* After the map overlay BIN finished loading into `ovl` (g_OvlDynamic):
+ * extract the localized message table and repoint the active map header at
+ * translated strings. No-op unless Pc_LangActive(). */
+void Pc_LangPatchMapMessages(int mapIdx, void* ovl, unsigned int ovlSize);
+
+/* Apply gamedata/load/text_overrides.txt to the active map header. Call after
+ * Pc_LangPatchMapMessages so a mod override wins over the localized string.
+ * No-op when the file is absent or has no entry for this map. */
+void Pc_TextOverrideApply(int mapIdx);
+
+/* Port-written menu translations (lang_menu.c — retail PAL kept every menu
+ * English, the disc has no menu strings to reuse). Called from the
+ * Gfx_StringDraw chokepoint: returns the translated string when one exists
+ * for the active language, else `str` unchanged (US discs: always
+ * unchanged). Pc_LangMenuTextWidth measures a (first line of a) menu string
+ * in pixels for the centered title/difficulty entries. */
+const char* Pc_LangMenuText(const char* str);
+int         Pc_LangMenuTextWidth(const char* str);
+
+#endif

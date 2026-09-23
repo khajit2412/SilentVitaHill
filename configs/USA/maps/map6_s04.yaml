@@ -1,0 +1,90 @@
+name: The MAP6_S04 map overlay (MAP6_S04)
+sha1: f8b99936e2d797d8bca6b591b9515bc72ba09cd6
+options:
+  basename: MAP6_S04.BIN
+  target_path: assets/USA/VIN/MAP6_S04.BIN
+  base_path: ../../..
+  platform: psx
+  compiler: GCC
+
+  asm_path: asm/USA/maps/map6_s04
+  src_path: src/maps/map6_s04
+  build_path: build/USA
+
+  ld_script_path: linkers/USA/maps/map6_s04.ld
+
+  find_file_boundaries: false
+  gp_value: 0x80022BB0
+  global_vram_start: 0x80010000
+  global_vram_end: 0x80200000
+
+  o_as_suffix: false
+  use_legacy_include_asm: false
+
+  asm_function_macro: glabel
+  asm_jtbl_label_macro: jlabel
+  asm_data_macro: dlabel
+  generate_asm_macros_files: False # Disabled as our include_asm.h is customized to work with different game versions.
+
+  section_order: [".rodata", ".text", ".data", ".bss"]
+
+  symbol_addrs_path:
+    - configs/USA/sym.main.txt
+    - configs/USA/sym.bodyprog.txt
+    - configs/USA/maps/sym.map6_s04.txt
+  reloc_addrs_path:
+    - configs/USA/maps/rel.map6_s04.txt
+
+  undefined_funcs_auto_path: linkers/USA/maps/undefined_funcs_auto.map6_s04.txt
+  undefined_syms_auto_path: linkers/USA/maps/undefined_syms_auto.map6_s04.txt
+
+  extensions_path: tools/splat_ext
+
+  subalign: 4
+
+  string_encoding: ASCII
+  data_string_encoding: ASCII
+  rodata_string_guesser_level: 2
+  data_string_guesser_level: 2
+segments:
+  - name: map6_s04
+    type: code
+    start: 0
+    vram: 0x800C9578
+    align: 4
+    subalign: 4
+    subsegments:
+      # .rodata section
+      - [0x0, rodata]
+      - [0x4, .rodata, map6_s04_header]
+      - [0x1050, .rodata, particle]
+      - [0x10A0, .rodata, player]
+      - [0x1738, .rodata, Chara_LarvalStalker]
+      - [0x1840, .rodata, Chara_Stalker]
+      - [0x1BA0, .rodata, Chara_MonsterCybil]
+      - [0x1FB0, .rodata, Chara_AlessaDahlia]
+      - [0x20AC, rodata]
+      - [0x20B0, .rodata, map6_s04_2]
+
+      - [0x3268, c, map6_s04_header]
+      - [0x3268, c, map6_s04_events_data]
+      - [0x3268, c, map6_s04_anim_info]
+
+      # .text section
+      - [0x3268, c, unk_draw_m1s01]
+      - [0x3E34, c, particle]
+      - [0x4FBC, c, player]
+      - [0x6B40, c, Chara_LarvalStalker]
+      - [0x9FE8, c, Chara_Stalker]
+      - [0xF238, c, Chara_MonsterCybil]
+      - [0x12D3C, c, Chara_AlessaDahlia]
+      - [0x14040, c, map6_s04_2]
+
+      # .data section
+      - [0x1E620, .data, map6_s04_anim_info]
+      - [0x1EAF0, data]
+      - [0x221e4, .data, map6_s04_header]
+      - [0x222A4, .data, map6_s04_2]
+      - [0x223D4, .data, map6_s04_events_data]
+      - [0x224B8, data]
+  - [0x24A00]

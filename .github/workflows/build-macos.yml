@@ -1,0 +1,110 @@
+name: Build PC Port (macOS arm64)
+
+# Produces the macOS arm64 binary of the PC port. CI only BUILDS it (the maintainer
+# is still the sole publisher) — release-nightly.ps1 -AttachCrossPlatform pulls the
+# artifact this run uploads and attaches it to the nightly release alongside the
+# Windows build. The Windows launcher never consumes these files.
+#
+# macos-14 runners are Apple Silicon (arm64). The binary is UNSIGNED — Gatekeeper
+# will warn; users right-click->Open once or run:
+#   xattr -dr com.apple.quarantine .   (whole folder: binary + map .dylibs)
+
+on:
+  push:
+    branches:
+      - pc-port
+    paths-ignore:
+      - '**.md'
+      - 'pc_port/launcher/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    if: github.repository == 'SlickAmogus/silent-hill-decomp'
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout (with PsyCross submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          # AppleClang can't compile the PSX decomp C; build.sh auto-selects
+          # Homebrew GCC and points CMake at openal-soft + jpeg-turbo (both
+          # keg-only, so build.sh passes their prefixes explicitly).
+          # ffmpeg is a build-time header dependency only: the FMV fallback
+          # dlopen's ffmpeg at runtime, so nothing is linked or bundled. The plain
+          # formula (8.x) is not keg-only, so pkg-config finds it unaided.
+          brew install gcc cmake ninja pkg-config sdl2 openal-soft jpeg-turbo ffmpeg
+
+      - name: Build (build.sh -> Ninja + map .dylib overlays)
+        run: |
+          cd pc_port
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Stage release files
+        run: |
+          set -euo pipefail
+          STAGE="$RUNNER_TEMP/SHPC-macos-arm64"
+          mkdir -p "$STAGE/maps"
+          cp pc_port/build/SilentHillPC "$STAGE/"
+          cp pc_port/build/maps/*.dylib "$STAGE/maps/"
+          cp pc_port/config.cfg "$STAGE/config.cfg"
+          mkdir -p "$STAGE/gamedata/save"
+          # Shipped runtime assets (pc_port/assets/ mirrors the game folder layout).
+          cp -r pc_port/assets/. "$STAGE/"
+
+          # Bundle libjpeg (issue #110): jpeg-turbo is keg-only, so the binary
+          # linked it by its absolute Homebrew path and users without
+          # `brew install jpeg-turbo` got "Library not loaded: .../libjpeg.8.dylib".
+          # Copy the actual linked dylib next to the binary and repoint the load
+          # command at @loader_path, so no Homebrew jpeg is needed at runtime.
+          JPEG_SRC="$(otool -L "$STAGE/SilentHillPC" | awk '/libjpeg\.[0-9]+\.dylib/{print $1; exit}')"
+          if [ -n "${JPEG_SRC:-}" ] && [ -f "$JPEG_SRC" ]; then
+            JPEG_BASE="$(basename "$JPEG_SRC")"
+            cp "$JPEG_SRC" "$STAGE/$JPEG_BASE"
+            chmod u+w "$STAGE/$JPEG_BASE"
+            install_name_tool -change "$JPEG_SRC" "@loader_path/$JPEG_BASE" "$STAGE/SilentHillPC"
+            install_name_tool -id "@loader_path/$JPEG_BASE" "$STAGE/$JPEG_BASE"
+            echo "Bundled $JPEG_BASE and repointed the load command."
+          else
+            echo "WARNING: could not locate the linked libjpeg to bundle." >&2
+          fi
+
+          # Ad-hoc codesign the binary and every .dylib (issue #110): unsigned
+          # .dylibs made Gatekeeper prompt once PER map overlay ("cannot verify
+          # developer", the four Done clicks). An ad-hoc signature plus the
+          # recursive quarantine strip below lets them load without prompts.
+          # Must run AFTER install_name_tool (editing a signed binary voids it).
+          codesign --force --sign - "$STAGE/SilentHillPC" || true
+          for dl in "$STAGE"/maps/*.dylib "$STAGE"/*.dylib; do
+            [ -f "$dl" ] && codesign --force --sign - "$dl" || true
+          done
+
+          cat > "$STAGE/README-macos.txt" <<'EOF'
+          Silent Hill PC Port — macOS arm64 (Apple Silicon)
+
+          Requires the original disc image in gamedata/ (not included).
+
+          Runtime dependencies (Homebrew):
+            brew install sdl2 openal-soft
+          (libjpeg is bundled; no jpeg-turbo install needed.)
+
+          The build is unsigned. Before the first run, clear the quarantine flag
+          on the WHOLE folder so the binary AND the map .dylibs load without
+          per-file Gatekeeper prompts:
+            xattr -dr com.apple.quarantine .
+          Then:  ./SilentHillPC
+          EOF
+          ( cd "$RUNNER_TEMP" && zip -r "$RUNNER_TEMP/SHPC-macos-arm64.zip" SHPC-macos-arm64 )
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SHPC-macos-arm64
+          path: ${{ runner.temp }}/SHPC-macos-arm64.zip
+          if-no-files-found: error
+          retention-days: 90

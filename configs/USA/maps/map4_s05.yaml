@@ -1,0 +1,85 @@
+name: The MAP4_S05 map overlay (MAP4_S05)
+sha1: e5facd48a75ae80f581b86d9a6aff119ec9629ee
+options:
+  basename: MAP4_S05.BIN
+  target_path: assets/USA/VIN/MAP4_S05.BIN
+  base_path: ../../..
+  platform: psx
+  compiler: GCC
+
+  asm_path: asm/USA/maps/map4_s05
+  src_path: src/maps/map4_s05
+  build_path: build/USA
+
+  ld_script_path: linkers/USA/maps/map4_s05.ld
+
+  find_file_boundaries: false
+  gp_value: 0x80022BB0
+  global_vram_start: 0x80010000
+  global_vram_end: 0x80200000
+
+  o_as_suffix: false
+  use_legacy_include_asm: false
+
+  asm_function_macro: glabel
+  asm_jtbl_label_macro: jlabel
+  asm_data_macro: dlabel
+  generate_asm_macros_files: False # Disabled as our include_asm.h is customized to work with different game versions.
+
+  section_order: [".rodata", ".text", ".data", ".bss"]
+
+  symbol_addrs_path:
+    - configs/USA/sym.main.txt
+    - configs/USA/sym.bodyprog.txt
+    - configs/USA/maps/sym.map4_s05.txt
+  reloc_addrs_path:
+    - configs/USA/maps/rel.map4_s05.txt
+
+  undefined_funcs_auto_path: linkers/USA/maps/undefined_funcs_auto.map4_s05.txt
+  undefined_syms_auto_path: linkers/USA/maps/undefined_syms_auto.map4_s05.txt
+
+  extensions_path: tools/splat_ext
+
+  subalign: 4
+
+  string_encoding: ASCII
+  data_string_encoding: ASCII
+  rodata_string_guesser_level: 2
+  data_string_guesser_level: 2
+segments:
+  - name: map4_s05
+    type: code
+    start: 0
+    vram: 0x800C9578
+    align: 4
+    subalign: 4
+    subsegments:
+      # .rodata section
+      - [0x0, rodata]
+      - [0x4, .rodata, map4_s05_header]
+      - [0x1050, .rodata, particle]
+      - [0x1204, rodata]
+      - [0x1208, .rodata, player]
+      - [0x132C, rodata]
+      - [0x1330, .rodata, map4_s05]
+      - [0x1729, rodata] # 3 random bytes, linker artifact, splat doesn't seem to write to .s so postbuild.py has to patch them back in.
+
+      - [0x172C, c, map4_s05_header]
+      - [0x172C, c, map4_s05_events_data]
+      - [0x172C, c, map4_s05_anim_info]
+
+      # .text section
+      - [0x172C, c, particle_acid]
+      - [0x2D88, c, unk_draw_m1s03]
+      - [0x3504, c, particle]
+      - [0x62E0, c, player]
+      - [0x8184, c, map4_s05]
+
+      # .data section
+      - [0xE05C, .data, map4_s05_anim_info]
+      - [0xE1EC, data]
+      - [0xe5bc, .data, map4_s05_header]
+      - [0xE6C8, .data, map4_s05]
+      - [0xE714, .data, map4_s05_events_data]
+      - [0xE7EC, data]
+  - [0x12500]

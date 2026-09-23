@@ -1,0 +1,3 @@
+    {
+      .isEndOfArray = true,
+    },

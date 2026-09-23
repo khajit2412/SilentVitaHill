@@ -1,0 +1,97 @@
+#include "bodyprog/bodyprog.h"
+#include "bodyprog/math/math.h"
+
+s_AnimInfo HARRY_M5S03_ANIM_INFOS[] = {
+    { Anim_BlendLinear, ANIM_STATUS(38, false), false, ANIM_STATUS(38, true), { Q12(10.0f) }, NO_VALUE, 676 },
+    { Anim_PlaybackOnce, ANIM_STATUS(38, true), false, ANIM_STATUS(38, true), { Q12(10.0f) }, 676, 677 },
+    { Anim_BlendLinear, ANIM_STATUS(39, false), false, ANIM_STATUS(39, true), { Q12(10.0f) }, NO_VALUE, 678 },
+    { Anim_PlaybackOnce, ANIM_STATUS(39, true), false, ANIM_STATUS(39, true), { Q12(15.0f) }, 678, 688 },
+    { Anim_BlendLinear, ANIM_STATUS(40, false), false, ANIM_STATUS(40, true), { Q12(10.0f) }, NO_VALUE, 689 },
+    { Anim_PlaybackOnce, ANIM_STATUS(40, true), false, ANIM_STATUS(40, true), { Q12(10.0f) }, 689, 724 },
+    { Anim_BlendLinear, ANIM_STATUS(41, false), false, ANIM_STATUS(41, true), { Q12(10.0f) }, NO_VALUE, 729 },
+    { Anim_PlaybackOnce, ANIM_STATUS(41, true), false, ANIM_STATUS(41, true), { Q12(15.0f) }, 729, 743 },
+    { Anim_BlendLinear, ANIM_STATUS(42, false), false, ANIM_STATUS(42, true), { Q12(10.0f) }, NO_VALUE, 748 },
+    { Anim_PlaybackOnce, ANIM_STATUS(42, true), false, ANIM_STATUS(42, true), { Q12(15.0f) }, 748, 762 },
+    { Anim_BlendLinear, ANIM_STATUS(43, false), false, ANIM_STATUS(43, true), { Q12(10.0f) }, NO_VALUE, 769 },
+    { Anim_PlaybackOnce, ANIM_STATUS(43, true), false, ANIM_STATUS(43, true), { Q12(10.0f) }, 769, 781 },
+    { Anim_BlendLinear, ANIM_STATUS(44, false), false, ANIM_STATUS(44, true), { Q12(10.0f) }, NO_VALUE, 788 },
+    { Anim_PlaybackOnce, ANIM_STATUS(44, true), false, ANIM_STATUS(44, true), { Q12(10.0f) }, 788, 800 },
+    { Anim_BlendLinear, ANIM_STATUS(45, false), false, ANIM_STATUS(45, true), { Q12(10.0f) }, NO_VALUE, 801 },
+    { Anim_PlaybackOnce, ANIM_STATUS(45, true), false, ANIM_STATUS(45, true), { Q12(15.0f) }, 801, 815 },
+    { Anim_BlendLinear, ANIM_STATUS(46, false), false, ANIM_STATUS(46, true), { Q12(10.0f) }, NO_VALUE, 816 },
+    { Anim_PlaybackOnce, ANIM_STATUS(46, true), false, ANIM_STATUS(46, true), { Q12(15.0f) }, 816, 827 },
+    { Anim_BlendLinear, ANIM_STATUS(47, false), false, ANIM_STATUS(47, true), { Q12(10.0f) }, NO_VALUE, 828 },
+    { Anim_PlaybackLoop, ANIM_STATUS(47, true), false, NO_VALUE, { Q12(6.0f) }, 828, 841 },
+    { Anim_BlendLinear, ANIM_STATUS(48, false), false, ANIM_STATUS(48, true), { Q12(10.0f) }, NO_VALUE, 842 },
+    { Anim_PlaybackLoop, ANIM_STATUS(48, true), false, NO_VALUE, { Q12(2.0f) }, 842, 845 },
+    { Anim_BlendLinear, ANIM_STATUS(49, false), false, ANIM_STATUS(49, true), { Q12(10.0f) }, NO_VALUE, 846 },
+    { Anim_PlaybackOnce, ANIM_STATUS(49, true), false, ANIM_STATUS(49, true), { Q12(10.0f) }, 846, 863 },
+    { Anim_BlendLinear, ANIM_STATUS(50, false), false, ANIM_STATUS(50, true), { Q12(10.0f) }, NO_VALUE, 864 },
+    { Anim_PlaybackOnce, ANIM_STATUS(50, true), false, ANIM_STATUS(50, true), { Q12(10.0f) }, 864, 900 },
+    { Anim_BlendLinear, ANIM_STATUS(51, false), false, ANIM_STATUS(51, true), { Q12(10.0f) }, NO_VALUE, 901 },
+    { Anim_PlaybackOnce, ANIM_STATUS(51, true), false, ANIM_STATUS(51, true), { Q12(10.0f) }, 901, 955 },
+    { Anim_BlendLinear, ANIM_STATUS(52, false), false, ANIM_STATUS(52, true), { Q12(10.0f) }, NO_VALUE, 485 },
+    { Anim_PlaybackOnce, ANIM_STATUS(52, true), false, ANIM_STATUS(52, true), { Q12(20.0f) }, 485, 502 },
+    {}
+};
+
+s_UnkStruct3_Mo g_MapHeaderTable_38[] = {
+    { 0x4D4C, 0x0, 0x2A4, 0x2A5 },
+    { 0x4F4E, 0xC8, 0x2A6, 0x2B0 },
+    { 0x5150, 0xCA, 0x2B1, 0x2D4 },
+    { 0x5352, 0xD2, 0x2D5, 0x2E7 },
+    { 0x5554, 0xD3, 0x2E8, 0x2FA },
+    { 0x5756, 0xD4, 0x2FB, 0x30D },
+    { 0x5958, 0xD5, 0x30E, 0x320 },
+    { 0x5B5A, 0x12C, 0x321, 0x32F },
+    { 0x5D5C, 0x12D, 0x330, 0x33B },
+    { 0x5F5E, 0x14B, 0x33C, 0x349 },
+    { 0x6160, 0x190, 0x34A, 0x34D },
+    { 0x6362, 0x1B2, 0x34E, 0x35F },
+    { 0x6564, 0x1BC, 0x360, 0x384 },
+    { 0x6766, 0x1CE, 0x385, 0x3BB },
+    { 0x6968, 0x1F4, 0x1E5, 0x1F6 },
+    {},
+};
+
+u8 LOADABLE_INVENTORY_ITEMS[] = {
+    InvItemId_HealthDrink,
+    InvItemId_FirstAidKit,
+    InvItemId_Ampoule,
+    InvItemId_KitchenKnife,
+    InvItemId_SteelPipe,
+    InvItemId_Hammer,
+    InvItemId_Chainsaw,
+    InvItemId_Axe,
+    InvItemId_Handgun,
+    InvItemId_HuntingRifle,
+    InvItemId_Shotgun,
+    InvItemId_HyperBlaster,
+    InvItemId_HandgunBullets,
+    InvItemId_RifleShells,
+    InvItemId_ShotgunShells,
+    InvItemId_Flashlight,
+    InvItemId_PocketRadio,
+    InvItemId_SewerKey,
+    InvItemId_SewerExitKey,
+    InvItemId_Flauros,
+    InvItemId_KaufmannKey,
+    InvItemId_Receipt,
+    InvItemId_SafeKey,
+    InvItemId_Magnet,
+    InvItemId_MotorcycleKey,
+    InvItemId_PlasticBottle,
+    InvItemId_UnknownLiquid,
+    InvItemId_VideoTape,
+    InvItemId_RockDrill,
+    InvItemId_GasolineTank,
+    InvItemId_ChannelingStone,
+    InvItemId_Katana,
+    InvItemId_Unequipped
+};
+
+u8 sharedData_800DD584_0_s00 = 0;
+
+/* s32[2] like map0_s00/map0_s01 (and the extern in particle.h): particle.c
+ * zeroes both elements, so a scalar here means a 4-byte OOB write. */
+s32 g_ParticlesAddedCount[2] = {};

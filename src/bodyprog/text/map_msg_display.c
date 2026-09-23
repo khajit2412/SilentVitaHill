@@ -1,0 +1,695 @@
+#include "game.h"
+
+#include <psyq/libetc.h>
+#include <psyq/libpad.h>
+#include <psyq/strings.h>
+
+#include "bodyprog/bodyprog.h"
+#include "bodyprog/events/map_msg.h"
+#include "bodyprog/math/math.h"
+#include "bodyprog/screen/screen_data.h"
+#include "bodyprog/screen/screen_draw.h"
+#include "bodyprog/sound/sound_system.h"
+#include "bodyprog/text/text_draw.h"
+#ifdef SH_PC_PORT
+#include "pc_msg_voice.h"
+#endif
+#include "main/fsqueue.h"
+
+#ifdef SH_PC_PORT
+#include <SDL_timer.h>
+#include "sh_log.h"
+#endif
+
+// ========================================
+// STATIC VARIABLES
+// ========================================
+
+static s32 g_MapMsg_CurrentIdx       = 0;
+static s16 g_MapMsg_SelectFlashTimer = 0;
+
+// ========================================
+// GLOBAL VARIABLES
+// ========================================
+
+s_MapMsgSelect g_MapMsg_Select;
+u8             g_MapMsg_AudioLoadBlock;
+s8             g_MapMsg_SelectCancelIdx;
+
+// @hack JP calls different `Gfx_StringSetColor` / `Gfx_StringDraw` funcs here.
+// The normal funcs available are also used in JP, so can't be renamed.
+// For now override `Gfx_StringSetColor` calls in this file until those JP funcs get figured out.
+#if VERSION_REGION_IS(NTSCJ)
+    #define Gfx_StringSetColor Gfx_StringSetColor_JP
+#endif
+
+#ifdef SH_PC_PORT
+/* PSX 0x800BCD6C. File-scope and exported for the RetroAchievements address
+ * map, which resolves each name in configs/USA/sym.*.txt at runtime: a
+ * function-local static is the same object but carries no name to look up, so
+ * this was one of the set's unmapped reads ("needs a translation entry") and
+ * any condition touching it read nothing. A function-local static already had
+ * static lifetime -- only linkage changes, and only for the PC build. */
+s32 msgIdx;
+#endif
+
+s32 Gfx_MapMsg_Draw(s32 mapMsgIdx) // 0x800365B8
+{
+#ifdef SH_PC_PORT
+    /* MSG_TIMER_MAX is the auto-advance timer's upper clamp. The original
+     * `Q12(524288.0f) - 1` computes `(s32)(524288.0f * 4096)` = `(s32)(2^31)`,
+     * a float->int overflow. PSX/MIPS (cvt.w.s) SATURATES that to 0x7FFFFFFF,
+     * so the sentinel was a valid "effectively unbounded" max. x86 (cvttss2si)
+     * returns INT_MIN (0x80000000) for the same conversion, and the resulting
+     * overflow-UB macro makes `timer > MSG_TIMER_MAX` evaluate TRUE for normal
+     * small timer values — so the per-frame clamp pins mapMsgTimer to INT_MAX
+     * on its first decrement. A timer-only subtitle (`~J0(n)`, e.g. map0's
+     * "Footsteps?"/"Cheryl...") then never counts down to 0 and the cutscene
+     * freezes (with its looped SFX). Use the intended literal sentinel. */
+    #define MSG_TIMER_MAX   0x7FFFFFFF
+#else
+    #define MSG_TIMER_MAX   (Q12(524288.0f) - 1)
+#endif
+    #define FINISH_CUTSCENE 0xFF
+    #define FINISH_MAP_MSG  0xFF
+
+    s32        temp_s1;
+    bool       hasInput;
+    s32        temp;
+#ifdef SH_PC_PORT
+    Pc_MsgVoice_Touch();
+#endif
+    s32        var_a1;
+    static s32 stateMachineIdx0;
+    static s32 stateMachineIdx1;
+    static s32 msgDisplayLength;
+#ifndef SH_PC_PORT
+    static s32 msgIdx;
+#endif
+    static s32 msgDisplayInc;
+    static s32 D_800BCD74;
+
+    // Check for user input.
+    hasInput = false;
+    if ((g_Controller0->clickedBtnFlags & (g_GameWorkPtr->config.controllerConfig.enter |
+                                          g_GameWorkPtr->config.controllerConfig.cancel)) ||
+        (g_Controller0->heldBtnFlags & g_GameWorkPtr->config.controllerConfig.skip))
+    {
+        hasInput = true;
+    }
+
+    g_SysWork.playerWork.player.properties.player.gasWeaponPowerTimer = Q12(0.0f);
+    func_8004C564(g_SysWork.playerCombat.weaponAttack, WEAPON_ATTACK(EquippedWeaponId_RockDrill, AttackInputType_Tap));
+
+#ifdef SH_PC_PORT
+    /* A setup-Finish for the SAME msg index that was just active (msgIdx still
+     * equals mapMsgIdx while isMgsStringSet re-enters false via a prior
+     * completion) is a spurious PC RE-DISPLAY of a line that already fired its
+     * voice — e.g. map6_s04 func_800E3EF4 shows msg47 at BOTH case7 and case9.
+     * On PSX, CD-load latency keeps the first display from completing before
+     * its paired cutscene timer advances the step, so case9 RESUMES
+     * (isMgsStringSet stays true) and fires no new voice. PC loads instantly,
+     * so the first display completes, isMgsStringSet goes false, and case9
+     * RESTARTS fresh — firing an EXTRA voice that walks the shared voice index
+     * (D_800ED5AC) +1, so every later line plays the next table clip one beat
+     * early (the Flauros "scream" ~7.8s ahead of its on-screen beat, then the
+     * whole scene shifted). Flag this re-setup so Event_DisplayMapMsgWithAudio
+     * suppresses the duplicate voice fire + index bump, matching PSX. */
+    int _reSetupSameMsg = (msgIdx == mapMsgIdx);
+
+    /* MULTI-PAGE variant of the same re-display (map7_s00 Lisa func_800D0B64):
+     * a message CHAIN (msg30->34, only 34 carries ~E) is shown at two
+     * consecutive steps — case7 DisplayMapMsg(30) then case9 DisplayMapMsg(30).
+     * On PSX CD latency keeps case7's chain in progress when the step advances,
+     * so case9 RESUMES it. PC's instant load completes the whole chain at case7,
+     * so case9 RESTARTS it: every page's subtitle re-shows ("It's only a
+     * temporary thing" a second time) and pages 2..N re-fire their voices,
+     * walking the shared audio index PAST the real table so the tail lines
+     * (msg35..37) fall silent ("audio runs out before the subtitles"). The
+     * voice-only suppression above only covers the chain's FIRST page. Make the
+     * spurious restart a full no-op that just advances the step, matching the
+     * PSX resume. g_MapMsg_CurrentIdx still holds the completed chain's LAST
+     * page while msgIdx holds its START, so they differ only for a multi-page
+     * chain — single-page re-displays (map6_s04 Flauros msg47, CurrentIdx==
+     * msgIdx) keep the lighter voice-only path and their proven step timing.
+     * Cutscene-gated so ordinary memo/item re-examination is untouched. */
+    if (_reSetupSameMsg && !g_SysWork.isMgsStringSet && g_MapMsg_CurrentIdx != msgIdx &&
+        ((g_SysWork.sysFlags & SysFlag_CutsceneActive) ||
+         g_SysWork.cutsceneBorderState != CutsceneBorderState_None))
+    {
+        return MapMsgState_SelectEntry0;
+    }
+#endif
+
+    if (msgIdx != mapMsgIdx)
+    {
+        g_SysWork.isMgsStringSet = false;
+    }
+
+    switch (g_SysWork.isMgsStringSet)
+    {
+        case false:
+#ifdef SH_PC_PORT
+            {
+                extern int g_PcMapMsgVoiceDropped;
+                g_PcMapMsgVoiceDropped = 0;
+            }
+#endif
+            g_SysWork.mapMsgTimer            = NO_VALUE;
+            g_MapMsg_Select.maxIdx           = NO_VALUE;
+            g_MapMsg_Select.selectedEntryIdx = 0;
+            g_MapMsg_AudioLoadBlock          = 0;
+            g_MapMsg_CurrentIdx              = mapMsgIdx;
+#ifdef SH_PC_PORT
+            Pc_MapMsgPageReset();
+            Pc_MsgVoice_OnPage(mapMsgIdx);
+#endif
+            stateMachineIdx0                 = 0;
+            stateMachineIdx1                 = 0;
+            msgIdx                           = mapMsgIdx;
+            msgDisplayLength                 = 0;
+            msgDisplayInc                    = 2; // Advance 2 glyphs at a time.
+
+            Gfx_MapMsg_DefaultStringInfoSet();
+            var_a1 = Gfx_MapMsg_CalculateWidths(g_MapMsg_CurrentIdx);
+
+#if VERSION_REGION_IS(NTSCJ)
+            if (var_a1 != 0)
+            {
+                switch (var_a1)
+                {
+                    case 2:
+                    case 3:
+                        func_8004B45C(g_MapMsg_CurrentIdx + 1, var_a1);
+                        break;
+
+                    case 4:
+                        func_8004B45C(0, 2);
+                        break;
+                }
+            }
+#endif
+
+            D_800BCD74 = 1;
+            g_SysWork.isMgsStringSet++;
+#ifdef SH_PC_PORT
+            { extern int g_PcMapMsgReDisplaySetup; g_PcMapMsgReDisplaySetup = _reSetupSameMsg; }
+#endif
+            return MapMsgState_Finish;
+
+        case true:
+            if (g_SysWork.bgmStatusFlags & BgmStatusFlag_VoiceDialog)
+            {
+#ifdef SH_PC_PORT
+                /* This wait was bypassed early in the port ("XA streaming
+                 * not implemented"); xa_player.c has long since maintained
+                 * the streaming flags (Sd_XaAudioPlayTaskAdd sets them,
+                 * Xa_SignalPlaybackFinished clears them). Without the wait,
+                 * dialogue pages advance on the text timer alone and each
+                 * new page's SD_Call preempts the still-playing line —
+                 * overlapping/cut-off voices in the Kaufmann intro et al.
+                 * Restore the vanilla hold, with a wall-clock fail-open in
+                 * case a page has no voice cmd (zero-stub table remnant)
+                 * so a missing line degrades to silence, not a hang. */
+                {
+                    extern int g_PcMapMsgVoiceDropped;
+                    static Uint32 s_voiceWaitStartMs = 0;
+                    u8 xaState = Sd_AudioStreamingCheck();
+
+                    if (xaState == 4)
+                    {
+                        D_800BCD74         = 0;
+                        s_voiceWaitStartMs = 0;
+                        break;
+                    }
+
+                    /* Event_DisplayMapMsgWithAudio dropped this page's voice
+                     * cmd (out-of-range = table overrun turned to silence):
+                     * no voice is coming, render the text NOW instead of
+                     * burning the 1s fail-open below. */
+                    if (D_800BCD74 != 0 && g_PcMapMsgVoiceDropped)
+                    {
+                        D_800BCD74             = 0;
+                        s_voiceWaitStartMs     = 0;
+                        g_PcMapMsgVoiceDropped = 0;
+                    }
+
+                    if (D_800BCD74 != 0)
+                    {
+                        /* Release the subtitle the instant the voice is actually
+                         * streaming (state 1 = xaAudioIdx active) and fall through
+                         * to render, so the text appears IN SYNC with the spoken
+                         * line. The original release watched only for the 'ready'
+                         * state 4; on PC the XA stream jumps loading(2)->playing(1)
+                         * without dwelling on 4, so it always hit the 1s fail-open
+                         * below -> "voice plays, subtitle appears ~1s later". The
+                         * fail-open still covers pages whose voice never starts. */
+                        if (xaState == 1)
+                        {
+                            D_800BCD74         = 0;
+                            s_voiceWaitStartMs = 0;
+                            /* no break: render this frame, synced with the voice */
+                        }
+                        else
+                        {
+                            if (s_voiceWaitStartMs == 0)
+                            {
+                                s_voiceWaitStartMs = SDL_GetTicks();
+                            }
+
+                            if ((SDL_GetTicks() - s_voiceWaitStartMs) < 1000)
+                            {
+                                break;
+                            }
+
+                            D_800BCD74         = 0;
+                            s_voiceWaitStartMs = 0;
+                        }
+                    }
+                }
+#else
+                if (Sd_AudioStreamingCheck() == 4)
+                {
+                    D_800BCD74 = 0;
+                    break;
+                }
+
+                if (D_800BCD74 != 0)
+                {
+                    break;
+                }
+#endif
+            }
+            else
+            {
+                D_800BCD74 = 0;
+            }
+
+            Gfx_StringSetColor(StringColorId_White);
+#if VERSION_REGION_IS(NTSC)
+            Gfx_StringSetPosition(40, 160);
+#endif
+
+#ifdef SH_PC_PORT
+            /* The typewriter advanced msgDisplayInc glyphs PER FRAME, so at
+             * uncapped fps the text completed far faster than the 30fps original.
+             * Each page then reached MapMsgState_Finish early and queued the next
+             * voice line (Event_DisplayMapMsgWithAudio) before the current one
+             * ended, backing up the XA voice pool and pushing subtitles
+             * progressively later in long cutscenes (they ended up appearing only
+             * after their spoken line had finished — worse the longer the scene).
+             * Advance at the fps-independent original rate: msgDisplayInc glyphs
+             * per 30fps frame = msgDisplayInc*30 glyphs/sec, with a fractional
+             * carry. g_DeltaTimeRaw is Q12 seconds-per-frame. */
+            {
+                static q19_12 s_glyphAccum = 0;
+                s32 stepGlyphs;
+                s_glyphAccum    += Q12_MULT(Q12(msgDisplayInc * 30), g_DeltaTimeRaw);
+                stepGlyphs       = s_glyphAccum >> 12;
+                s_glyphAccum    -= stepGlyphs << 12;
+                msgDisplayLength += stepGlyphs;
+            }
+#else
+            msgDisplayLength += msgDisplayInc;
+#endif
+            msgDisplayLength  = CLAMP(msgDisplayLength, 0, MAP_MESSAGE_DISPLAY_ALL_LENGTH);
+
+            if (g_MapMsg_AudioLoadBlock != 0 && g_SysWork.mapMsgTimer > 0)
+            {
+                g_SysWork.mapMsgTimer -= g_DeltaTimeRaw;
+                g_SysWork.mapMsgTimer  = CLAMP(g_SysWork.mapMsgTimer, Q12(0.0f), MSG_TIMER_MAX);
+            }
+
+#ifdef SH_PC_PORT
+            /* Hold the page's AUTO (timer) advance while this line's voice is
+             * still producing audio, so the next page's SD_Call can't cut it
+             * off. PSX serialised voices via long CD load latency; PC loads
+             * instantly, so without this an early text timer overlaps voices
+             * (the bug the voice-wait was meant to fix). Manual skip (input) is
+             * NOT gated.
+             *
+             * Gate on Xa_IsVoiceAudioDraining() (real audio still playing), NOT
+             * Sd_AudioStreamingCheck()==1: the latter stays 1 through the ~490ms
+             * end-of-voice pad (xa_player.c s_xaPadEndMs), which PSX has no
+             * equivalent to in this path — PSX advanced pages on the authored
+             * ~J page timer alone. Gating page-advance on the padded flag added
+             * a redundant ~0.5s per line that accumulated across a voiced
+             * cutscene (the map6_s04 Flauros/Damn! desync: dialogue + subtitles
+             * fell seconds behind the wall-clock animation). Real-drain gating
+             * restores the authored pacing while still preventing PC's instant
+             * next-line SD_Call from cutting a live voice. */
+            /* Also hold through the post-voice inter-line gap
+             * (cutscene_line_gap_ms) so tightly-timed lines get the PSX CD-seek
+             * pause instead of the next voice firing back-to-back. It's a
+             * MINIMUM: mapMsgTimer==0 is still required, so a line whose authored
+             * ~J timer already exceeds the gap is unaffected (Flauros-safe). */
+            extern int Xa_IsVoiceAudioDraining(void);
+            extern int Xa_VoiceGapHold(void);
+            /* J2 single-audio-file cutscenes (VHS tape: map3_s03 msgs 27-39,
+             * map7_s02 msgs 32-44): ONE ~35s XA clip spans ALL pages, which are
+             * authored to advance on their ~J timers WHILE it plays (PSX has no
+             * voice gate on this path, and J2 advances fire no SD_Call - the
+             * J2 early-return below). pcVoiceHold pinned the blank ~J0 lead
+             * page for the whole tape, so subtitles only began AFTER the
+             * audio. Exempt: (a) a page whose own tag parsed to J2; (b) a
+             * chaining page (no ~E, so the engine itself will index idx+1
+             * next) whose NEXT page is ~J2 - the lead-in that fired the clip.
+             * Per-page-voice scenes (Flauros/Lisa/Kaufmann) satisfy neither.
+             * Only computed while a ~J page is active (ALB != 0): the gates
+             * below ignore pcVoiceHold otherwise, and selection pages without
+             * ~E (e.g. map1_s06 Take_it?) never auto-chain, so peeking idx+1
+             * for them would be an out-of-bounds read. */
+            int pcSingleFileAudio = (g_MapMsg_AudioLoadBlock == MapMsgAudioLoadBlock_J2);
+            if (!pcSingleFileAudio && g_MapMsg_AudioLoadBlock != MapMsgAudioLoadBlock_None)
+            {
+                const u8* p      = (const u8*)g_MapOverlayHdr.mapMessages[g_MapMsg_CurrentIdx];
+                int       hasEnd = 0;
+
+                for (; *p != '\0'; p++)
+                {
+                    if (p[0] == MAP_MSG_CODE_MARKER && p[1] == MAP_MSG_CODE_END)
+                    {
+                        hasEnd = 1;
+                        break;
+                    }
+                }
+
+                if (!hasEnd)
+                {
+                    const u8* n = (const u8*)g_MapOverlayHdr.mapMessages[g_MapMsg_CurrentIdx + 1];
+
+                    for (; *n != '\0'; n++)
+                    {
+                        if (*n == ' ' || *n == '\t')
+                        {
+                            continue;
+                        }
+
+                        pcSingleFileAudio = (n[0] == MAP_MSG_CODE_MARKER &&
+                                             n[1] == MAP_MSG_CODE_JUMP && n[2] == '2');
+                        break;
+                    }
+                }
+            }
+            const int pcVoiceHold =
+                !pcSingleFileAudio &&
+                (g_SysWork.bgmStatusFlags & BgmStatusFlag_VoiceDialog) &&
+                (Xa_IsVoiceAudioDraining() || Xa_VoiceGapHold());
+#endif
+            temp_s1 = stateMachineIdx0;
+            if (temp_s1 == NO_VALUE)
+            {
+                if (g_MapMsg_AudioLoadBlock == 0)
+                {
+                    Game_TimerUpdate();
+                }
+
+                temp = stateMachineIdx1;
+                if (temp == temp_s1)
+                {
+                    if (g_MapMsg_Select.maxIdx == temp)
+                    {
+                        if (!((g_MapMsg_AudioLoadBlock & (1 << 0)) || !hasInput) ||
+                            (g_MapMsg_AudioLoadBlock != 0 && g_SysWork.mapMsgTimer == 0
+#ifdef SH_PC_PORT
+                             && !pcVoiceHold
+#endif
+                            ))
+                        {
+                            stateMachineIdx1 = FINISH_MAP_MSG;
+
+                            if (g_SysWork.bgmStatusFlags & BgmStatusFlag_VoiceDialog)
+                            {
+                                SD_Call(19);
+                            }
+                            break;
+                        }
+                    }
+                    else if (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.cancel)
+                    {
+                        g_MapMsg_Select.maxIdx           = temp;
+                        g_MapMsg_Select.selectedEntryIdx = g_MapMsg_SelectCancelIdx;
+
+                        Sd_PlaySfx(Sfx_MenuCancel, 0, Q8(0.25f));
+
+                        if (g_SysWork.silentYesSelection)
+                        {
+                            g_SysWork.silentYesSelection = false;
+                        }
+
+                        stateMachineIdx1 = FINISH_MAP_MSG;
+                        break;
+                    }
+                    else if (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.enter)
+                    {
+                        g_MapMsg_Select.maxIdx = temp;
+
+                        if (g_MapMsg_Select.selectedEntryIdx == (s8)g_MapMsg_SelectCancelIdx)
+                        {
+                            Sd_PlaySfx(Sfx_MenuCancel, 0, Q8(0.25f));
+                        }
+                        else if (!g_SysWork.silentYesSelection)
+                        {
+                            Sd_PlaySfx(Sfx_MenuConfirm, 0, Q8(0.25f));
+                        }
+
+                        if (g_SysWork.silentYesSelection)
+                        {
+                            g_SysWork.silentYesSelection = false;
+                        }
+
+                        stateMachineIdx1 = FINISH_MAP_MSG;
+                        break;
+                    }
+                }
+                else if ((!(g_MapMsg_AudioLoadBlock & (1 << 0)) && hasInput && g_MapMsg_Select.maxIdx != 0) ||
+                         (g_MapMsg_AudioLoadBlock != 0 && g_SysWork.mapMsgTimer == 0
+#ifdef SH_PC_PORT
+                          && !pcVoiceHold
+#endif
+                         ))
+                {
+                    if (g_MapMsg_Select.maxIdx != NO_VALUE)
+                    {
+                        g_MapMsg_Select.maxIdx  = NO_VALUE;
+                        stateMachineIdx1 = FINISH_MAP_MSG;
+                        break;
+                    }
+
+#ifdef SH_PC_PORT
+                    /* A localized message can need more lines than one page
+                     * holds (PAL documents; GitHub #85). The renderer breaks it
+                     * into pages and reports the same "more follows" code a
+                     * message ending at a bare NUL uses, so turn the page WITHIN
+                     * this message instead of stepping to the next index —
+                     * everything below (timer, width recalc, rollout reset) then
+                     * runs for the continuation exactly as for a real page. */
+                    if (Pc_MapMsgPagePending())
+                    {
+                        Pc_MapMsgPageAdvance();
+                    }
+                    else
+                    {
+                        g_MapMsg_CurrentIdx++;
+                        Pc_MsgVoice_OnPage(g_MapMsg_CurrentIdx);
+                    }
+#else
+                    g_MapMsg_CurrentIdx++;
+#endif
+                    g_SysWork.mapMsgTimer = g_MapMsg_Select.maxIdx;
+
+                    var_a1 = Gfx_MapMsg_CalculateWidths(g_MapMsg_CurrentIdx);
+
+#if VERSION_REGION_IS(NTSCJ)
+                    if (var_a1 != 0)
+                    {
+                        switch (var_a1)
+                        {
+                            case 2:
+                            case 3:
+                                func_8004B45C(g_MapMsg_CurrentIdx + 1, var_a1);
+                                break;
+
+                            case 4:
+                                func_8004B45C(0, 2);
+                                break;
+                        }
+                    }
+#endif
+
+                    msgDisplayLength = 0;
+                    stateMachineIdx0 = 0;
+
+                    if (g_MapMsg_AudioLoadBlock == MapMsgAudioLoadBlock_J2)
+                    {
+                        D_800BCD74 = 0;
+                        return MapMsgState_Idle;
+                    }
+
+                    if (g_SysWork.bgmStatusFlags & BgmStatusFlag_VoiceDialog)
+                    {
+                        SD_Call(19);
+                    }
+
+                    D_800BCD74 = 1;
+#ifdef SH_PC_PORT
+                    /* Page-advance Finish (a genuine next page of a multi-page
+                     * message) — NEVER a spurious re-display, so its voice must
+                     * always fire; clear the re-setup suppression flag. */
+                    { extern int g_PcMapMsgReDisplaySetup; g_PcMapMsgReDisplaySetup = 0; }
+#endif
+                    return MapMsgState_Finish;
+                }
+            }
+            else
+            {
+                if (hasInput)
+                {
+                    msgDisplayLength = MAP_MESSAGE_DISPLAY_ALL_LENGTH;
+                }
+            }
+
+            stateMachineIdx0 = 0;
+            stateMachineIdx1 = Gfx_MapMsg_SelectionUpdate(g_MapMsg_CurrentIdx, &msgDisplayLength);
+
+            if (stateMachineIdx1 != 0 && stateMachineIdx1 < MapMsgCode_Select4)
+            {
+                stateMachineIdx0 = NO_VALUE;
+            }
+    }
+
+    if (stateMachineIdx1 != FINISH_MAP_MSG)
+    {
+        return MapMsgState_Idle;
+    }
+
+#ifdef SH_PC_PORT
+    Pc_MsgVoice_OnEnd();
+#endif
+    g_SysWork.isMgsStringSet            = false;
+    g_SysWork.enableHighResGlyphs = false;
+    msgDisplayLength               = 0;
+
+    if (g_SysWork.bgmStatusFlags & BgmStatusFlag_VoiceDialog)
+    {
+        D_800BCD74 = 1;
+    }
+
+    return g_MapMsg_Select.selectedEntryIdx + 1;
+
+    #undef MSG_TIMER_MAX
+    #undef FINISH_CUTSCENE
+    #undef FINISH_MAP_MSG
+}
+
+s32 Gfx_MapMsg_SelectionUpdate(u8 mapMsgIdx, s32* arg1) // 0x80036B5C
+{
+    #define STRING_LINE_OFFSET 16
+
+    s32 i;
+    s32 mapMsgCode;
+
+    mapMsgCode = Gfx_MapMsg_StringDraw(g_MapOverlayHdr.mapMessages[mapMsgIdx], *arg1);
+
+    g_MapMsg_SelectFlashTimer += g_DeltaTimeRaw;
+    if (g_MapMsg_SelectFlashTimer >= Q12(0.5f))
+    {
+        g_MapMsg_SelectFlashTimer -= Q12(0.5f);
+    }
+
+    switch (mapMsgCode)
+    {
+        case NO_VALUE:
+        case MapMsgCode_None:
+            g_MapMsg_SelectFlashTimer = Q12(0.0f);
+            break;
+
+        case MapMsgCode_Select2:
+        case MapMsgCode_Select3:
+        case MapMsgCode_Select4:
+            g_MapMsg_Select.maxIdx  = 1;
+            g_MapMsg_SelectCancelIdx = (mapMsgCode == 3) ? 2 : 1;
+
+            if (mapMsgCode == MapMsgCode_Select4)
+            {
+                // Shows selection prompt with map messages at indices 0 and 1.
+                // All maps have "Yes" and "No" as messages 0 and 1, respectively.
+                for (i = 0; i < 2; i++)
+                {
+                    if (g_MapMsg_Select.selectedEntryIdx == i)
+                    {
+                        Gfx_StringSetColor(((g_MapMsg_SelectFlashTimer >> 10) * 3) + 4);
+                    }
+                    else
+                    {
+                        Gfx_StringSetColor(StringColorId_White);
+                    }
+
+#if VERSION_REGION_IS(NTSC)
+                    Gfx_StringSetPosition(32, (STRING_LINE_OFFSET * i) + 98);
+                    Gfx_StringDraw(g_MapOverlayHdr.mapMessages[i], MAP_MESSAGE_DISPLAY_ALL_LENGTH);
+#else
+                    Gfx_StringDraw_JP(g_MapOverlayHdr.mapMessages[i], i);
+#endif
+                }
+
+                mapMsgCode = 2;
+            }
+            else
+            {
+                // Shows selection prompt with 2 or 3 map messages from current index + 1/2/3.
+                // Requires prompt options to be arranged sequentially in the map message array, e.g.
+                // `[idx]`:     "Select one of 3 options. ~S3"
+                // `[idx + 1]`: "Option 1"
+                // `[idx + 2]`: "Option 2"
+                // `[idx + 3]`: "Option 3"
+                for (i = 0; i < mapMsgCode; i++)
+                {
+                    if (g_MapMsg_Select.selectedEntryIdx == i)
+                    {
+                        Gfx_StringSetColor(((g_MapMsg_SelectFlashTimer >> 10) * 3) + 4);
+                    }
+                    else
+                    {
+                        Gfx_StringSetColor(StringColorId_White);
+                    }
+
+#if VERSION_REGION_IS(NTSC)
+                    Gfx_StringSetPosition(32, (STRING_LINE_OFFSET * i) + 96);
+                    Gfx_StringDraw(g_MapOverlayHdr.mapMessages[(mapMsgIdx + i) + 1], MAP_MESSAGE_DISPLAY_ALL_LENGTH);
+#else
+                    Gfx_StringDraw_JP(g_MapOverlayHdr.mapMessages[(mapMsgIdx + i) + 1], i);
+#endif
+                }
+            }
+
+            if (g_Controller0->clickedBtnFlags & ControllerFlag_LStickUp &&
+                g_MapMsg_Select.selectedEntryIdx != 0)
+            {
+                g_MapMsg_SelectFlashTimer = Q12(0.0f);
+                g_MapMsg_Select.selectedEntryIdx--;
+
+                Sd_PlaySfx(Sfx_MenuMove, 0, Q8(0.25f));
+            }
+
+            if (g_Controller0->clickedBtnFlags & ControllerFlag_LStickDown &&
+                g_MapMsg_Select.selectedEntryIdx != (mapMsgCode - 1))
+            {
+                g_MapMsg_SelectFlashTimer = Q12(0.0f);
+                g_MapMsg_Select.selectedEntryIdx++;
+
+                Sd_PlaySfx(Sfx_MenuMove, 0, Q8(0.25f));
+            }
+
+            mapMsgCode = NO_VALUE;
+            break;
+
+        case MapMsgCode_DisplayAll:
+            *arg1 = MAP_MESSAGE_DISPLAY_ALL_LENGTH;
+            break;
+    }
+
+    return mapMsgCode;
+
+    #undef STRING_LINE_OFFSET
+}

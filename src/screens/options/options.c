@@ -1,0 +1,5213 @@
+#include "game.h"
+
+#include <memory.h>
+#include <psyq/libetc.h>
+
+#include "bodyprog/bodyprog.h"
+#include "bodyprog/events/radio.h"
+#include "bodyprog/gfx/map_effects.h"
+#include "bodyprog/item_screens.h"
+#include "bodyprog/math/math.h"
+#include "bodyprog/screen/screen_data.h"
+#include "bodyprog/screen/screen_draw.h"
+#include "bodyprog/sound/sound_system.h"
+#include "bodyprog/text/text_debug_draw.h"
+#include "bodyprog/text/text_draw.h"
+#include "screens/options.h"
+#include "screens/stream/stream.h"
+#ifdef SH_PC_PORT
+#include <ctype.h>
+#include "pc_config.h"
+#include "pc_audio_config.h" /* the software-SPU row */
+#endif
+
+#define LINE_CURSOR_TIMER_MAX 8
+#ifdef SH_PC_PORT
+#include <stdio.h>
+#include <stdlib.h> /* getenv: SH_DATA_LABEL */
+#include <string.h>
+#include "sh_log.h"
+
+#if defined(SH_IOS) || defined(__ANDROID__)
+/* Both mobile targets draw the Achievements row, so both need the prototypes.
+ * Guarded to iOS alone, Android built every Pc_Ra_* call as an implicit int:
+ * the int-returning ones survived it, and Pc_Ra_LoginResult's pointer came
+ * back truncated to 32 bits and crashed the first time anything dereferenced
+ * it. */
+#include "pc_retroachievements.h"
+#endif
+#if defined(SH_IOS)
+/* ios_port/src/ios_ra_login.m. Declared here rather than in a header because
+ * ios_port owns no include directory and the other Ios_ entry points are
+ * declared the same way at their call sites. */
+extern int Ios_ShowRetroAchievementsLogin(void);
+#endif
+#include "pc_config.h"
+#include "pc_mouse_cursor.h"
+#include "map_registry.h"
+#include "lang_text.h" /* PAL Language row (title-screen options) */
+#include "lang_pack.h" /* PC-side pack language label (Polish) */
+#define LAYER_24   PSX_OT_OFS(24)
+#define LAYER_40   PSX_OT_OFS(40)
+#define LAYER_36   PSX_OT_OFS(36)
+#define LAYER_8148 PSX_OT_OFS(8148)
+#else
+#define LAYER_24   24
+#define LAYER_40   40
+#define LAYER_36   36
+#define LAYER_8148 8148
+#endif
+
+s32  g_MainOptionsMenu_SelectedEntry      = 0;
+s32  g_ExtraOptionsMenu_SelectedEntry     = 0;
+s32  g_MainOptionsMenu_PrevSelectedEntry  = 0;
+s32  g_ExtraOptionsMenu_PrevSelectedEntry = 0;
+bool g_ScreenPosMenu_InvertBackgroundFade = false;
+bool g_ControllerMenu_IsOnActionsPane     = false;
+
+/** @brief Tracks movement time of the cursor highlight. */
+static s32 g_Options_SelectionHighlightTimer;
+
+/** @brief Number of options to show in the extra options screen. Shows extra unlockable settings if they are unlocked. */
+static s32 g_ExtraOptionsMenu_EntryCount;
+
+static s32 g_ExtraOptionsMenu_SelectedBloodColorEntry;
+
+static s32 g_ExtraOptionsMenu_BulletMultMax;
+
+// ========================================
+// MAIN AND EXTRA OPTION SCREEN
+// ========================================
+
+#ifdef SH_PC_PORT
+/* ============================================================================
+ *  PC OPTIONS MENU  (repurposes the "Screen Position" main-menu entry)
+ *
+ *  Two pages mirroring the launcher. Each setting row cycles its config value
+ *  with Left/Right, writes the config key and echoes to the console; realtime
+ *  rows also push their live render global so the change is immediate, while
+ *  restart-only rows print a "takes effect next launch" notice. Action rows
+ *  (Next/Prev page, Back) activate with Confirm; Cancel always backs out to the
+ *  main options menu (like every other submenu). Modeled on Extra Options. */
+
+/* Live render globals mirrored for realtime settings (defined in PsyCross /
+ * main_pc.c — the same ones main_pc.c seeds from g_PcConfig at boot). */
+extern int g_cfg_psxDither;
+extern int g_cfg_textureFilter;
+extern int g_cfg_bilinearFiltering;
+extern int g_cfg_anisoLevel;
+extern int g_PsxUsePgxp;
+extern int g_cfg_postProcess;
+extern int g_cfg_dreamFeedback;
+extern float g_PsxFeedbackDampBlend;
+extern int g_cfg_tonemap;
+extern int g_PsyX_UsePerPixelFlashlight;
+extern int g_PsyX_UseFlashlightShadows;
+
+/* PsyCross live-apply helpers for the window-level settings (resolution, window
+ * mode, vsync) so they take effect immediately instead of next launch. */
+extern void PsyX_ApplyWindowState(int width, int height, int fullscreen);
+extern void PsyX_ApplyVsync(int vsync);
+
+/* Per-pixel flashlight beam live floats (PsyCross); mirrored by the sliders. */
+extern float g_PsyX_FlashlightIntensity;
+extern float g_PsyX_FogStrength;
+extern float g_PsyX_FlashlightSize;
+
+/* FMV movie (SDL PCM) live volume, 0..1; mirrored by the FMV Movie slider.
+ * The Sound menu's Voice slider drives g_PcXaVolume separately. */
+extern float g_PcFmvVolume;
+
+/* The volume-bar labels are far longer once translated ("Głośność Efektów",
+ * "Musiklautstärke") than the English "BGM Volume" the retail x=184 bar origin
+ * was placed for, so the label ran into the bar. Nudge the bars, their notch
+ * hit-test, and their selection arrows right by this many (authored, pre-160)
+ * pixels in every language — the widescreen 2D layer has ample room on the
+ * right, and English still sits comfortably clear. */
+#define OPT_VOLUME_BAR_DX 28
+
+s32 g_PcOptionsMenu_SelectedEntry     = 0;
+s32 g_PcOptionsMenu_PrevSelectedEntry = 0;
+static s32 g_PcOptionsMenu_Page       = 0; /* 0 = Graphics, 1 = System, 2 = Controls, 3 = Camera, 4 = HUD */
+#if defined(SH_IOS) || defined(__ANDROID__)
+/* A sixth page on a phone. Every page there is at its 11-row ceiling (a
+ * twelfth row runs Back off the screen), so a new Controls row needed a page
+ * to push the overflow onto. PCOPT_M, after HUD. */
+#define PCOPT_PAGE_COUNT 6
+#else
+#define PCOPT_PAGE_COUNT 5
+#endif
+
+/* Mouse hover moves the selection WITHOUT resetting g_Options_SelectionHighlightTimer:
+ * a reset re-arms the LINE_CURSOR_TIMER_MAX gate, which then swallows the click that
+ * follows the hover a fraction of a second later. But the underline's endpoints are
+ * statics inside the highlight draws, recomputed ONLY when that timer is 0 — so the
+ * bullet followed the mouse while the underline stayed where the keyboard left it.
+ *
+ * This asks the next highlight draw to recompute its endpoints once. Prev == Selected
+ * at that point, so from == to and the underline snaps to the row instead of sliding —
+ * which is the right behaviour for a pointer that is already there. */
+s32 g_PcOptions_HighlightSnap = 0;
+
+/* In-game, the Auto Load row becomes Exit to Menu.
+ *
+ * Auto Load only means anything from the title screen (it decides whether
+ * booting jumps straight into the last save), and a player who has paused
+ * mid-game had no way back to the title short of killing the process --
+ * particularly on a touchscreen or a cabinet with no keyboard. The row is
+ * retitled rather than added because a page fits a fixed number of lines, and
+ * this is the one row that is dead weight in-game. Same trick PAL already uses
+ * to show Language here on the title screen. */
+int Pc_ExitToMenuRowActive(void)
+{
+    return g_GameWork.gameState == GameState_InGame;
+}
+
+
+enum { PCK_INT, PCK_RES, PCK_FILTER, PCK_WINMODE, PCK_VSYNC, PCK_SLIDER, PCK_MAP, PCK_FLMODE, PCK_NEXT, PCK_PREV, PCK_BACK, PCK_RESET, PCK_STORAGE, PCK_RALOGIN };
+
+/* PC-options row origin. The heading sits at y=20 and the rows used to start at 56,
+ * leaving a full empty row beneath it while the pages ran off the BOTTOM of the
+ * 240-line screen. Starting at 40 reclaims that row for every page. Everything that
+ * is positioned per-row moves with it: the two string draws, the mouse hit-test in
+ * Options_PcOptionsMenu_Control, and — in the centred quad space the highlight and
+ * bullets are authored in — HIGHLIGHT_OFFSET_Y and the bullet quad Y's. */
+#define PCOPT_LINE_BASE_Y 40
+
+typedef struct {
+    const char*        name;     /* row label (underscores render as spaces) */
+    int*               field;    /* &g_PcConfig.X (NULL for resolution + actions) */
+    const char*        key;      /* config.cfg key (NULL for actions) */
+    const int*         vals;     /* allowed values, in cycle order */
+    int                nVals;
+    const char* const* labels;   /* value labels parallel to vals (NULL = numeric) */
+    int*               live;     /* single live global to mirror (NULL = none) */
+    int                realtime; /* 1 = applies now, 0 = needs restart */
+    int                kind;     /* PCK_* */
+    float*             ffield;   /* PCK_SLIDER: config float this row adjusts */
+    float*             flive;    /* PCK_SLIDER: live global to mirror (NULL = none) */
+    float              fmin;     /* PCK_SLIDER value range + step */
+    float              fmax;
+    float              fstep;
+} s_PcOpt;
+
+static const int VAL_WIN[]   = { 0, 1, 2 };
+static const int VAL_VSYNC[] = { 0, 1 };
+static const int VAL_FILT[]  = { 0, 1, 2, 3, 4, 5, 6, 7 };
+static const int VAL_ONOFF[] = { 0, 1 };
+static const int VAL_AA[]    = { 0, 2, 4, 8 };
+static const int VAL_POST[]  = { 0, 1, 2, 3, 4, 5, 6, 7, 8 };
+static const int VAL_TONE[]  = { 0, 1, 2, 3 };
+static const int VAL_CON[]   = { 0, 1, 2, 3 };
+static const int VAL_FPS[]   = { 0, 30, 60, 120, 240 };
+static const int VAL_FLMODE[] = { 0, 1, 2, 3 };
+static const int VAL_MMCNR[]  = { 0, 1, 2, 3 };
+static const int VAL_MMMODE[] = { 0, 1, 2 };
+/* Cycle order, not numeric order: the values are e_TouchControlsMode and have to
+ * keep the meanings an existing config.cfg already wrote, while Automatic is
+ * what the row should open on. */
+static const int VAL_TOUCH[]  = { TouchControls_Auto, TouchControls_On, TouchControls_Off };
+/* Weather simulation rate. 60 = one step per rendered frame (default), 30 = the
+ * console cadence the particle code was authored at. */
+static const int VAL_WHZ[]    = { 30, 60 };
+
+static const char* const LBL_WIN[]   = { "Windowed", "Fullscreen", "Borderless" };
+static const char* const LBL_VSYNC[] = { "Off", "On" };
+static const char* const LBL_FILT[]  = { "Off", "Dither", "Bilinear", "Trilinear",
+                                         "Aniso_2x", "Aniso_4x", "Aniso_8x", "Aniso_16x" };
+static const char* const LBL_ONOFF[] = { "Off", "On" };
+static const char* const LBL_AA[]    = { "Off", "2x", "4x", "8x" };
+static const char* const LBL_POST[]  = { "Off", "CRT", "Scanlines", "Vignette", "Color_Grade", "Film_Grain", "Sharpen", "PSX_Retro", "Cinematic" };
+static const char* const LBL_TONE[]  = { "Off", "Reinhard", "ACES", "Filmic" };
+static const char* const LBL_CON[]   = { "Off", "External", "In_Game", "Both" };
+static const char* const LBL_FPS[]   = { "Off", "30", "60", "120", "240" };
+/* Short enough to fit the value column at every language/width ("Modern_Shadows" clipped). */
+static const char* const LBL_FLMODE[] = { "Classic", "C_+_Shadows", "Modern", "M_+_Shadows" };
+/* Abbreviated for the same reason as LBL_FLMODE: "Bottom_Right" ran off the
+ * right edge of the value column. */
+static const char* const LBL_MMCNR[]  = { "Top_L", "Top_R", "Bottom_L", "Bottom_R" };
+static const char* const LBL_MMMODE[] = { "Off", "Square", "Circle" };
+static const char* const LBL_TOUCH[]  = { "Automatic", "Always_On", "Always_Off" };
+static const int VAL_ORIENT[]  = { 0, 1, 2 };
+static const char* const LBL_ORIENT[] = { "Landscape", "Auto", "Portrait" };
+static const int VAL_TSTYLE[] = { 0, 1 };
+static const char* const LBL_TSTYLE[] = { "Context", "Gamepad" };
+static const char* const LBL_WHZ[]    = { "30_Hz", "60_Hz" };
+
+static const int RES_W[] = { 640, 1280, 1366, 1600, 1920, 2560, 3840 };
+static const int RES_H[] = { 480,  720,  768,  900, 1080, 1440, 2160 };
+#define PC_RES_COUNT ((int)(sizeof(RES_W) / sizeof(RES_W[0])))
+
+static const s_PcOpt PCOPT_G[] = {
+    /* Neither row means anything on a phone, and Resolution actively breaks it:
+     * the drawable is the panel's, published back into the config at startup
+     * (see GR_InitialiseGLContext), so picking a number here only desynchronises
+     * the viewport and cull bounds from the screen until the next launch.
+     * Window_Mode is moot too — the window is always fullscreen. */
+#if !defined(__ANDROID__) && !defined(SH_IOS)
+    { "Resolution",     NULL,                           NULL,                   NULL,      0, NULL,      NULL,                          0, PCK_RES    },
+    { "Window_Mode",    &g_PcConfig.fullscreen,         "fullscreen",           VAL_WIN,   3, LBL_WIN,   NULL,                          1, PCK_WINMODE },
+#endif
+    { "VSync",          &g_PcConfig.vsync,              "vsync",                VAL_VSYNC, 2, LBL_VSYNC, NULL,                          1, PCK_VSYNC   },
+    { "Texture_Filter", &g_PcConfig.psxDither,          "psx_dither",           VAL_FILT,  8, LBL_FILT,  NULL,                          1, PCK_FILTER },
+    { "PGXP",           &g_PcConfig.usePgxp,            "use_pgxp",             VAL_ONOFF, 2, LBL_ONOFF, &g_PsxUsePgxp,                 1, PCK_INT    },
+    { "Antialiasing",   &g_PcConfig.msaaSamples,        "msaa",                 VAL_AA,    4, LBL_AA,    NULL,                          0, PCK_INT    },
+    { "Post_Process",   &g_PcConfig.postProcess,        "post_process",         VAL_POST,  9, LBL_POST,  &g_cfg_postProcess,            1, PCK_INT    },
+    { "Tone_Mapping",   &g_PcConfig.tonemap,            "tonemap",              VAL_TONE,  4, LBL_TONE,  &g_cfg_tonemap,                1, PCK_INT    },
+    /* New-Game start map. Moved here from the Camera page, which had run to 12
+     * rows (the practical maximum) while this page had room to spare. */
+    { "Map",            NULL,                           "map",                  NULL,      0, NULL,      NULL,                          1, PCK_MAP    },
+#if defined(__ANDROID__)
+    /* Where the disc image, gamedata/, config.cfg, the memory cards and the log
+     * live. The default is an SD card where one is present, because the players
+     * who asked for this wanted a volume they could take out and read
+     * elsewhere. The row cannot move the data itself -- the disc alone is most
+     * of a gigabyte, and the location is fixed before the engine starts -- so it
+     * asks SetupActivity to put the chooser back up on the next launch. */
+    { "Game_Data",      NULL,                           NULL,                   NULL,      0, NULL,      NULL,                          0, PCK_STORAGE },
+#endif
+#if defined(SH_IOS) || defined(__ANDROID__)
+    /* The one switch behind every gamedata/load/ channel: replacement textures,
+     * models, ILM/IPD, glTF meshes, SFX banks, XA voice lines and text
+     * overrides. Launcher-only on desktop, but a phone has no launcher, and
+     * editing config.cfg by hand through Files.app is the only alternative.
+     * On by default here for the same reason; this row is for turning it off.
+     *
+     * Not realtime: the lookups run when an asset is loaded, so the room already
+     * in memory keeps what it has. Takes hold on the next load either way. */
+    { "Load_Mods",      &g_PcConfig.allowLooseFiles,    "allow_loose_files",    VAL_ONOFF, 2, LBL_ONOFF, NULL,                          0, PCK_INT    },
+#endif
+#if defined(SH_IOS)
+    /* Lives on this page rather than System purely for room: System is already
+     * at the 11-row ceiling, and this page has two spare rows on a phone now
+     * that Resolution and Window_Mode are gone. Restores the config.cfg the app
+     * shipped with, straight out of the signed bundle -- there is no full config
+     * writer to rebuild one from the defaults in memory, and a phone has no text
+     * editor pointed at Documents. */
+    { "Reset_Settings", NULL,                           NULL,                   NULL,      0, NULL,      NULL,                          0, PCK_RESET  },
+#endif
+    /* Always second to last, after every platform's own rows. It used to sit
+     * above the mobile-only rows, so on a phone Bullet_Decals, Load_Mods and
+     * Reset_Settings were listed under Next_Page; on desktop those are compiled
+     * out and the order is unchanged. */
+    { "Next_Page",      NULL,                           NULL,                   NULL,      0, NULL,      NULL,                          0, PCK_NEXT   },
+    { "Back",           NULL,                           NULL,                   NULL,      0, NULL,      NULL,                          0, PCK_BACK   },
+};
+
+static const s_PcOpt PCOPT_S[] = {
+    /* One row for the whole flashlight look: Classic (PSX per-vertex),
+     * Classic_Shadows (per-pixel, PSX-calibrated + shadows), Modern (stylized
+     * per-pixel spotlight), Modern_Shadows. PCK_FLMODE routes the change
+     * through Pc_FlashlightModeApply, which derives the per-pixel/style/shadow
+     * globals and the per-style beam defaults. */
+    { "Flashlight",       &g_PcConfig.flashlightMode,     "flashlight_mode",      VAL_FLMODE, 4, LBL_FLMODE, NULL,                        1, PCK_FLMODE },
+    { "Beam_Intensity",   NULL, "flashlight_intensity", NULL, 0, NULL, NULL, 1, PCK_SLIDER, &g_PcConfig.flashlightIntensity, &g_PsyX_FlashlightIntensity, 0.0f, 3.0f, 0.1f },
+    { "Beam_Size",        NULL, "flashlight_size",      NULL, 0, NULL, NULL, 1, PCK_SLIDER, &g_PcConfig.flashlightSize,      &g_PsyX_FlashlightSize,      0.0f, 3.0f, 0.1f },
+    /* 1.1 is the PSX-matched density. Lowering it reveals the extra reach that
+     * draw_distance_pct buys, rather than just thinning the haze -- the two are
+     * meant to be moved together, since either alone disappoints. */
+    { "Fog_Strength",     NULL, "fog_strength",         NULL, 0, NULL, NULL, 1, PCK_SLIDER, &g_PcConfig.fogStrength,         &g_PsyX_FogStrength,         0.0f, 2.0f, 0.05f },
+    /* Preload_Chunks moved out: it needs a map reload to take effect and the
+     * launcher already exposes it. Disable_Culling takes the slot back -- it
+     * applies live, and it pairs with Fog_Strength above for seeing further. */
+    { "Disable_Culling",  &g_PcConfig.disableCulling, "disable_culling",  VAL_ONOFF, 2, LBL_ONOFF, NULL, 1, PCK_INT  },
+    { "FPS_Limit",        &g_PcConfig.fpsCap,         "fps_cap",          VAL_FPS,   5, LBL_FPS,   NULL, 1, PCK_INT  },
+    { "FMV_Movie_Vol",    NULL, "fmv_volume",           NULL, 0, NULL, NULL, 1, PCK_SLIDER, &g_PcConfig.fmvVolume,           &g_PcFmvVolume,             0.0f, 1.0f, 0.05f },
+    /* Rain and snow step once per rendered frame at 60, or on the original
+     * 30 Hz console cadence -- the same knob as the WEATHERHZ console command.
+     * Sits with FPS_Limit because it is the same kind of decision. The two
+     * Crosshair rows moved to the HUD page to make room, which is where the
+     * quick-options overlay already groups them. */
+    { "Weather_Rate",     &g_PcConfig.weatherSimHz,   "weather_sim_hz",   VAL_WHZ,   2, LBL_WHZ,   NULL, 1, PCK_INT  },
+    { "Prev_Page",        NULL,                       NULL,               NULL,      0, NULL,      NULL, 0, PCK_PREV },
+    { "Next_Page",        NULL,                       NULL,               NULL,      0, NULL,      NULL, 0, PCK_NEXT },
+    { "Back",             NULL,                       NULL,               NULL,      0, NULL,      NULL, 0, PCK_BACK },
+};
+
+/* Page 3 (Controls): the 2D screen-relative control toggles + look sensitivities
+ * and the invert toggles. (The New-Game start Map row now lives on page 4.) */
+static const s_PcOpt PCOPT_C[] = {
+    { "2D_Controls",       &g_PcConfig.control2d,        "control_2d",             VAL_ONOFF, 2, LBL_ONOFF, NULL, 1, PCK_INT },
+    /* control_2d_snap is config-only now — the default turn-into-the-direction 2D
+     * control is what players expect, so the in-game toggle was dropped. The key
+     * still loads from config.cfg (pc_config.c) for anyone who wants instant snap. */
+    /* 11 rows is this page's hard ceiling (see Bullet_Decals below), and the
+     * touch rows would take it to 13. The two mouse rows are what give way on a
+     * phone, because there is no mouse there to invert or set a speed for.
+     * Both keys still load from config.cfg for anyone pairing one over USB-C. */
+#if !defined(__ANDROID__) && !defined(SH_IOS)
+    { "Mouse_Sensitivity", NULL, "mouse_sensitivity",      NULL, 0, NULL, NULL, 1, PCK_SLIDER, &g_PcConfig.mouseSensitivity,      NULL, 0.1f, 4.0f, 0.1f },
+#endif
+    { "Pad_Sensitivity",   NULL, "controller_sensitivity", NULL, 0, NULL, NULL, 1, PCK_SLIDER, &g_PcConfig.controllerSensitivity, NULL, 0.1f, 4.0f, 0.1f },
+    /* The three per-camera FOVs moved to the Camera page (grouped with the aim/
+     * camera options) once OTS got its own FOV -- the Controls page was full. */
+#if !defined(__ANDROID__) && !defined(SH_IOS)
+    { "Invert_Mouse_Y",    &g_PcConfig.invertMouseY,      "invert_mouse_y",         VAL_ONOFF, 2, LBL_ONOFF, NULL, 1, PCK_INT },
+#endif
+    { "Invert_Pad_Y",      &g_PcConfig.invertControllerY, "invert_controller_y",    VAL_ONOFF, 2, LBL_ONOFF, NULL, 1, PCK_INT },
+#if defined(__ANDROID__) || defined(SH_IOS)
+    /* Automatic stands aside for a controller and comes back the moment the
+     * screen is touched; Always_On keeps the controls up alongside a pad;
+     * Always_Off drops the stick and the buttons but keeps the taps that leave a
+     * screen, so this row stays reachable (see pc_touch.c). */
+    { "Touch_Controls",    &g_PcConfig.touchControls,     "touch_controls",         VAL_TOUCH, 3, LBL_TOUCH, NULL, 1, PCK_INT },
+    { "Touch_Look_Speed",  NULL, "touch_look_sensitivity", NULL, 0, NULL, NULL, 1, PCK_SLIDER, &g_PcConfig.touchLookSensitivity, NULL, 0.1f, 4.0f, 0.1f },
+    /* Named for the row width, not the feature: "One_Button_Combat" is the
+     * longest name on this page and pushed the value column past where
+     * Touch_Controls' "Always_Off" could finish before the 320px clip. */
+    { "One_Button_Fire",   &g_PcConfig.oneButtonCombat,  "one_button_combat",      VAL_ONOFF, 2, LBL_ONOFF, NULL, 1, PCK_INT },
+    /* Context is this port's own scheme -- a floating stick, drag to look, tap
+     * to act, buttons that change with the screen. Gamepad is a fixed PSX pad
+     * in one place always, after WhoisMiau0x1's Android fork. Applies live. */
+    { "Touch_Style",       &g_PcConfig.touchStyle,       "touch_style",            VAL_TSTYLE, 2, LBL_TSTYLE, NULL, 1, PCK_INT },
+#endif
+#if defined(__ANDROID__) || defined(SH_IOS)
+    /* Quick Save / Quick Load buttons on the touch overlay. Named for the
+     * value column: a longer name pushes it past where Touch_Controls'
+     * "Always_Off" can finish before the 320px clip (see One_Button_Fire).
+     * The quick menu has room for the full wording. Applies live. */
+    { "Quick_Save_Load",   &g_PcConfig.touchQuickSaveLoad, "touch_quicksave_buttons", VAL_ONOFF, 2, LBL_ONOFF, NULL, 1, PCK_INT },
+#else
+    /* A graphics option parked on the Controls page purely for room: 11 rows
+     * is the ceiling on every page. On a phone it lives on the sixth page. */
+    { "Bullet_Decals",     &g_PcConfig.bulletDecals,      "bullet_decals",          VAL_ONOFF, 2, LBL_ONOFF, NULL, 1, PCK_INT },
+#endif
+    { "Prev_Page",         NULL,                          NULL,                     NULL,      0, NULL,      NULL, 0, PCK_PREV },
+    { "Next_Page",         NULL,                          NULL,                     NULL,      0, NULL,      NULL, 0, PCK_NEXT },
+    { "Back",              NULL,                          NULL,                     NULL,      0, NULL,      NULL, 0, PCK_BACK },
+};
+
+/* Page 4 (Camera): the aiming + alternate-camera options. A page fits ~12 lines
+ * (PCOPT_LINE_BASE_Y 40 + 16/row on a 240-line screen) and this one had reached
+ * that limit, so Crosshair moved to the System page and the New-Game start Map
+ * row to the Graphics page — both of which had spare rows. Third_Person_FOV
+ * lives with First_Person_FOV on the Controls page. */
+static const s_PcOpt PCOPT_T[] = {
+    /* The minimap rows moved to the HUD page (PCOPT_H) when the low-health
+     * glow arrived: every page was at the 11-row ceiling. */
+    { "Aim_Assist",        &g_PcConfig.aimAssist,          "aim_assist",            VAL_ONOFF, 2, LBL_ONOFF, NULL, 1, PCK_INT },
+    /* Per-camera FOV, each independent (40..140). First/Thirdperson moved here from
+     * the Controls page when OTS got its own FOV; grouped with the camera options. */
+    { "First_Person_FOV",  NULL, "fps_fov", NULL, 0, NULL, NULL, 1, PCK_SLIDER, &g_PcConfig.fpsFov, NULL, 40.0f, 140.0f, 1.0f },
+    { "Third_Person_FOV",  NULL, "tps_fov", NULL, 0, NULL, NULL, 1, PCK_SLIDER, &g_PcConfig.tpsFov, NULL, 40.0f, 140.0f, 1.0f },
+    { "OTS_FOV",           NULL, "ots_fov", NULL, 0, NULL, NULL, 1, PCK_SLIDER, &g_PcConfig.otsFov, NULL, 40.0f, 140.0f, 1.0f },
+    /* Aim_Zoom is tps_aim_zoom_amount (Thirdperson only since the TPS/OTS split);
+     * -200..200, 0 = no zoom, 100 = original, negative pulls the aim camera back. */
+    { "Aim_Zoom",          NULL, "tps_aim_zoom_amount",    NULL, 0, NULL, NULL, 1, PCK_SLIDER, &g_PcConfig.tpsAimZoom,  NULL, -200.0f, 200.0f, 5.0f },
+    { "OTS_Aim_Zoom",      NULL, "ots_aim_zoom_amount",    NULL, 0, NULL, NULL, 1, PCK_SLIDER, &g_PcConfig.otsAimZoom,  NULL, -200.0f, 200.0f, 5.0f },
+    { "OTS_Aim_In_TPS",    &g_PcConfig.tpsOtsAim,          "tps_ots_aim",           VAL_ONOFF, 2, LBL_ONOFF, NULL, 1, PCK_INT },
+    { "Camera_Collision",  &g_PcConfig.tpsCameraCollision, "tps_camera_collision",  VAL_ONOFF, 2, LBL_ONOFF, NULL, 1, PCK_INT },
+    { "Prev_Page",         NULL,                           NULL,                    NULL,      0, NULL,      NULL, 0, PCK_PREV },
+    { "Next_Page",         NULL,                           NULL,                    NULL,      0, NULL,      NULL, 0, PCK_NEXT },
+    { "Back",              NULL,                           NULL,                    NULL,      0, NULL,      NULL, 0, PCK_BACK },
+};
+
+/* Page 5 (HUD): the minimap rows plus the low-health glow. */
+static const s_PcOpt PCOPT_H[] = {
+    { "Minimap",           &g_PcConfig.minimap,            "minimap",               VAL_MMMODE, 3, LBL_MMMODE, NULL, 1, PCK_INT },
+    { "Minimap_Scale",     NULL, "minimap_scale",          NULL, 0, NULL, NULL, 1, PCK_SLIDER, &g_PcConfig.minimapScale, NULL, MINIMAP_SCALE_MIN, MINIMAP_SCALE_MAX, 5.0f },
+    { "Minimap_Corner",    &g_PcConfig.minimapCorner,      "minimap_corner",        VAL_MMCNR, 4, LBL_MMCNR, NULL, 1, PCK_INT },
+    { "Minimap_Opacity",   NULL, "minimap_opacity",        NULL, 0, NULL, NULL, 1, PCK_SLIDER, &g_PcConfig.minimapOpacity, NULL, 0.0f, 100.0f, 5.0f },
+    /* pc_minimap.c reads this live, so the toggle applies instantly. On = only
+     * draw the minimap once the area's paper map is found (the default); Off =
+     * always draw it. Was config-only (minimap_require_map). */
+    { "Minimap_Reqs_Map",  &g_PcConfig.minimapRequireMap,  "minimap_require_map",  VAL_ONOFF, 2, LBL_ONOFF, NULL, 1, PCK_INT },
+    /* Pulsing red edge glow below 20 hp (pc_combat.c Pc_LowHealthGlowUpdate). */
+    { "Low_HP_Glow",       &g_PcConfig.lowHealthGlow,      "low_health_glow",       VAL_ONOFF, 2, LBL_ONOFF, NULL, 1, PCK_INT },
+    /* From the System page; a crosshair is HUD, and that page needed the room. */
+    { "Crosshair",         &g_PcConfig.crosshair,          "crosshair",             VAL_ONOFF, 2, LBL_ONOFF, NULL, 1, PCK_INT },
+    { "Crosshair_Size",    NULL, "crosshair_size",         NULL, 0, NULL, NULL, 1, PCK_SLIDER, &g_PcConfig.crosshairSize, NULL, 25.0f, 125.0f, 5.0f },
+    { "Prev_Page",         NULL,                           NULL,                    NULL,      0, NULL,      NULL, 0, PCK_PREV },
+#if defined(SH_IOS) || defined(__ANDROID__)
+    /* Not the last page on a phone: PCOPT_M follows. */
+    { "Next_Page",         NULL,                           NULL,                    NULL,      0, NULL,      NULL, 0, PCK_NEXT },
+#endif
+    { "Back",              NULL,                           NULL,                    NULL,      0, NULL,      NULL, 0, PCK_BACK },
+};
+
+#if defined(SH_IOS) || defined(__ANDROID__)
+/* Page 6, phones only: the overflow. Each of these was parked on a page with
+ * a spare row until the rows ran out -- Bullet_Decals on Controls, the
+ * RetroAchievements login on HUD, Android's Screen_Rotation on Camera, which
+ * had made that page twelve tall there. The pages are unlabelled in game, so
+ * grouping is secondary to every page fitting. */
+static const s_PcOpt PCOPT_M[] = {
+    { "Bullet_Decals",     &g_PcConfig.bulletDecals,      "bullet_decals",       VAL_ONOFF,  2, LBL_ONOFF,  NULL, 1, PCK_INT },
+    /* Mobile only, because a phone has no launcher: everywhere else the
+     * launcher owns the account and the game just consumes its token. */
+    { "Achievements",      NULL,                          NULL,                  NULL,       0, NULL,       NULL, 0, PCK_RALOGIN },
+#if defined(__ANDROID__)
+    /* Applied at startup, so it needs a relaunch. */
+    { "Screen_Rotation",   &g_PcConfig.screenOrientation, "screen_orientation", VAL_ORIENT, 3, LBL_ORIENT, NULL, 0, PCK_INT },
+#endif
+    { "Prev_Page",         NULL,                          NULL,                  NULL,       0, NULL,       NULL, 0, PCK_PREV },
+    { "Back",              NULL,                          NULL,                  NULL,       0, NULL,       NULL, 0, PCK_BACK },
+};
+#endif
+
+static void Options_PcOptionsMenu_EntryStringsDraw(void);
+static void Options_PcOptionsMenu_ConfigDraw(void);
+static void Options_PcOptionsMenu_SelectionHighlightDraw(void);
+
+/* ---- Mouse support: hover selects, click acts, wheel adjusts values ----
+ * Injections write the same controller bits the stock input code reads, so
+ * every screen keeps its own step/clamp/SFX/state logic. */
+
+static void PcMouse_InjectEnter(void)
+{
+    g_Controller0->clickedBtnFlags |= g_GameWorkPtr->config.controllerConfig.enter;
+}
+
+extern int Pc_Touch_UsedRecently(void);
+
+static void PcMouse_InjectCancel(void)
+{
+    g_Controller0->clickedBtnFlags |= g_GameWorkPtr->config.controllerConfig.cancel;
+}
+
+/* A value-cycle step: toggle rows read clickedBtnFlags, sliders/volumes read
+ * pulsedBtnFlags — set both, like a fresh physical press does. */
+static void PcMouse_InjectDir(int dir)
+{
+    u32 flag = (dir > 0) ? ControllerFlag_LStickRight : ControllerFlag_LStickLeft;
+
+    g_Controller0->clickedBtnFlags |= flag;
+    g_Controller0->pulsedBtnFlags  |= flag;
+}
+
+const s_PcOpt* PcOpt_PageByIndex(int page, int* count)
+{
+    if (page == 0) { *count = (int)(sizeof(PCOPT_G) / sizeof(PCOPT_G[0])); return PCOPT_G; }
+    if (page == 1) { *count = (int)(sizeof(PCOPT_S) / sizeof(PCOPT_S[0])); return PCOPT_S; }
+    if (page == 2) { *count = (int)(sizeof(PCOPT_C) / sizeof(PCOPT_C[0])); return PCOPT_C; }
+    if (page == 3) { *count = (int)(sizeof(PCOPT_T) / sizeof(PCOPT_T[0])); return PCOPT_T; }
+#if defined(SH_IOS) || defined(__ANDROID__)
+    if (page == 5) { *count = (int)(sizeof(PCOPT_M) / sizeof(PCOPT_M[0])); return PCOPT_M; }
+#endif
+    *count = (int)(sizeof(PCOPT_H) / sizeof(PCOPT_H[0]));
+    return PCOPT_H;
+}
+
+static const s_PcOpt* PcOpt_Page(int* count)
+{
+    if (g_PcOptionsMenu_Page == 0) { *count = (int)(sizeof(PCOPT_G) / sizeof(PCOPT_G[0])); return PCOPT_G; }
+    if (g_PcOptionsMenu_Page == 1) { *count = (int)(sizeof(PCOPT_S) / sizeof(PCOPT_S[0])); return PCOPT_S; }
+    if (g_PcOptionsMenu_Page == 2) { *count = (int)(sizeof(PCOPT_C) / sizeof(PCOPT_C[0])); return PCOPT_C; }
+    if (g_PcOptionsMenu_Page == 3) { *count = (int)(sizeof(PCOPT_T) / sizeof(PCOPT_T[0])); return PCOPT_T; }
+#if defined(SH_IOS) || defined(__ANDROID__)
+    if (g_PcOptionsMenu_Page == 5) { *count = (int)(sizeof(PCOPT_M) / sizeof(PCOPT_M[0])); return PCOPT_M; }
+#endif
+    *count = (int)(sizeof(PCOPT_H) / sizeof(PCOPT_H[0]));
+    return PCOPT_H;
+}
+
+static int PcOpt_ValIndex(const s_PcOpt* e)
+{
+    /* Prefer the live render global when the row mirrors one: it's the ground
+     * truth, so the menu reflects toggles made via hotkeys/console (F1 PGXP,
+     * F2 post-process, etc.) rather than a stale g_PcConfig copy. */
+    int i, v = (e->live) ? *e->live : *e->field;
+    for (i = 0; i < e->nVals; i++)
+        if (e->vals[i] == v) return i;
+    return 0;
+}
+
+/* x for the value column: past the longest name, clamped to the band the pages
+ * were laid out in. LINE_BASE_X is 64 in both draws. */
+static int PcOpt_ValueColumnX(const s_PcOpt* tbl, int count)
+{
+    int i, widest = 0, x;
+
+    for (i = 0; i < count; i++)
+    {
+        int w = Pc_LangMenuTextWidth(tbl[i].name);
+
+        if (w > widest)
+            widest = w;
+    }
+
+    x = 64 + widest + 8;
+    if (x < 196) x = 196;
+    if (x > 240) x = 240;
+
+    return x;
+}
+
+static const char* PcOpt_ValueLabel(const s_PcOpt* e, char* buf, int bufsz)
+{
+    if (e->kind == PCK_RES) {
+        snprintf(buf, bufsz, "%dx%d", g_PcConfig.windowWidth, g_PcConfig.windowHeight);
+        return buf;
+    }
+    if (e->kind == PCK_SLIDER) {
+        snprintf(buf, bufsz, "%.2f", e->ffield ? *e->ffield : 0.0f);
+        return buf;
+    }
+    if (e->kind == PCK_MAP) {
+        return g_PcConfig.mapName[0] ? g_PcConfig.mapName : "map0_s00";
+    }
+#if defined(__ANDROID__)
+    if (e->kind == PCK_STORAGE) {
+        /* Published by SilentHillActivity, which is the side that knows which
+         * volume this is -- the path alone does not say. */
+        const char* label = getenv("SH_DATA_LABEL");
+        return (label != NULL && label[0]) ? label : "Unknown";
+    }
+#endif
+#if defined(SH_IOS) || defined(__ANDROID__)
+    if (e->kind == PCK_RALOGIN) {
+        if (Pc_Ra_LoginPending())
+            return "Signing_in";
+        if (!Pc_Ra_IsSignedIn()) {
+            /* An attempt that finished without signing in has to say so. It
+             * used to snap straight back to "Sign_In", which is exactly what
+             * doing nothing looks like -- a missing INTERNET permission, a
+             * wrong password and a dropped connection were all indistinguishable. The
+             * reason itself is too long for this column; it is in the log as
+             * [RA] password login failed. */
+            const char* res = Pc_Ra_LoginResult();
+
+            return (res != NULL && res[0]) ? "Failed" : "Sign_In";
+        }
+        /* Truncated to what fits: the value column starts at 204 and the screen
+         * clips at 320, which is about 13 glyphs. RA allows longer names than
+         * that, and an overrun would draw off the edge rather than wrap. */
+        snprintf(buf, bufsz, "%.12s", g_PcConfig.raUsername);
+        return buf;
+    }
+#endif
+    if (e->field == NULL)
+        return "";
+    {
+        int idx = PcOpt_ValIndex(e);
+        if (e->labels) return e->labels[idx];
+        snprintf(buf, bufsz, "%d", e->vals[idx]);
+        return buf;
+    }
+}
+
+/* Click-and-drag on a slider row. PcOpt_Adjust writes config.cfg on every call,
+ * so driving it once per drag step would rewrite the file dozens of times a
+ * second; instead move the value live here and let the caller save once when the
+ * button is released. */
+static void PcOpt_SliderDragApply(const s_PcOpt* e, int steps)
+{
+    float v;
+
+    if (e->kind != PCK_SLIDER || !e->ffield || steps == 0)
+        return;
+
+    v = *e->ffield + (float)steps * e->fstep;
+    if (v < e->fmin) v = e->fmin;
+    if (v > e->fmax) v = e->fmax;
+
+    *e->ffield = v;
+    if (e->flive) *e->flive = v;
+}
+
+static void PcOpt_SliderDragCommit(const s_PcOpt* e)
+{
+    char fb[16];
+
+    if (e->kind != PCK_SLIDER || !e->ffield || !e->key)
+        return;
+
+    snprintf(fb, sizeof(fb), "%.3f", *e->ffield);
+    PcConfig_SaveKeyValue(e->key, fb);
+    SH_DBG_ECHO("%s: %.2f", e->name, *e->ffield);
+}
+
+static void PcOpt_Adjust(const s_PcOpt* e, int dir)
+{
+    char buf[24];
+    char vbuf[24];
+
+    if (e->kind == PCK_RES) {
+        int i, idx = 0;
+        for (i = 0; i < PC_RES_COUNT; i++)
+            if (RES_W[i] == g_PcConfig.windowWidth && RES_H[i] == g_PcConfig.windowHeight) { idx = i; break; }
+        idx = (idx + dir + PC_RES_COUNT) % PC_RES_COUNT;
+        g_PcConfig.windowWidth  = RES_W[idx];
+        g_PcConfig.windowHeight = RES_H[idx];
+        snprintf(buf, sizeof(buf), "%d", g_PcConfig.windowWidth);  PcConfig_SaveKeyValue("width", buf);
+        snprintf(buf, sizeof(buf), "%d", g_PcConfig.windowHeight); PcConfig_SaveKeyValue("height", buf);
+        PsyX_ApplyWindowState(g_PcConfig.windowWidth, g_PcConfig.windowHeight, g_PcConfig.fullscreen);
+        SH_DBG_ECHO("Resolution: %dx%d", g_PcConfig.windowWidth, g_PcConfig.windowHeight);
+        return;
+    }
+    if (e->kind == PCK_SLIDER) {
+        float v = (e->ffield ? *e->ffield : 0.0f) + (float)dir * e->fstep;
+        if (v < e->fmin) v = e->fmin;
+        if (v > e->fmax) v = e->fmax;
+        if (e->ffield) *e->ffield = v;
+        if (e->flive)  *e->flive  = v;
+        if (e->key) { char fb[16]; snprintf(fb, sizeof(fb), "%.3f", v); PcConfig_SaveKeyValue(e->key, fb); }
+        SH_DBG_ECHO("%s: %.2f", e->name, v);
+        return;
+    }
+    if (e->kind == PCK_MAP) {
+        /* Cycle the New-Game start map (same effect as the console MAP command
+         * and the 4/5 debug keys): set g_PcConfig.mapName; the map loads on the
+         * next New Game. MAP_NAMES is dense 0..Count-1 in story order. */
+        int cnt = MapRegistry_Count();
+        int idx = MapRegistry_FindByName(g_PcConfig.mapName);
+        const char* nm;
+        if (idx < 0) idx = 0;
+        idx = (idx + dir + cnt) % cnt;
+        nm  = MapRegistry_GetName((e_MapIdx)idx);
+        strncpy(g_PcConfig.mapName, nm, sizeof(g_PcConfig.mapName) - 1);
+        g_PcConfig.mapName[sizeof(g_PcConfig.mapName) - 1] = '\0';
+        PcConfig_SaveMapName(nm);
+        {
+            const char* desc = MapRegistry_GetDescription((e_MapIdx)idx);
+            SH_DBG_ECHO("Map: %s (%s)", nm, (desc && desc[0]) ? desc : nm);
+        }
+        return;
+    }
+    if (e->field == NULL)
+        return;
+
+    {
+        int idx = (PcOpt_ValIndex(e) + dir + e->nVals) % e->nVals;
+        *e->field = e->vals[idx];
+        snprintf(buf, sizeof(buf), "%d", *e->field);
+        if (e->key) PcConfig_SaveKeyValue(e->key, buf);
+
+        if (e->kind == PCK_FILTER) {
+            switch (*e->field) {
+            /* 0 off, 1 dither, 2 bilinear, 3 trilinear, 4 anisotropic.
+             * g_cfg_textureFilter is the mode the renderer acts on;
+             * g_cfg_bilinearFiltering is kept as the derived "any filtering"
+             * flag its remaining callers expect. */
+            case 1:  g_cfg_psxDither = 1; g_cfg_textureFilter = 0; break;
+            case 2:  g_cfg_psxDither = 0; g_cfg_textureFilter = 1; break;
+            case 3:  g_cfg_psxDither = 0; g_cfg_textureFilter = 2; break;
+            /* 4..7 are anisotropic at 2x/4x/8x/16x. One value carries both the
+             * mode and the strength so the row, the launcher and config.cfg
+             * cannot disagree about what is selected. */
+            case 4:  g_cfg_psxDither = 0; g_cfg_textureFilter = 3; g_cfg_anisoLevel = 2;  break;
+            case 5:  g_cfg_psxDither = 0; g_cfg_textureFilter = 3; g_cfg_anisoLevel = 4;  break;
+            case 6:  g_cfg_psxDither = 0; g_cfg_textureFilter = 3; g_cfg_anisoLevel = 8;  break;
+            case 7:  g_cfg_psxDither = 0; g_cfg_textureFilter = 3; g_cfg_anisoLevel = 16; break;
+            default: g_cfg_psxDither = 0; g_cfg_textureFilter = 0; break;
+            }
+            g_cfg_bilinearFiltering = (g_cfg_textureFilter > 0);
+        } else if (e->kind == PCK_WINMODE) {
+            PsyX_ApplyWindowState(g_PcConfig.windowWidth, g_PcConfig.windowHeight, g_PcConfig.fullscreen);
+        } else if (e->kind == PCK_VSYNC) {
+            PsyX_ApplyVsync(g_PcConfig.vsync);
+        } else if (e->kind == PCK_FLMODE) {
+            Pc_FlashlightModeApply(*e->field, 1);
+        } else if (e->live) {
+            *e->live = *e->field;
+        }
+
+        SH_DBG_ECHO("%s: %s", e->name, PcOpt_ValueLabel(e, vbuf, sizeof(vbuf)));
+        if (!e->realtime)
+            SH_DBG_ECHO("This setting will take effect the next time the game is started.");
+    }
+}
+
+#ifdef SH_PC_PORT
+/* ---- Quick options overlay (pc_quick_options.c, F9) ----
+ * The overlay drives the SAME rows as the PC Options screen through this
+ * opaque handle API, so labels, value cycling, config saving and live-apply
+ * side effects are this file's code and cannot drift. Looked up by config
+ * key; NULL if a key is not on any page. */
+const void* PcOpt_QuickFind(const char* key)
+{
+    int page, count, i;
+    if (key == NULL)
+        return NULL;
+    for (page = 0; page < PCOPT_PAGE_COUNT; page++) {
+        const s_PcOpt* tbl = PcOpt_PageByIndex(page, &count);
+        for (i = 0; i < count; i++)
+            if (tbl[i].key && strcmp(tbl[i].key, key) == 0)
+                return &tbl[i];
+    }
+    return NULL;
+}
+
+const char* PcOpt_QuickName(const void* h)     { return ((const s_PcOpt*)h)->name; }
+int         PcOpt_QuickRealtime(const void* h) { return ((const s_PcOpt*)h)->realtime; }
+
+const char* PcOpt_QuickLabel(const void* h, char* buf, int bufsz)
+{
+    return PcOpt_ValueLabel((const s_PcOpt*)h, buf, bufsz);
+}
+
+void PcOpt_QuickAdjust(const void* h, int dir)
+{
+    Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+    PcOpt_Adjust((const s_PcOpt*)h, dir);
+}
+
+/* Rows the overlay wants that are not in the table: the shadow map size
+ * (launcher / console only until now), the speaker layout and the two PSX
+ * volumes (main Options menu rows). Same apply paths as those screens. */
+enum { QO_X_SHADOW = 0, QO_X_SPEAKERS, QO_X_BGM, QO_X_SFX,
+       QO_X_ASPECT, QO_X_CRTTRIM, QO_X_HFOV, QO_X_VFOV, QO_X_PAR, QO_X_VSHIFT,
+       QO_X_CUTSHIFT,
+       /* Per-camera view rows (shown by the View page for the active camera):
+        * Thirdperson/FPS FOV, and the FPS eye position + melee-swing pullback.
+        * Keep IDENTICAL to the mirror enum in pc_quick_options.c. */
+       QO_X_TPSFOV, QO_X_FPSFOV,
+       QO_X_FPSHEADX, QO_X_FPSHEADY, QO_X_FPSHEADZ, QO_X_FPSSWING,
+       QO_X_OTSFOV, QO_X_TPSAIMZOOM, QO_X_OTSAIMZOOM, QO_X_TPSOTSAIM,
+       QO_X_TPSRESTX, QO_X_TPSRESTY, QO_X_TPSAIMX, QO_X_TPSAIMY,
+       QO_X_OTSRESTX, QO_X_OTSRESTY, QO_X_OTSAIMX, QO_X_OTSAIMY,
+       QO_X_SPU,
+       /* Quick menu only: the PC Options graphics page is at its row limit. */
+       QO_X_DREAMSTR, QO_X_DREAMBLUR, QO_X_DPADMOVE };
+
+/* display_aspect = crt puts the picture on (4:3 x trim), so one framebuffer
+ * pixel lands on screen this many times wider than tall at trim 1.0. It is the
+ * bridge between the two Control Types. */
+#define PCOPT_CRT_SHAPE ((4.0f / 3.0f) / (320.0f / 224.0f))
+
+extern void Pc_QuickOptions_InvalidateRows(void);
+
+static const int         QO_SHADOW_SIZES[] = { 256, 512, 1024, 2048, 4096, 8192 };
+static const char* const QO_SPEAKER_LBL[]  = { "Auto", "Stereo", "Quad", "5.1", "7.1" };
+
+/* The software SPU implementations, in the order the renderer enum has them
+ * minus Legacy. Legacy is the OpenAL mixer, which does not exist on a build
+ * without OpenAL -- PcAudioConfig_UsesSoftwareSpu pins those to software
+ * whatever the config says, so offering it here would be a value that reads
+ * back wrong on the next launch. */
+static const char* const QO_SPU_LBL[] = { "Authentic", "High Precision", "Modern" };
+static const char* const QO_SPU_IDS[] = { "authentic", "high_precision", "modern" };
+/* Each implementation renders at its own native rate; keeping the pair in
+ * step here means the rate never has to be a second row to get wrong. */
+static const int         QO_SPU_RATE[] = { 44100, 176400, 176400 };
+static const char* const QO_SPEAKER_IDS[]  = { "auto", "stereo", "quad", "51", "71" };
+
+const char* PcOpt_QuickExtraLabel(int which, char* buf, int bufsz)
+{
+    switch (which) {
+    case QO_X_SHADOW:
+        snprintf(buf, bufsz, "%d x %d", g_PcConfig.shadowMapSize, g_PcConfig.shadowMapSize);
+        return buf;
+    case QO_X_SPEAKERS: {
+        int a = g_PcConfig.audioOutput;
+        return (a >= 0 && a < 5) ? QO_SPEAKER_LBL[a] : "HRTF";
+    }
+    case QO_X_SPU: {
+        int r = g_PcAudioConfig.renderer - PC_SPU_RENDERER_AUTHENTIC;
+        return (r >= 0 && r < 3) ? QO_SPU_LBL[r] : "Legacy";
+    }
+    /* Quick menu only: the PC Options graphics page is already at its row limit. */
+    case QO_X_DREAMBLUR:
+        return g_PcConfig.dreamBlur ? "On" : "Off";
+    case QO_X_DPADMOVE:
+        return g_PcConfig.disableDpadMovement ? "On" : "Off";
+    case QO_X_DREAMSTR:
+        if (!g_PcConfig.dreamBlur) { snprintf(buf, bufsz, "%d%%  (off)", (int)(g_PcConfig.dreamBlurStrength * 100.0f + 0.5f)); return buf; }
+        snprintf(buf, bufsz, "%d%%", (int)(g_PcConfig.dreamBlurStrength * 100.0f + 0.5f));
+        return buf;
+    case QO_X_BGM:
+        snprintf(buf, bufsz, "%d / 16", g_GameWork.config.volumeBgm / 8);
+        return buf;
+    case QO_X_SFX:
+        snprintf(buf, bufsz, "%d / 16", g_GameWork.config.volumeSe / 8);
+        return buf;
+    case QO_X_ASPECT:
+        return g_PcConfig.aspectRaw ? "Advanced" : "Simple";
+    /* Advanced gets its shape from hfov x vfov / par instead, so the trim is
+      * inert there and says so rather than reading as a knob that failed. */
+    case QO_X_CRTTRIM:
+        snprintf(buf, bufsz, g_PcConfig.aspectRaw ? "%.2f  (simple)" : "%.2f",
+                 g_PcConfig.crtAspectTrim);
+        return buf;
+    /* Simple hides this row entirely: its pixel-aspect solve divides hfov
+      * straight back out, so the knob genuinely does nothing there. */
+    case QO_X_HFOV:
+        snprintf(buf, bufsz, "%.2f", g_PcConfig.worldHScale);
+        return buf;
+    case QO_X_VFOV:
+        snprintf(buf, bufsz, "%.2f", g_PcConfig.worldVScale);
+        return buf;
+    case QO_X_PAR:
+        snprintf(buf, bufsz, "%.3f", g_PcConfig.pixelAspect);
+        return buf;
+    case QO_X_VSHIFT:
+        snprintf(buf, bufsz, "%+d rows", (int)g_PcConfig.worldVShift);
+        return buf;
+    case QO_X_CUTSHIFT:
+        snprintf(buf, bufsz, "%+d rows", (int)g_PcConfig.cutsceneVShift);
+        return buf;
+    case QO_X_TPSFOV:
+        snprintf(buf, bufsz, "%.0f%s", g_PcConfig.tpsFov,
+                 (g_PcConfig.tpsFov > 71.0f && g_PcConfig.tpsFov < 71.2f) ? " (default)" : "");
+        return buf;
+    case QO_X_FPSFOV:
+        snprintf(buf, bufsz, "%.0f%s", g_PcConfig.fpsFov,
+                 (g_PcConfig.fpsFov > 71.0f && g_PcConfig.fpsFov < 71.2f) ? " (default)" : "");
+        return buf;
+    case QO_X_FPSHEADX:
+        snprintf(buf, bufsz, "%+d", g_PcConfig.fpsHeadX);
+        return buf;
+    case QO_X_FPSHEADY:
+        /* Stored PSX-down; show as up-positive so "+" reads as "raise the eye". */
+        snprintf(buf, bufsz, "%+d", -g_PcConfig.fpsHeadY);
+        return buf;
+    case QO_X_FPSHEADZ:
+        snprintf(buf, bufsz, "%+d", g_PcConfig.fpsHeadZ);
+        return buf;
+    case QO_X_FPSSWING:
+        if (g_PcConfig.fpsMeleeSwing <= 0.0001f) return "Off";
+        snprintf(buf, bufsz, "%.2f", g_PcConfig.fpsMeleeSwing);
+        return buf;
+    case QO_X_OTSFOV:
+        snprintf(buf, bufsz, "%.0f%s", g_PcConfig.otsFov,
+                 (g_PcConfig.otsFov > 71.0f && g_PcConfig.otsFov < 71.2f) ? " (default)" : "");
+        return buf;
+    case QO_X_TPSAIMZOOM:
+        snprintf(buf, bufsz, "%+d%%", (int)(g_PcConfig.tpsAimZoom + (g_PcConfig.tpsAimZoom < 0.0f ? -0.5f : 0.5f)));
+        return buf;
+    case QO_X_OTSAIMZOOM:
+        snprintf(buf, bufsz, "%+d%%", (int)(g_PcConfig.otsAimZoom + (g_PcConfig.otsAimZoom < 0.0f ? -0.5f : 0.5f)));
+        return buf;
+    case QO_X_TPSOTSAIM:
+        return g_PcConfig.tpsOtsAim ? "On" : "Off";
+    /* Position offsets, raw Q12; Y shown up-positive (stored PSX-down). */
+    case QO_X_TPSRESTX: snprintf(buf, bufsz, "%+d", g_PcConfig.tpsRestX);  return buf;
+    case QO_X_TPSRESTY: snprintf(buf, bufsz, "%+d", -g_PcConfig.tpsRestY); return buf;
+    case QO_X_TPSAIMX:  snprintf(buf, bufsz, "%+d", g_PcConfig.tpsAimX);   return buf;
+    case QO_X_TPSAIMY:  snprintf(buf, bufsz, "%+d", -g_PcConfig.tpsAimY);  return buf;
+    case QO_X_OTSRESTX: snprintf(buf, bufsz, "%+d", g_PcConfig.otsRestX);  return buf;
+    case QO_X_OTSRESTY: snprintf(buf, bufsz, "%+d", -g_PcConfig.otsRestY); return buf;
+    case QO_X_OTSAIMX:  snprintf(buf, bufsz, "%+d", g_PcConfig.otsAimX);   return buf;
+    case QO_X_OTSAIMY:  snprintf(buf, bufsz, "%+d", -g_PcConfig.otsAimY);  return buf;
+    default:
+        return "";
+    }
+}
+
+/* The five view knobs share one adjust path: step the config float, clamp it,
+ * push the PsyCross global (every one of them is read per frame, so the change
+ * lands on the next drawn frame) and save the key. */
+static void PcOpt_ViewStep(float* cfg, float* live, const char* key,
+                           float lo, float hi, float step, int dir, int decimals)
+{
+    char buf[24];
+    float v = *cfg + (float)dir * step;
+
+    if (v < lo) v = lo;
+    if (v > hi) v = hi;
+    /* Steps of 0.01 off a float accumulate a drift that shows in the label. */
+    v = (float)((int)(v * 1000.0f + (v < 0.0f ? -0.5f : 0.5f))) / 1000.0f;
+    *cfg = v;
+    if (live) *live = v;
+    snprintf(buf, sizeof(buf), (decimals >= 3) ? "%.3f" : "%.2f", v);
+    PcConfig_SaveKeyValue(key, buf);
+    /* Logged because a screenshot is only useful if the settings behind it are
+     * known, and these five have historically been retyped per session and
+     * never recorded -- which is how comparison shots ended up unattributable. */
+    SH_LOG("View: %s = %s  (aspect %s, trim %.2f, hfov %.2f, vfov %.2f, vshift %+d, par %.3f)",
+           key, buf, g_PcConfig.aspectRaw ? "raw" : "crt", g_PcConfig.crtAspectTrim,
+           g_PcConfig.worldHScale, g_PcConfig.worldVScale,
+           (int)g_PcConfig.worldVShift, g_PcConfig.pixelAspect);
+    Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+}
+
+/* FPS eye-position axes: step the config field AND the live g_PcFpsOffset
+ * together (the camera reads the live global every frame, config persists it),
+ * clamp, and save. Q12 in Harry's body frame -- same units the numpad debug
+ * keys nudge, so a menu value reproduces a baked value exactly. */
+static void PcOpt_FpsHeadStep(int* cfg, int* live, const char* key, int delta)
+{
+    char buf[24];
+    int v = *cfg + delta;
+    if (v < -20000) v = -20000;
+    if (v >  20000) v =  20000;
+    *cfg = v;
+    if (live) *live = v;
+    snprintf(buf, sizeof(buf), "%d", v);
+    PcConfig_SaveKeyValue(key, buf);
+    Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+}
+
+/* Reset row on the View & Aspect page: restore the ACTIVE camera's settings to
+ * their compile-time defaults, so a display experiment can never leave the picture
+ * unusable. Mode-scoped: resetting one camera never disturbs another.
+ * mode: 0 = Classic, 1 = Thirdperson, 2 = OTS, 3 = Firstperson (matches
+ * qo_view_cam_mode in pc_quick_options.c). */
+void PcOpt_QuickViewReset(int mode)
+{
+    extern const s_PcConfig* PcConfig_Defaults(void);
+    const s_PcConfig* d = PcConfig_Defaults();
+    char buf[24];
+
+    if (mode == 0) /* Classic: aspect shape + world shifts (the shared/global view). */
+    {
+        extern int   g_PsxAspectRaw;
+        extern float g_PsxCrtAspectTrim, g_PsxWorldHScale, g_PsxWorldVScale;
+        extern float g_PsxWorldVShift, g_PsxCutsceneVShift, g_PsxPixelAspect;
+        g_PcConfig.aspectRaw      = d->aspectRaw;
+        g_PcConfig.crtAspectTrim  = d->crtAspectTrim;
+        g_PcConfig.worldHScale    = d->worldHScale;
+        g_PcConfig.worldVScale    = d->worldVScale;
+        g_PcConfig.pixelAspect    = d->pixelAspect;
+        g_PcConfig.worldVShift    = d->worldVShift;
+        g_PcConfig.cutsceneVShift = d->cutsceneVShift;
+        g_PsxAspectRaw      = g_PcConfig.aspectRaw;
+        g_PsxCrtAspectTrim  = g_PcConfig.crtAspectTrim;
+        g_PsxWorldHScale    = g_PcConfig.worldHScale;
+        g_PsxWorldVScale    = g_PcConfig.worldVScale;
+        g_PsxPixelAspect    = g_PcConfig.pixelAspect;
+        g_PsxWorldVShift    = g_PcConfig.worldVShift;
+        g_PsxCutsceneVShift = g_PcConfig.cutsceneVShift;
+        PcConfig_SaveKeyValue("display_aspect", g_PcConfig.aspectRaw ? "raw" : "crt");
+        snprintf(buf, sizeof(buf), "%.2f", g_PcConfig.crtAspectTrim);  PcConfig_SaveKeyValue("crt_aspect_trim", buf);
+        snprintf(buf, sizeof(buf), "%.2f", g_PcConfig.worldHScale);    PcConfig_SaveKeyValue("world_hscale", buf);
+        snprintf(buf, sizeof(buf), "%.2f", g_PcConfig.worldVScale);    PcConfig_SaveKeyValue("world_vscale", buf);
+        snprintf(buf, sizeof(buf), "%.3f", g_PcConfig.pixelAspect);    PcConfig_SaveKeyValue("pixel_aspect", buf);
+        snprintf(buf, sizeof(buf), "%.0f", g_PcConfig.worldVShift);    PcConfig_SaveKeyValue("world_vshift", buf);
+        snprintf(buf, sizeof(buf), "%.0f", g_PcConfig.cutsceneVShift); PcConfig_SaveKeyValue("cutscene_vshift", buf);
+    }
+    else if (mode == 1) /* Thirdperson */
+    {
+        g_PcConfig.tpsFov     = d->tpsFov;
+        g_PcConfig.tpsAimZoom = d->tpsAimZoom;
+        g_PcConfig.tpsOtsAim  = d->tpsOtsAim;
+        g_PcConfig.tpsRestX   = d->tpsRestX; g_PcConfig.tpsRestY = d->tpsRestY;
+        g_PcConfig.tpsAimX    = d->tpsAimX;  g_PcConfig.tpsAimY  = d->tpsAimY;
+        snprintf(buf, sizeof(buf), "%.1f", g_PcConfig.tpsFov);     PcConfig_SaveKeyValue("tps_fov", buf);
+        snprintf(buf, sizeof(buf), "%.1f", g_PcConfig.tpsAimZoom); PcConfig_SaveKeyValue("tps_aim_zoom_amount", buf);
+        PcConfig_SaveKeyValue("tps_ots_aim", g_PcConfig.tpsOtsAim ? "1" : "0");
+        snprintf(buf, sizeof(buf), "%d", g_PcConfig.tpsRestX); PcConfig_SaveKeyValue("tps_rest_x", buf);
+        snprintf(buf, sizeof(buf), "%d", g_PcConfig.tpsRestY); PcConfig_SaveKeyValue("tps_rest_y", buf);
+        snprintf(buf, sizeof(buf), "%d", g_PcConfig.tpsAimX);  PcConfig_SaveKeyValue("tps_aim_x", buf);
+        snprintf(buf, sizeof(buf), "%d", g_PcConfig.tpsAimY);  PcConfig_SaveKeyValue("tps_aim_y", buf);
+    }
+    else if (mode == 2) /* Over-the-Shoulder */
+    {
+        g_PcConfig.otsFov     = d->otsFov;
+        g_PcConfig.otsAimZoom = d->otsAimZoom;
+        g_PcConfig.otsRestX   = d->otsRestX; g_PcConfig.otsRestY = d->otsRestY;
+        g_PcConfig.otsAimX    = d->otsAimX;  g_PcConfig.otsAimY  = d->otsAimY;
+        snprintf(buf, sizeof(buf), "%.1f", g_PcConfig.otsFov);     PcConfig_SaveKeyValue("ots_fov", buf);
+        snprintf(buf, sizeof(buf), "%.1f", g_PcConfig.otsAimZoom); PcConfig_SaveKeyValue("ots_aim_zoom_amount", buf);
+        snprintf(buf, sizeof(buf), "%d", g_PcConfig.otsRestX); PcConfig_SaveKeyValue("ots_rest_x", buf);
+        snprintf(buf, sizeof(buf), "%d", g_PcConfig.otsRestY); PcConfig_SaveKeyValue("ots_rest_y", buf);
+        snprintf(buf, sizeof(buf), "%d", g_PcConfig.otsAimX);  PcConfig_SaveKeyValue("ots_aim_x", buf);
+        snprintf(buf, sizeof(buf), "%d", g_PcConfig.otsAimY);  PcConfig_SaveKeyValue("ots_aim_y", buf);
+    }
+    else /* Firstperson */
+    {
+        extern VECTOR3 g_PcFpsOffset;
+        g_PcConfig.fpsFov        = d->fpsFov;
+        g_PcConfig.fpsHeadX      = d->fpsHeadX;
+        g_PcConfig.fpsHeadY      = d->fpsHeadY;
+        g_PcConfig.fpsHeadZ      = d->fpsHeadZ;
+        g_PcConfig.fpsMeleeSwing = d->fpsMeleeSwing;
+        g_PcFpsOffset.vx = d->fpsHeadX;
+        g_PcFpsOffset.vy = d->fpsHeadY;
+        g_PcFpsOffset.vz = d->fpsHeadZ;
+        snprintf(buf, sizeof(buf), "%.1f", g_PcConfig.fpsFov);        PcConfig_SaveKeyValue("fps_fov", buf);
+        snprintf(buf, sizeof(buf), "%d", g_PcConfig.fpsHeadX);        PcConfig_SaveKeyValue("fps_head_x", buf);
+        snprintf(buf, sizeof(buf), "%d", g_PcConfig.fpsHeadY);        PcConfig_SaveKeyValue("fps_head_y", buf);
+        snprintf(buf, sizeof(buf), "%d", g_PcConfig.fpsHeadZ);        PcConfig_SaveKeyValue("fps_head_z", buf);
+        snprintf(buf, sizeof(buf), "%.2f", g_PcConfig.fpsMeleeSwing); PcConfig_SaveKeyValue("fps_melee_swing", buf);
+    }
+
+    Pc_QuickOptions_InvalidateRows();
+    Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+    SH_LOG("View reset: camera mode %d", mode);
+}
+
+void PcOpt_QuickExtraAdjust(int which, int dir)
+{
+    char buf[24];
+
+    switch (which) {
+    case QO_X_SHADOW: {
+        extern int g_PsyX_ShadowMapSize;
+        int n = (int)(sizeof(QO_SHADOW_SIZES) / sizeof(QO_SHADOW_SIZES[0]));
+        int i, idx = 2;
+        for (i = 0; i < n; i++)
+            if (QO_SHADOW_SIZES[i] == g_PcConfig.shadowMapSize) { idx = i; break; }
+        idx = (idx + dir + n) % n;
+        g_PcConfig.shadowMapSize = QO_SHADOW_SIZES[idx];
+        g_PsyX_ShadowMapSize     = QO_SHADOW_SIZES[idx]; /* target rebuilds on the next shadow frame */
+        snprintf(buf, sizeof(buf), "%d", g_PcConfig.shadowMapSize);
+        PcConfig_SaveKeyValue("shadow_resolution", buf);
+        Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+        break;
+    }
+    case QO_X_SPU: {
+        /* Which software SPU renders the mix. Takes effect on the next launch:
+         * PsyX_SPUAL_ConfigureRenderer is read once, before SpuInit, and the
+         * voices are already allocated against it -- hence the * in the label
+         * and the footer note. Saved immediately so the choice survives even if
+         * the player never opens this again. */
+        int r = g_PcAudioConfig.renderer - PC_SPU_RENDERER_AUTHENTIC;
+        char rateBuf[16];
+
+        if (r < 0 || r > 2)
+            r = 0;                      /* legacy, or anything unexpected */
+        r = (r + dir + 3) % 3;
+
+        g_PcAudioConfig.renderer = PC_SPU_RENDERER_AUTHENTIC + r;
+        g_PcAudioConfig.rate     = QO_SPU_RATE[r];
+        PcConfig_SaveKeyValue("spu_renderer", QO_SPU_IDS[r]);
+        snprintf(rateBuf, sizeof(rateBuf), "%d", QO_SPU_RATE[r]);
+        PcConfig_SaveKeyValue("audio_rate", rateBuf);
+        Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+        break;
+    }
+    case QO_X_SPEAKERS: {
+        /* Mirrors the main Options "Sound" row: Auto/Stereo/Quad/5.1/7.1,
+         * internal mix pinned to Stereo so surround layouts keep their image. */
+        extern void PsyX_SPUAL_SetOutputMode(int mode);
+        g_PcConfig.audioOutput = (g_PcConfig.audioOutput + dir + 5) % 5;
+        PcConfig_SaveKeyValue("audio_output", QO_SPEAKER_IDS[g_PcConfig.audioOutput]);
+        PsyX_SPUAL_SetOutputMode(g_PcConfig.audioOutput);
+        g_GameWork.config.soundType = 0;
+        SD_Call(AudioMode_Stereo);
+        Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+        break;
+    }
+    case QO_X_ASPECT: {
+        /* Switching Control Type must not move the picture. The two modes reach
+         * the same on-screen pixel aspect by different routes --
+         *   Simple:   shape = PCOPT_CRT_SHAPE x trim
+         *   Advanced: shape = hfov x vfov / par
+         * -- so carry the current shape across into whichever knob the new mode
+         * owns. Only the controls you are handed change; the render does not,
+         * and the conversion round-trips exactly. */
+        extern int   g_PsxAspectRaw;
+        extern float g_PsxWorldHScale;
+        extern float g_PsxCrtAspectTrim;
+        float vf  = (g_PcConfig.worldVScale > 0.0f) ? g_PcConfig.worldVScale : 1.0f;
+        float par = (g_PcConfig.pixelAspect > 0.0f) ? g_PcConfig.pixelAspect : 1.0f;
+        char  buf[24];
+
+        if (!g_PcConfig.aspectRaw)
+        {
+            float hf = (PCOPT_CRT_SHAPE * g_PcConfig.crtAspectTrim) * par / vf;
+            if (hf < 0.25f) hf = 0.25f;
+            if (hf > 2.00f) hf = 2.00f;
+            g_PcConfig.worldHScale = hf;
+            g_PsxWorldHScale       = hf;
+            snprintf(buf, sizeof(buf), "%.3f", hf);
+            PcConfig_SaveKeyValue("world_hscale", buf);
+        }
+        else
+        {
+            float tr = (g_PcConfig.worldHScale * vf / par) / PCOPT_CRT_SHAPE;
+            if (tr < 0.50f) tr = 0.50f;
+            if (tr > 1.50f) tr = 1.50f;
+            g_PcConfig.crtAspectTrim = tr;
+            g_PsxCrtAspectTrim       = tr;
+            snprintf(buf, sizeof(buf), "%.3f", tr);
+            PcConfig_SaveKeyValue("crt_aspect_trim", buf);
+        }
+
+        g_PcConfig.aspectRaw = !g_PcConfig.aspectRaw;
+        g_PsxAspectRaw       = g_PcConfig.aspectRaw;
+        PcConfig_SaveKeyValue("display_aspect", g_PcConfig.aspectRaw ? "raw" : "crt");
+        Pc_QuickOptions_InvalidateRows(); /* the page shows a different row set */
+        SH_LOG("View: control type = %s  (trim %.3f, hfov %.3f, vfov %.2f, par %.3f)",
+               g_PcConfig.aspectRaw ? "advanced" : "simple", g_PcConfig.crtAspectTrim,
+               g_PcConfig.worldHScale, g_PcConfig.worldVScale, g_PcConfig.pixelAspect);
+        Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+        break;
+    }
+    case QO_X_CRTTRIM: {
+        extern float g_PsxCrtAspectTrim;
+        PcOpt_ViewStep(&g_PcConfig.crtAspectTrim, &g_PsxCrtAspectTrim,
+                       "crt_aspect_trim", 0.50f, 1.50f, 0.01f, dir, 2);
+        break;
+    }
+    case QO_X_HFOV: {
+        extern float g_PsxWorldHScale;
+        PcOpt_ViewStep(&g_PcConfig.worldHScale, &g_PsxWorldHScale,
+                       "world_hscale", 0.25f, 2.00f, 0.01f, dir, 2);
+        break;
+    }
+    case QO_X_VFOV: {
+        extern float g_PsxWorldVScale;
+        PcOpt_ViewStep(&g_PcConfig.worldVScale, &g_PsxWorldVScale,
+                       "world_vscale", 0.25f, 2.00f, 0.01f, dir, 2);
+        break;
+    }
+    case QO_X_PAR: {
+        extern float g_PsxPixelAspect;
+        PcOpt_ViewStep(&g_PcConfig.pixelAspect, &g_PsxPixelAspect,
+                       "pixel_aspect", 0.50f, 2.00f, 0.005f, dir, 3);
+        break;
+    }
+    case QO_X_VSHIFT: {
+        extern float g_PsxWorldVShift;
+        PcOpt_ViewStep(&g_PcConfig.worldVShift, &g_PsxWorldVShift,
+                       "world_vshift", -60.0f, 60.0f, 1.0f, dir, 2);
+        break;
+    }
+    case QO_X_CUTSHIFT: {
+        /* Gameplay vshift is deliberately not applied during cutscenes (they
+         * frame via letterbox bars), so cutscenes carry their own delta. */
+        extern float g_PsxCutsceneVShift;
+        PcOpt_ViewStep(&g_PcConfig.cutsceneVShift, &g_PsxCutsceneVShift,
+                       "cutscene_vshift", -60.0f, 60.0f, 1.0f, dir, 2);
+        break;
+    }
+    case QO_X_DREAMSTR: {
+        /* Gain of the blur's feedback loop. 1.0 is hardware, where the
+         * overlay's own 50/50 composite is the only decay; lower fades the
+         * ghost out faster. Same value as the second FBDAMP argument. */
+        float v = g_PcConfig.dreamBlurStrength + (float)dir * 0.05f;
+        if (v < 0.0f) v = 0.0f;
+        if (v > 1.0f) v = 1.0f;
+        if (v == g_PcConfig.dreamBlurStrength) { SD_Call(Sfx_MenuError); break; }
+        g_PcConfig.dreamBlurStrength = v;
+        g_PsxFeedbackDampBlend       = v;
+        snprintf(buf, sizeof(buf), "%.2f", v);
+        PcConfig_SaveKeyValue("dream_blur_strength", buf);
+        Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+        break;
+    }
+    case QO_X_BGM:
+    case QO_X_SFX: {
+        /* 16 notches of 8 over 0..128, exactly the main Options sliders. */
+        s32 vol = (which == QO_X_BGM) ? g_GameWork.config.volumeBgm : g_GameWork.config.volumeSe;
+        s32 nv  = CLAMP(vol + dir * 8, 0, OPT_SOUND_VOLUME_MAX);
+        if (nv == vol) { SD_Call(Sfx_MenuError); break; }
+        if (which == QO_X_BGM) g_GameWork.config.volumeBgm = nv;
+        else                   g_GameWork.config.volumeSe  = nv;
+        Sd_SetVolume(OPT_SOUND_VOLUME_MAX, g_GameWork.config.volumeBgm, g_GameWork.config.volumeSe);
+        SD_Call(Sfx_MenuMove);
+        break;
+    }
+    case QO_X_TPSFOV:
+        /* No live global: Pc_CameraFov_Update reads g_PcConfig.tpsFov per frame. */
+        PcOpt_ViewStep(&g_PcConfig.tpsFov, NULL, "tps_fov", 40.0f, 140.0f, 1.0f, dir, 2);
+        break;
+    case QO_X_FPSFOV:
+        PcOpt_ViewStep(&g_PcConfig.fpsFov, NULL, "fps_fov", 40.0f, 140.0f, 1.0f, dir, 2);
+        break;
+    case QO_X_FPSHEADX: {
+        extern VECTOR3 g_PcFpsOffset;
+        PcOpt_FpsHeadStep(&g_PcConfig.fpsHeadX, (int*)&g_PcFpsOffset.vx, "fps_head_x", dir * 64);
+        break;
+    }
+    case QO_X_FPSHEADY: {
+        /* Displayed up-positive; stored PSX-down, so a "+" press lowers fpsHeadY. */
+        extern VECTOR3 g_PcFpsOffset;
+        PcOpt_FpsHeadStep(&g_PcConfig.fpsHeadY, (int*)&g_PcFpsOffset.vy, "fps_head_y", -dir * 64);
+        break;
+    }
+    case QO_X_FPSHEADZ: {
+        extern VECTOR3 g_PcFpsOffset;
+        PcOpt_FpsHeadStep(&g_PcConfig.fpsHeadZ, (int*)&g_PcFpsOffset.vz, "fps_head_z", dir * 64);
+        break;
+    }
+    case QO_X_FPSSWING:
+        /* No live global: the FPS camera reads g_PcConfig.fpsMeleeSwing per frame. */
+        PcOpt_ViewStep(&g_PcConfig.fpsMeleeSwing, NULL, "fps_melee_swing", 0.0f, 1.0f, 0.05f, dir, 2);
+        break;
+    /* TPS/OTS FOV + aim zoom (camera reads g_PcConfig per frame -> live = NULL). */
+    case QO_X_OTSFOV:
+        PcOpt_ViewStep(&g_PcConfig.otsFov, NULL, "ots_fov", 40.0f, 140.0f, 1.0f, dir, 2);
+        break;
+    case QO_X_TPSAIMZOOM:
+        PcOpt_ViewStep(&g_PcConfig.tpsAimZoom, NULL, "tps_aim_zoom_amount", -200.0f, 200.0f, 5.0f, dir, 2);
+        break;
+    case QO_X_OTSAIMZOOM:
+        PcOpt_ViewStep(&g_PcConfig.otsAimZoom, NULL, "ots_aim_zoom_amount", -200.0f, 200.0f, 5.0f, dir, 2);
+        break;
+    case QO_X_TPSOTSAIM:
+        g_PcConfig.tpsOtsAim = !g_PcConfig.tpsOtsAim;
+        PcConfig_SaveKeyValue("tps_ots_aim", g_PcConfig.tpsOtsAim ? "1" : "0");
+        Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+        break;
+    case QO_X_DREAMBLUR:
+        g_PcConfig.dreamBlur = !g_PcConfig.dreamBlur;
+        g_cfg_dreamFeedback  = g_PcConfig.dreamBlur;
+        PcConfig_SaveKeyValue("dream_blur", g_PcConfig.dreamBlur ? "1" : "0");
+        Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+        break;
+    /* Read every frame by the gameplay gate in game_main.c, so it applies live. */
+    case QO_X_DPADMOVE:
+        g_PcConfig.disableDpadMovement = !g_PcConfig.disableDpadMovement;
+        PcConfig_SaveKeyValue("disable_dpad_movement", g_PcConfig.disableDpadMovement ? "1" : "0");
+        Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+        break;
+    /* Position offsets: config-only (live = NULL), 128 = ~0.03 units per press.
+     * Y presses are inverted so a "+" press raises the camera (stored PSX-down). */
+    case QO_X_TPSRESTX: PcOpt_FpsHeadStep(&g_PcConfig.tpsRestX, NULL, "tps_rest_x",  dir * 128); break;
+    case QO_X_TPSRESTY: PcOpt_FpsHeadStep(&g_PcConfig.tpsRestY, NULL, "tps_rest_y", -dir * 128); break;
+    case QO_X_TPSAIMX:  PcOpt_FpsHeadStep(&g_PcConfig.tpsAimX,  NULL, "tps_aim_x",   dir * 128); break;
+    case QO_X_TPSAIMY:  PcOpt_FpsHeadStep(&g_PcConfig.tpsAimY,  NULL, "tps_aim_y",  -dir * 128); break;
+    case QO_X_OTSRESTX: PcOpt_FpsHeadStep(&g_PcConfig.otsRestX, NULL, "ots_rest_x",  dir * 128); break;
+    case QO_X_OTSRESTY: PcOpt_FpsHeadStep(&g_PcConfig.otsRestY, NULL, "ots_rest_y", -dir * 128); break;
+    case QO_X_OTSAIMX:  PcOpt_FpsHeadStep(&g_PcConfig.otsAimX,  NULL, "ots_aim_x",   dir * 128); break;
+    case QO_X_OTSAIMY:  PcOpt_FpsHeadStep(&g_PcConfig.otsAimY,  NULL, "ots_aim_y",  -dir * 128); break;
+    default:
+        break;
+    }
+}
+#endif
+
+/* Reset one options row to its captured compile-time default, applying the
+ * same side effects a manual change would. Resolution and window mode are
+ * skipped by the caller (their kinds) so the player is never bumped to 640x480
+ * or a different display mode. Actions/labels (no key) are skipped too. */
+static void PcOpt_ResetEntry(const s_PcOpt* e)
+{
+    extern const s_PcConfig* PcConfig_Defaults(void);
+    const s_PcConfig* d = PcConfig_Defaults();
+    char buf[32];
+
+    if (e->key == NULL) return;
+    if (e->kind == PCK_RES || e->kind == PCK_WINMODE ||
+        e->kind == PCK_NEXT || e->kind == PCK_PREV || e->kind == PCK_BACK ||
+        e->kind == PCK_MAP) return;
+
+    if (e->kind == PCK_SLIDER && e->ffield != NULL) {
+        float dv = *(const float*)((const char*)d + ((const char*)e->ffield - (const char*)&g_PcConfig));
+        *e->ffield = dv;
+        if (e->flive) *e->flive = dv;
+        snprintf(buf, sizeof(buf), "%.3f", dv);
+        PcConfig_SaveKeyValue(e->key, buf);
+        return;
+    }
+
+    if (e->field == NULL) return;
+    {
+        int dv = *(const int*)((const char*)d + ((const char*)e->field - (const char*)&g_PcConfig));
+        *e->field = dv;
+        snprintf(buf, sizeof(buf), "%d", dv);
+        PcConfig_SaveKeyValue(e->key, buf);
+
+        if (e->kind == PCK_FILTER) {
+            switch (dv) {
+            case 1:  g_cfg_psxDither = 1; g_cfg_textureFilter = 0; break;
+            case 2:  g_cfg_psxDither = 0; g_cfg_textureFilter = 1; break;
+            case 3:  g_cfg_psxDither = 0; g_cfg_textureFilter = 2; break;
+            case 4:  g_cfg_psxDither = 0; g_cfg_textureFilter = 3; g_cfg_anisoLevel = 2;  break;
+            case 5:  g_cfg_psxDither = 0; g_cfg_textureFilter = 3; g_cfg_anisoLevel = 4;  break;
+            case 6:  g_cfg_psxDither = 0; g_cfg_textureFilter = 3; g_cfg_anisoLevel = 8;  break;
+            case 7:  g_cfg_psxDither = 0; g_cfg_textureFilter = 3; g_cfg_anisoLevel = 16; break;
+            default: g_cfg_psxDither = 0; g_cfg_textureFilter = 0; break;
+            }
+            g_cfg_bilinearFiltering = (g_cfg_textureFilter > 0);
+        } else if (e->kind == PCK_VSYNC) {
+            PsyX_ApplyVsync(g_PcConfig.vsync);
+        } else if (e->kind == PCK_FLMODE) {
+            Pc_FlashlightModeApply(dv, 1);
+        } else if (e->live) {
+            *e->live = dv;
+        }
+    }
+}
+
+/* Restore every options-menu setting to its default, EXCLUDING resolution and
+ * window mode (skipped per-entry above). Iterates all four pages so the reset
+ * covers exactly what the menu exposes, nothing hidden. Persisted to
+ * config.cfg per key and applied live where the row supports it. */
+void Pc_Options_ResetToDefaults(void)
+{
+    extern const s_PcOpt* PcOpt_PageByIndex(int page, int* count);
+    int page, count, i;
+    for (page = 0; page < PCOPT_PAGE_COUNT; page++) {
+        const s_PcOpt* tbl = PcOpt_PageByIndex(page, &count);
+        for (i = 0; i < count; i++)
+            PcOpt_ResetEntry(&tbl[i]);
+    }
+    SH_DBG_ECHO("Settings reset to defaults (resolution and window mode kept).");
+}
+
+#ifdef SH_PC_PORT
+#include <SDL.h>
+#include "pc_confirm_dialog.h"
+#include "pc_bind_panel.h"
+
+/* Shared with the header draw: 1 while the reset dialog is up (label turns red). */
+int g_PcOptResetConfirmActive = 0;
+
+/* One-shot rising edge for a scancode (own small history so it never fights the
+ * game pad path). */
+static int PcOpt_KeyEdge(int sc)
+{
+    static unsigned char s_prev[SDL_NUM_SCANCODES];
+    const unsigned char* ks = SDL_GetKeyboardState(NULL);
+    int down = ks ? ks[sc] : 0;
+    int edge = down && !s_prev[sc];
+    s_prev[sc] = (unsigned char)down;
+    return edge;
+}
+
+/* "Reset settings to defaults?" Yes/No box. Drawn by the pc_confirm_dialog GL
+ * overlay (the achievement/randomizer panel style, composited after the PSX
+ * frame so nothing in the ordering table can draw over it). Returns 1 while the
+ * dialog owns input, so the caller blocks the normal menu handling. */
+/* Which action the open dialog is asking about. The box itself is generic; only
+ * the text and the Yes branch differ. */
+enum { PCOPT_CONFIRM_RESET = 0, PCOPT_CONFIRM_STORAGE };
+static int s_confirmAction = PCOPT_CONFIRM_RESET;
+
+#if defined(__ANDROID__)
+/* A marker in the working directory, read and deleted by SetupActivity on the
+ * next launch. Not JNI: by the time this runs the setup activity is gone, the
+ * choice cannot take effect until a restart anyway, and both sides already
+ * agree on this directory. */
+static void PcOpt_AskStorageNextLaunch(void)
+{
+    FILE* f = fopen(".ask_storage", "wb");
+
+    if (f != NULL) {
+        fclose(f);
+        SH_DBG_ECHO("Game data location will be asked on the next launch.");
+    } else {
+        SH_DBG_ECHO("Could not write .ask_storage - the data directory is not writable.");
+    }
+}
+#endif
+
+static int PcOpt_ResetConfirm_Run(void)
+{
+    const s_ControllerConfig* cfg = &g_GameWorkPtr->config.controllerConfig;
+    int left, right, confirm, cancel, res;
+
+    g_PcOptResetConfirmActive = Pc_ConfirmDialog_IsOpen();
+
+    if (!g_PcOptResetConfirmActive) {
+        if (PcOpt_KeyEdge(SDL_SCANCODE_R)) {
+            s_confirmAction = PCOPT_CONFIRM_RESET;
+            Pc_ConfirmDialog_Open("RESET SETTINGS", "Reset all PC options to their defaults?");
+            g_PcOptResetConfirmActive = 1;
+            Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+            return 1;
+        }
+        /* keep edge state fresh even when closed */
+        PcOpt_KeyEdge(SDL_SCANCODE_LEFT);
+        PcOpt_KeyEdge(SDL_SCANCODE_RIGHT);
+        PcOpt_KeyEdge(SDL_SCANCODE_RETURN);
+        PcOpt_KeyEdge(SDL_SCANCODE_ESCAPE);
+        return 0;
+    }
+
+    /* Keyboard edges OR the player's own pad bindings (the keyboard already
+     * feeds the pad flags too; a double hit is the same action in one frame). */
+    left    = PcOpt_KeyEdge(SDL_SCANCODE_LEFT) ||
+              (g_Controller0->pulsedBtnFlags & (ControllerFlag_DpadLeft | ControllerFlag_LStickLeft)) != 0;
+    right   = PcOpt_KeyEdge(SDL_SCANCODE_RIGHT) ||
+              (g_Controller0->pulsedBtnFlags & (ControllerFlag_DpadRight | ControllerFlag_LStickRight)) != 0;
+    confirm = PcOpt_KeyEdge(SDL_SCANCODE_RETURN) ||
+              (g_Controller0->clickedBtnFlags & cfg->enter) != 0;
+    cancel  = PcOpt_KeyEdge(SDL_SCANCODE_ESCAPE) || PcOpt_KeyEdge(SDL_SCANCODE_R) ||
+              (g_Controller0->clickedBtnFlags & cfg->cancel) != 0;
+
+    if (left || right)
+        Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+
+    res = Pc_ConfirmDialog_Update(left, right, confirm, cancel);
+    if (res == PC_CONFIRM_YES) {
+        Sd_PlaySfx(Sfx_MenuConfirm, 0, 64);
+#if defined(__ANDROID__)
+        if (s_confirmAction == PCOPT_CONFIRM_STORAGE)
+            PcOpt_AskStorageNextLaunch();
+        else
+#endif
+            Pc_Options_ResetToDefaults();
+    } else if (res == PC_CONFIRM_NO) {
+        Sd_PlaySfx(Sfx_MenuCancel, 0, 64);
+    }
+
+    /* Swallow this frame's pad presses so the menu underneath never sees the
+     * confirm/cancel that answered the dialog. */
+    g_Controller0->clickedBtnFlags = 0;
+    g_Controller0->pulsedBtnFlags  = 0;
+    return 1;
+}
+#endif
+
+void Options_PcOptionsMenu_Control(void)
+{
+    int            count;
+    const s_PcOpt* tbl = PcOpt_Page(&count);
+
+    Options_PcOptionsMenu_EntryStringsDraw();
+    Options_PcOptionsMenu_ConfigDraw();
+    Options_PcOptionsMenu_SelectionHighlightDraw();
+    Options_Menu_VignetteDraw();
+    Screen_BackgroundImgDraw(&g_ItemInspectionImg);
+    Pc_MouseCursor_Draw();
+
+    if (g_GameWork.gameStateSteps[0] != OptionsMenuState_PcOptions)
+        return;
+
+#ifdef SH_PC_PORT
+    if (PcOpt_ResetConfirm_Run())
+        return; /* dialog owns input this frame */
+#endif
+
+    if ((LINE_CURSOR_TIMER_MAX - 1) < g_Options_SelectionHighlightTimer)
+        g_Options_SelectionHighlightTimer = LINE_CURSOR_TIMER_MAX;
+    else
+        /* Advance by ELAPSED vblanks, not one per frame. This gates input until
+         * the highlight animation finishes, so on a slow device a fixed 8-frame
+         * animation became 8 * frame-time -- over a second before the next
+         * option could be selected. At 60fps g_VBlanks is 1 and this is
+         * identical to the original. */
+        g_Options_SelectionHighlightTimer += (g_VBlanks > 0) ? g_VBlanks : 1;
+
+    if (g_Options_SelectionHighlightTimer == LINE_CURSOR_TIMER_MAX)
+    {
+        const s_PcOpt* sel;
+
+        if (g_PcOptionsMenu_SelectedEntry >= count)
+            g_PcOptionsMenu_SelectedEntry = 0;
+        g_PcOptionsMenu_PrevSelectedEntry = g_PcOptionsMenu_SelectedEntry;
+
+        /* Mouse: hover selects (snapping, so the click that follows isn't
+         * swallowed by the highlight timer), click activates action rows /
+         * cycles value rows, wheel steps the hovered value, right-click backs
+         * out (via the cancel handler below). */
+        {
+            int mx, my;
+
+            /* Slider drag state. Holding the button on a slider row grabs it:
+             * the row is pinned (so the vertical wobble of a drag can't hover
+             * onto a neighbour) and pointer travel is accumulated into value
+             * steps. Right or up raises, left or down lowers, so either axis
+             * feels natural. Committed once on release — see
+             * PcOpt_SliderDragApply. */
+            static int s_dragRow  = -1;
+            static int s_dragX    = 0;
+            static int s_dragY    = 0;
+            static int s_dragMoved = 0;
+            const int  PCOPT_DRAG_PX_PER_STEP = 4;
+
+            if (Pc_MouseCursor_UiPos(&mx, &my))
+            {
+                int row = -1, i;
+
+                for (i = 0; i < count; i++) {
+                    int top = PCOPT_LINE_BASE_Y + (i * 16) - 3;
+                    if (my >= top && my < top + 16) { row = i; break; }
+                }
+
+                /* Start a drag when the button goes down on a slider row. */
+                if (s_dragRow < 0 && Pc_MouseCursor_LeftClicked() &&
+                    row >= 0 && row == g_PcOptionsMenu_SelectedEntry &&
+                    tbl[row].kind == PCK_SLIDER)
+                {
+                    s_dragRow   = row;
+                    s_dragX     = mx;
+                    s_dragY     = my;
+                    s_dragMoved = 0;
+                }
+
+                if (s_dragRow >= 0 && Pc_MouseCursor_LeftHeld() && s_dragRow < count)
+                {
+                    int travel = (mx - s_dragX) - (my - s_dragY);
+                    int steps  = travel / PCOPT_DRAG_PX_PER_STEP;
+
+                    if (steps != 0) {
+                        PcOpt_SliderDragApply(&tbl[s_dragRow], steps);
+                        /* Keep the remainder so slow drags still accumulate. */
+                        s_dragX += steps * PCOPT_DRAG_PX_PER_STEP;
+                        s_dragY -= steps * PCOPT_DRAG_PX_PER_STEP;
+                        s_dragMoved = 1;
+                    }
+                }
+                else if (s_dragRow >= 0)
+                {
+                    /* Released. A drag saves once; a click that never moved
+                     * keeps the old behaviour of nudging the value one step. */
+                    if (s_dragRow < count) {
+                        if (s_dragMoved) PcOpt_SliderDragCommit(&tbl[s_dragRow]);
+                        else             PcOpt_Adjust(&tbl[s_dragRow], 1);
+                    }
+                    s_dragRow = -1;
+                }
+
+                if (s_dragRow < 0 &&
+                    row >= 0 && Pc_MouseCursor_Moved() && row != g_PcOptionsMenu_SelectedEntry) {
+                    g_PcOptionsMenu_SelectedEntry     = row;
+                    g_PcOptionsMenu_PrevSelectedEntry = row;
+                    g_PcOptions_HighlightSnap         = 1;
+                    Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+                }
+                if (s_dragRow < 0 && row >= 0 && row == g_PcOptionsMenu_SelectedEntry) {
+                    int wheel = Pc_MouseCursor_WheelStep();
+
+                    if (tbl[row].kind >= PCK_NEXT) {
+                        if (Pc_MouseCursor_LeftClicked())
+                            PcMouse_InjectEnter();
+                    } else if (Pc_MouseCursor_LeftClicked() && tbl[row].kind != PCK_SLIDER) {
+                        PcMouse_InjectDir(1);
+                    } else if (wheel != 0) {
+                        PcMouse_InjectDir(wheel);
+                    }
+                }
+                if (Pc_MouseCursor_RightClicked())
+                    PcMouse_InjectCancel();
+            }
+            else if (s_dragRow >= 0)
+            {
+                /* Pointer left the viewport mid-drag — commit and let go. */
+                if (s_dragMoved && s_dragRow < count)
+                    PcOpt_SliderDragCommit(&tbl[s_dragRow]);
+                s_dragRow = -1;
+            }
+        }
+
+        if (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickUp) {
+            Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+            g_PcOptionsMenu_SelectedEntry = ((g_PcOptionsMenu_SelectedEntry - 1) + count) % count;
+            g_Options_SelectionHighlightTimer = 0;
+        }
+        if (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickDown) {
+            Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+            g_PcOptionsMenu_SelectedEntry = (g_PcOptionsMenu_SelectedEntry + 1) % count;
+            g_Options_SelectionHighlightTimer = 0;
+        }
+
+        /* L1 / R1 (LB / RB) jump to the previous / next PC-options page (wraps).
+         * clickedBtnFlags is the per-frame rising edge; keyboard L1=A / R1=D map to
+         * the same PSX bits, so this works on keyboard too. */
+        if (g_Controller0->clickedBtnFlags & ControllerFlag_R1) {
+            Sd_PlaySfx(Sfx_MenuConfirm, 0, 64);
+            g_PcOptionsMenu_Page = (g_PcOptionsMenu_Page + 1) % PCOPT_PAGE_COUNT;
+            g_PcOptionsMenu_SelectedEntry     = 0;
+            g_Options_SelectionHighlightTimer = 0;
+        }
+        if (g_Controller0->clickedBtnFlags & ControllerFlag_L1) {
+            Sd_PlaySfx(Sfx_MenuConfirm, 0, 64);
+            g_PcOptionsMenu_Page = (g_PcOptionsMenu_Page + PCOPT_PAGE_COUNT - 1) % PCOPT_PAGE_COUNT;
+            g_PcOptionsMenu_SelectedEntry     = 0;
+            g_Options_SelectionHighlightTimer = 0;
+        }
+
+        sel = &tbl[g_PcOptionsMenu_SelectedEntry];
+
+        /* Every value row (INT/RES/FILTER/WINMODE/VSYNC/SLIDER) adjusts on
+         * left/right; only the action rows (NEXT/PREV/BACK) are excluded. */
+        if (sel->kind < PCK_NEXT) {
+            if (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickRight) {
+                Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+                PcOpt_Adjust(sel, +1);
+            }
+            if (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickLeft) {
+                Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+                PcOpt_Adjust(sel, -1);
+            }
+        }
+
+        if (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.enter) {
+            if (sel->kind == PCK_NEXT) {
+                Sd_PlaySfx(Sfx_MenuConfirm, 0, 64);
+                g_PcOptionsMenu_Page++; /* Graphics -> System -> Controls -> Camera -> HUD */
+                g_PcOptionsMenu_SelectedEntry = 0;
+                g_Options_SelectionHighlightTimer = 0;
+            } else if (sel->kind == PCK_PREV) {
+                Sd_PlaySfx(Sfx_MenuConfirm, 0, 64);
+                g_PcOptionsMenu_Page--; /* HUD -> Camera -> Controls -> System -> Graphics */
+                g_PcOptionsMenu_SelectedEntry = 0;
+                g_Options_SelectionHighlightTimer = 0;
+#if defined(SH_IOS)
+            } else if (sel->kind == PCK_RESET) {
+                extern int  Ios_RestoreDefaultConfig(void);
+                extern void PcConfig_Load(const char* path);
+
+                if (Ios_RestoreDefaultConfig()) {
+                    PcConfig_Load("config.cfg");
+                    Sd_PlaySfx(Sfx_MenuConfirm, 0, 64);
+                } else {
+                    Sd_PlaySfx(Sfx_MenuCancel, 0, 64);
+                }
+                g_Options_SelectionHighlightTimer = 0;
+#endif
+#if defined(SH_IOS) || defined(__ANDROID__)
+            } else if (sel->kind == PCK_RALOGIN) {
+                /* Signed in already? Then this is the sign-out. Otherwise open
+                 * the native sheet -- a password field is not something the
+                 * game's own 2D screens can offer (no text input, no keyboard,
+                 * no masking), which is why this one row leaves the engine's UI
+                 * entirely. */
+                if (Pc_Ra_IsSignedIn()) {
+                    Pc_Ra_SignOut();
+                    Sd_PlaySfx(Sfx_MenuCancel, 0, 64);
+                } else {
+#if defined(__ANDROID__)
+                    /* Fire-and-forget: the dialog runs on the UI thread while
+                     * SDL keeps driving the game loop on this one. */
+                    extern void Android_ShowRetroAchievementsLogin(void);
+                    Android_ShowRetroAchievementsLogin();
+                    Sd_PlaySfx(Sfx_MenuConfirm, 0, 64);
+#else
+                    if (Ios_ShowRetroAchievementsLogin())
+                        Sd_PlaySfx(Sfx_MenuConfirm, 0, 64);
+                    else
+                        Sd_PlaySfx(Sfx_MenuCancel, 0, 64);
+#endif
+                }
+                g_Options_SelectionHighlightTimer = 0;
+#endif
+#if defined(__ANDROID__)
+            } else if (sel->kind == PCK_STORAGE) {
+                s_confirmAction = PCOPT_CONFIRM_STORAGE;
+                Pc_ConfirmDialog_Open("GAME DATA",
+                    "Pick a new location next time the game starts? Your files stay where they are.");
+                g_PcOptResetConfirmActive = 1;
+                Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+                g_Options_SelectionHighlightTimer = 0;
+#endif
+            } else if (sel->kind == PCK_BACK) {
+                Sd_PlaySfx(Sfx_MenuCancel, 0, 64);
+                ScreenFade_Start(true, false, false);
+                g_GameWork.gameStateSteps[0] = OptionsMenuState_LeavePcOptions;
+                g_SysWork.counters_1C[1]     = 0;
+                g_GameWork.gameStateSteps[1] = 0;
+                g_GameWork.gameStateSteps[2] = 0;
+                return;
+            }
+        }
+    }
+
+    if ((g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.cancel) &&
+        g_GameWork.gameStateSteps[0] != OptionsMenuState_LeavePcOptions)
+    {
+        Sd_PlaySfx(Sfx_MenuCancel, 0, 64);
+        ScreenFade_Start(true, false, false);
+        g_GameWork.gameStateSteps[0] = OptionsMenuState_LeavePcOptions;
+        g_SysWork.counters_1C[1]     = 0;
+        g_GameWork.gameStateSteps[1] = 0;
+        g_GameWork.gameStateSteps[2] = 0;
+    }
+}
+
+static void Options_PcOptionsMenu_EntryStringsDraw(void)
+{
+    #define LINE_BASE_X   64
+    #define LINE_BASE_Y   PCOPT_LINE_BASE_Y
+    #define LINE_OFFSET_Y 16
+
+    int            count, i;
+    const s_PcOpt* tbl = PcOpt_Page(&count);
+    DVECTOR        strPos  = { 100, 20 };
+#if defined(SH_IOS)
+    const char*    HEADING = "iOS_Options";
+#elif defined(__ANDROID__)
+    const char*    HEADING = "Android_Options";
+#else
+    const char*    HEADING = "PC_Options";
+#endif
+
+    /* Hold the centre "PC_Options" sits at, rather than its left edge. A longer
+     * heading -- "Android_Options" is 42px wider -- then grows both ways from
+     * where the short one was instead of sliding right off its own column. */
+    strPos.vx = 148 - (Pc_LangMenuTextWidth(HEADING) / 2);
+
+    Gfx_StringSetColor(StringColorId_White);
+    Gfx_StringSetPosition(strPos.vx, strPos.vy);
+    Gfx_Strings2dLayerIdxSet(8);
+    Gfx_StringDraw(HEADING, DEFAULT_MAP_MESSAGE_LENGTH);
+
+/* Neither mobile target: there is no keyboard to press R on, so the hint would
+ * advertise something unreachable. iOS has the Reset_Settings row on the
+ * Graphics page instead, which goes further -- it restores the config.cfg out
+ * of the signed bundle rather than resetting the values held in memory. */
+#if defined(SH_PC_PORT) && !defined(SH_IOS) && !defined(__ANDROID__)
+    /* Reset hint, top-right by the heading (same layer). Highlighted while the
+     * confirm dialog is up. Underscores render as spaces: "[R] Reset".
+     *
+     * Hidden on both mobile targets for the same reason: there is no keyboard
+     * to press R on, so it advertises something the player cannot do. */
+    {
+        extern int g_PcOptResetConfirmActive;
+        Gfx_StringSetColor(g_PcOptResetConfirmActive ? StringColorId_Red : StringColorId_White);
+        Gfx_StringSetPosition(232, strPos.vy);
+        Gfx_Strings2dLayerIdxSet(8);
+        Gfx_StringDraw("[R]_Reset", DEFAULT_MAP_MESSAGE_LENGTH);
+        Gfx_StringSetColor(StringColorId_White);
+    }
+#endif
+
+    for (i = 0; i < count; i++) {
+        Gfx_StringSetPosition(LINE_BASE_X, LINE_BASE_Y + (i * LINE_OFFSET_Y));
+        Gfx_Strings2dLayerIdxSet(8);
+        Gfx_StringDraw(tbl[i].name, DEFAULT_MAP_MESSAGE_LENGTH);
+    }
+    Gfx_StringsReset2dLayerIdx();
+
+    #undef LINE_BASE_X
+    #undef LINE_BASE_Y
+    #undef LINE_OFFSET_Y
+}
+
+static void Options_PcOptionsMenu_ConfigDraw(void)
+{
+    #define LINE_BASE_X   64
+    #define LINE_BASE_Y   PCOPT_LINE_BASE_Y
+    #define LINE_OFFSET_Y 16
+
+    int            count, i;
+    const s_PcOpt* tbl = PcOpt_Page(&count);
+    char           buf[24];
+    /* Value column: clear of the widest row name on THIS page, measured, rather
+     * than a constant per page. Three things move it that a constant cannot
+     * follow — the mobile builds compile rows out, a translated name is not the
+     * width of the English one, and Touch_Controls' three-way values are wider
+     * than the On/Off the Controls page was measured for. Clamped at both ends
+     * so a page of short names keeps the old look and a long one still leaves
+     * its widest value inside the 320px clip. */
+    int            valX = PcOpt_ValueColumnX(tbl, count);
+
+    Gfx_StringSetColor(StringColorId_White);
+    for (i = 0; i < count; i++) {
+        const char* v = PcOpt_ValueLabel(&tbl[i], buf, sizeof(buf));
+        if (v && v[0]) {
+            Gfx_StringSetPosition(valX, LINE_BASE_Y + (i * LINE_OFFSET_Y));
+            Gfx_Strings2dLayerIdxSet(8);
+            Gfx_StringDraw(v, DEFAULT_MAP_MESSAGE_LENGTH);
+        }
+    }
+
+    Gfx_StringsReset2dLayerIdx();
+
+    #undef LINE_BASE_X
+    #undef LINE_BASE_Y
+    #undef LINE_OFFSET_Y
+}
+
+static void Options_PcOptionsMenu_SelectionHighlightDraw(void)
+{
+    #define LINE_OFFSET_Y      16
+    #define HIGHLIGHT_OFFSET_X -121
+    /* 58 + 16: the rows moved up one line (PCOPT_LINE_BASE_Y 56 -> 40), and this
+     * space measures DOWN from the row, so it grows by the same 16. */
+    #define HIGHLIGHT_OFFSET_Y 74
+    #define HILITE_WIDTH       196
+
+    int            count, i, j;
+    s16            interpAlpha;
+    s_Line2d       highlightLine;
+    s_Quad2d       bulletQuads[2];
+    DVECTOR*       quadVerts;
+    static DVECTOR selectionHighlightFrom;
+    static DVECTOR selectionHighlightTo;
+
+    /* Bullet quads, likewise lifted 16 to follow PCOPT_LINE_BASE_Y. */
+    const DVECTOR BULLET_QUAD_VERTS_FRONT[] = { { -120, -71 }, { -120, -59 }, { -108, -71 }, { -108, -59 } };
+    const DVECTOR BULLET_QUAD_VERTS_BACK[]  = { { -121, -72 }, { -121, -58 }, { -107, -72 }, { -107, -58 } };
+
+    const s_PcOpt* tbl = PcOpt_Page(&count);
+    (void)tbl;
+
+    if (g_Options_SelectionHighlightTimer == 0 || g_PcOptions_HighlightSnap) {
+        g_PcOptions_HighlightSnap = 0;
+        selectionHighlightFrom.vx = HILITE_WIDTH + (65536 + HIGHLIGHT_OFFSET_X);
+        selectionHighlightFrom.vy = ((u16)g_PcOptionsMenu_PrevSelectedEntry * LINE_OFFSET_Y) - HIGHLIGHT_OFFSET_Y;
+        selectionHighlightTo.vx   = HILITE_WIDTH + (65536 + HIGHLIGHT_OFFSET_X);
+        selectionHighlightTo.vy   = ((u16)g_PcOptionsMenu_SelectedEntry * LINE_OFFSET_Y) - HIGHLIGHT_OFFSET_Y;
+    }
+
+    interpAlpha = Math_Sin(g_Options_SelectionHighlightTimer << 7);
+
+    highlightLine.vertex0.vx = HIGHLIGHT_OFFSET_X;
+    highlightLine.vertex1.vx = selectionHighlightFrom.vx +
+                               FP_FROM((selectionHighlightTo.vx - selectionHighlightFrom.vx) * interpAlpha, Q12_SHIFT);
+    highlightLine.vertex1.vy = selectionHighlightFrom.vy +
+                               FP_FROM((selectionHighlightTo.vy - selectionHighlightFrom.vy) * interpAlpha, Q12_SHIFT) +
+                               LINE_OFFSET_Y;
+    highlightLine.vertex0.vy = highlightLine.vertex1.vy;
+    Options_Selection_HighlightDraw(&highlightLine, true, false);
+
+    for (i = 0; i < count; i++) {
+        int line = i;
+        quadVerts = (DVECTOR*)&bulletQuads;
+        for (j = 0; j < RECT_VERT_COUNT; j++) {
+            quadVerts[j].vx                   = BULLET_QUAD_VERTS_FRONT[j].vx;
+            quadVerts[j].vy                   = BULLET_QUAD_VERTS_FRONT[j].vy + (line * LINE_OFFSET_Y);
+            quadVerts[j + sizeof(DVECTOR)].vx = BULLET_QUAD_VERTS_BACK[j].vx;
+            quadVerts[j + sizeof(DVECTOR)].vy = BULLET_QUAD_VERTS_BACK[j].vy + (line * LINE_OFFSET_Y);
+        }
+        if (i == g_PcOptionsMenu_SelectedEntry) {
+            Options_Selection_BulletPointDraw(&bulletQuads[0], false, false);
+            Options_Selection_BulletPointDraw(&bulletQuads[1], true,  false);
+        } else {
+            Options_Selection_BulletPointDraw(&bulletQuads[0], false, true);
+            Options_Selection_BulletPointDraw(&bulletQuads[1], true,  true);
+        }
+    }
+
+    #undef LINE_OFFSET_Y
+    #undef HIGHLIGHT_OFFSET_X
+    #undef HIGHLIGHT_OFFSET_Y
+    #undef HILITE_WIDTH
+}
+#endif /* SH_PC_PORT */
+
+void GameState_Options_Update(void) // 0x801E2D44
+{
+    s32 unlockedOptFlags;
+    s32 i;
+
+    if (g_GameWork.gameStatePrev == GameState_InGame)
+    {
+        func_800363D0();
+    }
+
+    if (g_GameWork.gameStatePrev != GameState_MainMenu)
+    {
+        Game_TimerUpdate();
+    }
+
+    // Handle options menu state.
+    switch (g_GameWork.gameStateSteps[0])
+    {
+        case OptionsMenuState_EnterMainOptions:
+            DrawSync(SyncMode_Wait);
+
+            if (g_GameWork.gameStatePrev != GameState_InGame)
+            {
+                VSync(SyncMode_Wait8);
+            }
+
+            g_GameWork.background2dColor.r = 0;
+            g_GameWork.background2dColor.g = 0;
+            g_GameWork.background2dColor.b = 0;
+
+            ScreenFade_Start(false, true, false);
+            g_IntervalVBlanks   = 1;
+
+            if (g_GameWork.gameStatePrev == GameState_InGame)
+            {
+                Game_RadioSoundStop();
+            }
+
+            g_MainOptionsMenu_SelectedEntry      = MainOptionsMenuEntry_Exit;
+            g_MainOptionsMenu_PrevSelectedEntry  = 0;
+            g_ExtraOptionsMenu_SelectedEntry     = 0;
+            g_ExtraOptionsMenu_PrevSelectedEntry = 0;
+            g_Options_SelectionHighlightTimer    = 0;
+            g_ExtraOptionsMenu_BulletMultMax     = 1;
+            unlockedOptFlags                     = g_GameWork.config.extraOptionsEnabled;
+
+            // Set available bullet multiplier.
+            for (i = 0; i < 5; i++)
+            {
+                if (unlockedOptFlags & (1 << i))
+                {
+                    g_ExtraOptionsMenu_BulletMultMax++;
+                }
+            }
+
+            // Set selected blood color.
+            switch (g_GameWork.config.extraBloodColor)
+            {
+                case BloodColor_Normal:
+                    g_ExtraOptionsMenu_SelectedBloodColorEntry = BloodColorMenuEntry_Normal;
+                    break;
+
+                case BloodColor_Green:
+                    g_ExtraOptionsMenu_SelectedBloodColorEntry = BloodColorMenuEntry_Green;
+                    break;
+
+                case BloodColor_Violet:
+                    g_ExtraOptionsMenu_SelectedBloodColorEntry = BloodColorMenuEntry_Violet;
+                    break;
+
+                case BloodColor_Black:
+                    g_ExtraOptionsMenu_SelectedBloodColorEntry = BloodColorMenuEntry_Black;
+                    break;
+            }
+
+            g_ExtraOptionsMenu_EntryCount = (g_GameWork.config.extraOptionsEnabled) ? 8 : 6;
+            g_GameWork.gameStateSteps[0]  = OptionsMenuState_MainOptions;
+            g_SysWork.counters_1C[1]              = 0;
+            g_GameWork.gameStateSteps[1]  = 0;
+            g_GameWork.gameStateSteps[2]  = 0;
+            break;
+
+        case OptionsMenuState_LeaveScreenPos:
+        case OptionsMenuState_LeaveBrightness:
+        case OptionsMenuState_LeaveController:
+            g_GameWork.gameStateSteps[0] = OptionsMenuState_MainOptions;
+            g_SysWork.counters_1C[1]              = 0;
+            g_GameWork.gameStateSteps[1] = 0;
+            g_GameWork.gameStateSteps[2] = 0;
+            break;
+
+        case OptionsMenuState_EnterScreenPos:
+            if (ScreenFade_IsFinished())
+            {
+                g_GameWork.gameStateSteps[0] = OptionsMenuState_ScreenPos;
+                g_SysWork.counters_1C[1]              = 0;
+                g_GameWork.gameStateSteps[1] = 0;
+                g_GameWork.gameStateSteps[2] = 0;
+            }
+            break;
+
+        case OptionsMenuState_ScreenPos:
+            Options_ScreenPosMenu_Control();
+            break;
+
+        case OptionsMenuState_EnterBrightness:
+            if (ScreenFade_IsFinished())
+            {
+                Fs_QueueWaitForEmpty();
+
+                g_GameWork.gameStateSteps[0] = OptionsMenuState_Brightness;
+                g_GameWork.gameStateSteps[0] = OptionsMenuState_Brightness;
+                g_SysWork.counters_1C[1]              = 0;
+                g_GameWork.gameStateSteps[1] = 0;
+                g_GameWork.gameStateSteps[2] = 0;
+            }
+            break;
+
+        case OptionsMenuState_Brightness:
+            Options_BrightnessMenu_Control();
+            break;
+
+        case OptionsMenuState_EnterController:
+            // Switch to controller binding menu.
+            if (ScreenFade_IsFinished())
+            {
+                g_GameWork.gameStateSteps[0] = OptionsMenuState_Controller;
+                g_GameWork.gameStateSteps[0] = OptionsMenuState_Controller;
+                g_SysWork.counters_1C[1]              = 0;
+                g_GameWork.gameStateSteps[1] = 0;
+                g_GameWork.gameStateSteps[2] = 0;
+            }
+            break;
+
+        case OptionsMenuState_Controller:
+            Options_ControllerMenu_Control();
+            break;
+
+        case OptionsMenuState_Leave:
+            ScreenFade_Start(true, false, false);
+            g_GameWork.gameStateSteps[0] = OptionsMenuState_LeaveMainOptions;
+            g_SysWork.counters_1C[1]              = 0;
+            g_GameWork.gameStateSteps[1] = 0;
+            g_GameWork.gameStateSteps[2] = 0;
+            break;
+
+        case OptionsMenuState_LeaveMainOptions:
+            if (ScreenFade_IsFinished())
+            {
+                // TODO: Likely `Game_StateSetPrevious` inline, but `gameState`/`gameStatePrev` loads inside are switched?
+
+                e_GameState prevGameState = g_GameWork.gameStatePrev;
+                e_GameState gameState     = g_GameWork.gameState;
+
+                g_SysWork.counters_1C[0]              = 0;
+                g_SysWork.counters_1C[1]              = 0;
+                g_GameWork.gameStateSteps[1] = 0;
+                g_GameWork.gameStateSteps[2] = 0;
+
+                SysWork_StateSetNext(SysState_Gameplay);
+
+                g_GameWork.gameStateSteps[0] = gameState;
+                g_GameWork.gameState         = prevGameState;
+                g_GameWork.gameStatePrev     = gameState;
+                g_GameWork.gameStateSteps[0] = OptionsMenuState_EnterMainOptions;
+            }
+
+            break;
+
+        case OptionsMenuState_EnterExtraOptions:
+            if (ScreenFade_IsFinished())
+            {
+                g_GameWork.gameStateSteps[0] = OptionsMenuState_ExtraOptions;
+                g_SysWork.counters_1C[1]                = 0;
+                ScreenFade_Start(false, true, false);
+                g_GameWork.gameStateSteps[1]      = 0;
+                g_GameWork.gameStateSteps[2]      = 0;
+                g_Options_SelectionHighlightTimer = 0;
+            }
+            break;
+
+        case OptionsMenuState_LeaveExtraOptions:
+            if (ScreenFade_IsFinished())
+            {
+                g_GameWork.gameStateSteps[0] = OptionsMenuState_EnterMainOptions;
+                g_SysWork.counters_1C[1]              = 0;
+                g_GameWork.gameStateSteps[1] = 0;
+                g_GameWork.gameStateSteps[2] = 0;
+                ScreenFade_Start(false, true, false);
+            }
+            break;
+
+#ifdef SH_PC_PORT
+        case OptionsMenuState_EnterPcOptions:
+            if (ScreenFade_IsFinished())
+            {
+                g_PcOptionsMenu_Page              = 0;
+                g_PcOptionsMenu_SelectedEntry     = 0;
+                g_PcOptionsMenu_PrevSelectedEntry = 0;
+                g_Options_SelectionHighlightTimer = 0;
+                ScreenFade_Start(false, true, false);
+                g_GameWork.gameStateSteps[0] = OptionsMenuState_PcOptions;
+                g_SysWork.counters_1C[1]     = 0;
+                g_GameWork.gameStateSteps[1] = 0;
+                g_GameWork.gameStateSteps[2] = 0;
+            }
+            break;
+
+        case OptionsMenuState_LeavePcOptions:
+            if (ScreenFade_IsFinished())
+            {
+                g_GameWork.gameStateSteps[0] = OptionsMenuState_EnterMainOptions;
+                g_SysWork.counters_1C[1]     = 0;
+                g_GameWork.gameStateSteps[1] = 0;
+                g_GameWork.gameStateSteps[2] = 0;
+                ScreenFade_Start(false, true, false);
+            }
+            break;
+#endif
+    }
+
+    // Handle menu state.
+    switch (g_GameWork.gameStateSteps[0])
+    {
+        case OptionsMenuState_MainOptions:
+        case OptionsMenuState_Leave:
+        case OptionsMenuState_LeaveMainOptions:
+        case OptionsMenuState_EnterScreenPos:
+        case OptionsMenuState_EnterBrightness:
+        case OptionsMenuState_EnterController:
+        case OptionsMenuState_EnterExtraOptions:
+#ifdef SH_PC_PORT
+        case OptionsMenuState_EnterPcOptions:
+#endif
+            Options_MainOptionsMenu_Control();
+            break;
+
+        case OptionsMenuState_ExtraOptions:
+        case OptionsMenuState_LeaveExtraOptions:
+            Options_ExtraOptionsMenu_Control();
+            break;
+
+#ifdef SH_PC_PORT
+        case OptionsMenuState_PcOptions:
+        case OptionsMenuState_LeavePcOptions:
+            Options_PcOptionsMenu_Control();
+            break;
+#endif
+    }
+}
+
+void Options_ExtraOptionsMenu_Control(void) // 0x801E318C
+{
+    Options_ExtraOptionsMenu_EntryStringsDraw();
+    Options_ExtraOptionsMenu_ConfigDraw();
+    Options_ExtraOptionsMenu_SelectionHighlightDraw();
+    Options_Menu_VignetteDraw();
+    Screen_BackgroundImgDraw(&g_ItemInspectionImg);
+#ifdef SH_PC_PORT
+    Pc_MouseCursor_Draw();
+#endif
+
+    if (g_GameWork.gameStateSteps[0] != OptionsMenuState_ExtraOptions)
+    {
+        return;
+    }
+
+    // Increment line move timer.
+    if ((LINE_CURSOR_TIMER_MAX - 1) < g_Options_SelectionHighlightTimer)
+    {
+        g_Options_SelectionHighlightTimer = LINE_CURSOR_TIMER_MAX;
+    }
+    else
+    {
+        /* Advance by ELAPSED vblanks, not one per frame. This gates input until
+         * the highlight animation finishes, so on a slow device a fixed 8-frame
+         * animation became 8 * frame-time -- over a second before the next
+         * option could be selected. At 60fps g_VBlanks is 1 and this is
+         * identical to the original. */
+        g_Options_SelectionHighlightTimer += (g_VBlanks > 0) ? g_VBlanks : 1;
+    }
+
+    if (g_Options_SelectionHighlightTimer == LINE_CURSOR_TIMER_MAX)
+    {
+        g_ExtraOptionsMenu_PrevSelectedEntry = g_ExtraOptionsMenu_SelectedEntry;
+
+#ifdef SH_PC_PORT
+        /* Mouse: hover selects (snapping), click / wheel cycles the value
+         * (every row here is a value row), right-click backs out via the
+         * cancel handler at the bottom. Rows start at y=64 on this screen. */
+        {
+            int mx, my;
+
+            if (Pc_MouseCursor_UiPos(&mx, &my))
+            {
+                s32 row = -1;
+                s32 i;
+
+                for (i = 0; i < g_ExtraOptionsMenu_EntryCount; i++)
+                {
+                    s32 top = 64 + (i * 16) - 3;
+                    if (my >= top && my < top + 16) { row = i; break; }
+                }
+
+                if (row >= 0 && Pc_MouseCursor_Moved() && row != g_ExtraOptionsMenu_SelectedEntry)
+                {
+                    g_ExtraOptionsMenu_SelectedEntry     = row;
+                    g_ExtraOptionsMenu_PrevSelectedEntry = row;
+                    g_PcOptions_HighlightSnap            = 1;
+                    Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+                }
+                if (row >= 0 && row == g_ExtraOptionsMenu_SelectedEntry)
+                {
+                    int wheel = Pc_MouseCursor_WheelStep();
+
+                    if (Pc_MouseCursor_LeftClicked())
+                        PcMouse_InjectDir(1);
+                    else if (wheel != 0)
+                        PcMouse_InjectDir(wheel);
+                }
+                if (Pc_MouseCursor_RightClicked())
+                    PcMouse_InjectCancel();
+            }
+        }
+#endif
+
+        // Leave to gameplay (if options menu was accessed with `Option` input action).
+        if (g_GameWork.gameStatePrev == GameState_InGame &&
+            !(g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.enter) &&
+            (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.option))
+        {
+            Sd_PlaySfx(Sfx_MenuCancel, 0, 64);
+
+            g_GameWork.gameStateSteps[0] = OptionsMenuState_Leave;
+            g_SysWork.counters_1C[1]              = 0;
+            g_GameWork.gameStateSteps[1] = 0;
+            g_GameWork.gameStateSteps[2] = 0;
+            return;
+        }
+
+        // Move selection cursor up/down.
+        if (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickUp)
+        {
+            s32 var = 1;
+            Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+            g_ExtraOptionsMenu_SelectedEntry  = ((g_ExtraOptionsMenu_SelectedEntry - var) + g_ExtraOptionsMenu_EntryCount) % g_ExtraOptionsMenu_EntryCount;
+            g_Options_SelectionHighlightTimer = 0;
+        }
+        if (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickDown)
+        {
+            Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+            g_ExtraOptionsMenu_SelectedEntry++;
+            g_ExtraOptionsMenu_SelectedEntry  = g_ExtraOptionsMenu_SelectedEntry % g_ExtraOptionsMenu_EntryCount;
+            g_Options_SelectionHighlightTimer = 0;
+        }
+
+        // Handle config change.
+        switch (g_ExtraOptionsMenu_SelectedEntry)
+        {
+            case ExtraOptionsMenuEntry_WeaponCtrl:
+                // Scroll left/right.
+                if (g_Controller0->clickedBtnFlags & (ControllerFlag_LStickRight | ControllerFlag_LStickLeft))
+                {
+                    Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+                    g_GameWork.config.extraWeaponCtrl = !g_GameWork.config.extraWeaponCtrl;
+                }
+                break;
+
+            case ExtraOptionsMenuEntry_Blood:
+                // Scroll left/right.
+                if (g_Controller0->clickedBtnFlags & ControllerFlag_LStickRight)
+                {
+                    Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+                    g_ExtraOptionsMenu_SelectedBloodColorEntry++;
+                }
+                if (g_Controller0->clickedBtnFlags & ControllerFlag_LStickLeft)
+                {
+                    Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+                    g_ExtraOptionsMenu_SelectedBloodColorEntry += 3;
+                }
+
+                // Set config.
+                g_ExtraOptionsMenu_SelectedBloodColorEntry = g_ExtraOptionsMenu_SelectedBloodColorEntry % BloodColorMenuEntry_Count;
+                switch (g_ExtraOptionsMenu_SelectedBloodColorEntry)
+                {
+                    case BloodColorMenuEntry_Normal:
+                        g_GameWork.config.extraBloodColor = BloodColor_Normal;
+                        break;
+
+                    case BloodColorMenuEntry_Green:
+                        g_GameWork.config.extraBloodColor = BloodColor_Green;
+                        break;
+
+                    case BloodColorMenuEntry_Violet:
+                        g_GameWork.config.extraBloodColor = BloodColor_Violet;
+                        break;
+
+                    case BloodColorMenuEntry_Black:
+                        g_GameWork.config.extraBloodColor = BloodColor_Black;
+                        break;
+                }
+#ifdef SH_PC_PORT
+                /* Mirror the legit blood-color choice so Map_EffectTexturesLoad
+                 * can restore it after per-map corruption (#41). */
+                {
+                    extern unsigned char g_PcTrustedBloodColor;
+                    g_PcTrustedBloodColor = (unsigned char)g_GameWork.config.extraBloodColor;
+                }
+#endif
+                break;
+
+            case ExtraOptionsMenuEntry_ViewCtrl:
+                // Scroll left/right.
+                if (g_Controller0->clickedBtnFlags & (ControllerFlag_LStickRight | ControllerFlag_LStickLeft))
+                {
+                    Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+
+                    // Set config.
+                    g_GameWork.config.extraViewCtrl = !g_GameWork.config.extraViewCtrl;
+                }
+                break;
+
+            case ExtraOptionsMenuEntry_RetreatTurn:
+                // Scroll left/right.
+                if (g_Controller0->clickedBtnFlags & (ControllerFlag_LStickRight | ControllerFlag_LStickLeft))
+                {
+                    Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+
+                    // Set config.
+                    g_GameWork.config.extraRetreatTurn = (s8)g_GameWork.config.extraRetreatTurn == 0;
+                }
+                break;
+
+            case ExtraOptionsMenuEntry_MovementCtrl:
+                // Scroll left/right.
+                if (g_Controller0->clickedBtnFlags & (ControllerFlag_LStickRight | ControllerFlag_LStickLeft))
+                {
+                    Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+
+                    // Set config.
+                    g_GameWork.config.extraWalkRunCtrl = (s8)g_GameWork.config.extraWalkRunCtrl == 0;
+                }
+                break;
+
+            case ExtraOptionsMenuEntry_AutoAiming:
+                // Scroll left/right.
+                if (g_Controller0->clickedBtnFlags & (ControllerFlag_LStickRight | ControllerFlag_LStickLeft))
+                {
+                    Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+
+                    // Set config.
+                    g_GameWork.config.extraAutoAiming = (s8)g_GameWork.config.extraAutoAiming == 0;
+                }
+                break;
+
+            case ExtraOptionsMenuEntry_ViewMode:
+                // Scroll left/right.
+                if (g_Controller0->clickedBtnFlags & (ControllerFlag_LStickRight | ControllerFlag_LStickLeft))
+                {
+                    Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+
+                    // Set config.
+                    g_GameWork.config.extraViewMode = !g_GameWork.config.extraViewMode;
+                }
+                break;
+
+            case ExtraOptionsMenuEntry_BulletMult:
+                // Scroll left/right.
+                if (g_Controller0->clickedBtnFlags & ControllerFlag_LStickRight)
+                {
+                    Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+
+                    // Set config.
+                    g_GameWork.config.extraBulletAdjust++;
+                }
+                if (g_Controller0->clickedBtnFlags & ControllerFlag_LStickLeft)
+                {
+                    Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+
+                    // Set config.
+                    g_GameWork.config.extraBulletAdjust = g_GameWork.config.extraBulletAdjust + (g_ExtraOptionsMenu_BulletMultMax - 1);
+                }
+                g_GameWork.config.extraBulletAdjust = g_GameWork.config.extraBulletAdjust % g_ExtraOptionsMenu_BulletMultMax;
+                break;
+        }
+    }
+
+    // Leave menu.
+    if ((g_Controller0->clickedBtnFlags & (g_GameWorkPtr->config.controllerConfig.cancel |
+                                          (ControllerFlag_L2 | ControllerFlag_R2 |
+                                           ControllerFlag_L1 | ControllerFlag_R1))) &&
+        g_GameWork.gameStateSteps[0] != OptionsMenuState_LeaveExtraOptions)
+    {
+        if (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.cancel)
+        {
+            Sd_PlaySfx(Sfx_MenuCancel, 0, 64);
+        }
+        else
+        {
+            Sd_PlaySfx(Sfx_MenuConfirm, 0, 64);
+        }
+
+        ScreenFade_Start(true, false, false);
+        g_GameWork.gameStateSteps[0] = OptionsMenuState_LeaveExtraOptions;
+        g_SysWork.counters_1C[1]              = 0;
+        g_GameWork.gameStateSteps[1] = 0;
+        g_GameWork.gameStateSteps[2] = 0;
+    }
+}
+
+void Options_MainOptionsMenu_Control(void) // 0x801E3770
+{
+    #define SOUND_VOL_STEP 8
+
+    s32 audioType;
+    s32 vol;
+
+    // Draw graphics.
+    Options_MainOptionsMenu_EntryStringsDraw();
+    Options_MainOptionsMenu_ConfigDraw();
+    Options_MainOptionsMenu_SelectionHighlightDraw();
+    Options_Menu_VignetteDraw();
+    Screen_BackgroundImgDraw(&g_ItemInspectionImg);
+    Options_MainOptionsMenu_BgmVolumeBarDraw();
+    Options_MainOptionsMenu_SfxVolumeBarDraw();
+#ifdef SH_PC_PORT
+    Options_MainOptionsMenu_FmvVolumeBarDraw();
+    Pc_MouseCursor_Draw();
+#endif
+
+    if (g_GameWork.gameStateSteps[0] != OptionsMenuState_MainOptions)
+    {
+        return;
+    }
+
+    // Increment line move timer.
+    if ((LINE_CURSOR_TIMER_MAX - 1) < g_Options_SelectionHighlightTimer)
+    {
+        g_Options_SelectionHighlightTimer = LINE_CURSOR_TIMER_MAX;
+    }
+    else
+    {
+        /* Advance by ELAPSED vblanks, not one per frame. This gates input until
+         * the highlight animation finishes, so on a slow device a fixed 8-frame
+         * animation became 8 * frame-time -- over a second before the next
+         * option could be selected. At 60fps g_VBlanks is 1 and this is
+         * identical to the original. */
+        g_Options_SelectionHighlightTimer += (g_VBlanks > 0) ? g_VBlanks : 1;
+    }
+
+    if (g_Options_SelectionHighlightTimer != LINE_CURSOR_TIMER_MAX)
+    {
+        return;
+    }
+
+    g_MainOptionsMenu_PrevSelectedEntry = g_MainOptionsMenu_SelectedEntry;
+
+#ifdef SH_PC_PORT
+    /* Mouse: hover selects (snapping past the highlight timer so the follow-up
+     * click isn't swallowed), click enters the submenu rows / cycles the value
+     * rows, click-drag on a volume bar walks the volume to the pointed notch
+     * (one stock step per frame, so the game's clamp + SFX stay in charge),
+     * wheel steps the hovered value, right-click = cancel. */
+    {
+        int mx, my;
+
+        if (Pc_MouseCursor_UiPos(&mx, &my))
+        {
+            s32 row = -1;
+            s32 i;
+
+            for (i = 0; i < MainOptionsMenuEntry_Count; i++)
+            {
+                s32 top = 56 + (i * 16) - 3;
+                if (my >= top && my < top + 16) { row = i; break; }
+            }
+
+            if (row >= 0 && Pc_MouseCursor_Moved() && row != g_MainOptionsMenu_SelectedEntry)
+            {
+                g_MainOptionsMenu_SelectedEntry     = row;
+                g_MainOptionsMenu_PrevSelectedEntry = row;
+                g_PcOptions_HighlightSnap           = 1;
+                Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+            }
+
+            if (row >= 0 && row == g_MainOptionsMenu_SelectedEntry)
+            {
+                int wheel = Pc_MouseCursor_WheelStep();
+
+                if (row <= MainOptionsMenuEntry_ScreenPosition ||
+                    (row == MainOptionsMenuEntry_AutoLoad && Pc_ExitToMenuRowActive()))
+                {
+                    /* Exit / Brightness / Controller / PC Options, plus the
+                     * in-game Exit to Menu row -- all activate on Confirm
+                     * rather than cycling a value with left/right. */
+                    if (Pc_MouseCursor_LeftClicked())
+                        PcMouse_InjectEnter();
+                }
+                else if (row >= MainOptionsMenuEntry_BgmVolume)
+                {
+                    /* Volume bars: notches at authored x (184 + DX) + n*6,
+                     * n = 0..15; just left of the bar drags the volume to
+                     * zero. Origin tracks the OPT_VOLUME_BAR_DX bar nudge. */
+                    if (Pc_MouseCursor_LeftHeld() && mx >= 174 + OPT_VOLUME_BAR_DX)
+                    {
+                        extern float g_PcXaVolume;
+                        s32 barX0 = 184 + OPT_VOLUME_BAR_DX;
+                        s32 curVol =
+                            (row == MainOptionsMenuEntry_BgmVolume) ? g_GameWork.config.volumeBgm :
+                            (row == MainOptionsMenuEntry_SfxVolume) ? g_GameWork.config.volumeSe  :
+                            CLAMP((s32)((g_PcXaVolume * (float)OPT_SOUND_VOLUME_MAX) + 0.5f), 0, OPT_SOUND_VOLUME_MAX);
+                        s32 lit = (mx < barX0) ? 0 : CLAMP(((mx - barX0) / 6) + 1, 1, 16);
+
+                        if (lit > curVol / 8)
+                            PcMouse_InjectDir(1);
+                        else if (lit < curVol / 8)
+                            PcMouse_InjectDir(-1);
+                    }
+                    else if (wheel != 0)
+                    {
+                        PcMouse_InjectDir(wheel);
+                    }
+                }
+                else if (Pc_MouseCursor_LeftClicked())
+                {
+                    /* Vibration / Auto Load (Language) / Sound toggles. */
+                    PcMouse_InjectDir(1);
+                }
+                else if (wheel != 0)
+                {
+                    PcMouse_InjectDir(wheel);
+                }
+            }
+
+            if (Pc_MouseCursor_RightClicked())
+                PcMouse_InjectCancel();
+        }
+    }
+#endif
+
+    // Leave to gameplay (if options menu was accessed with `Option` input action).
+    if (g_GameWork.gameStatePrev == GameState_InGame &&
+        !(g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.enter) &&
+        (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.option))
+    {
+        Sd_PlaySfx(Sfx_MenuCancel, 0, 64);
+
+        g_GameWork.gameStateSteps[0] = OptionsMenuState_Leave;
+        g_SysWork.counters_1C[1]              = 0;
+        g_GameWork.gameStateSteps[1] = 0;
+        g_GameWork.gameStateSteps[2] = 0;
+        return;
+    }
+
+    // Move selection cursor up/down.
+    if (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickUp)
+    {
+        Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+
+        g_Options_SelectionHighlightTimer = 0;
+        g_MainOptionsMenu_SelectedEntry   = (g_MainOptionsMenu_SelectedEntry + (MainOptionsMenuEntry_Count - 1)) % MainOptionsMenuEntry_Count;
+    }
+    if (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickDown)
+    {
+        Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+
+        g_Options_SelectionHighlightTimer = 0;
+        g_MainOptionsMenu_SelectedEntry   = (g_MainOptionsMenu_SelectedEntry + 1) % MainOptionsMenuEntry_Count;
+    }
+
+    // Handle config change.
+    switch (g_MainOptionsMenu_SelectedEntry)
+    {
+        case MainOptionsMenuEntry_Exit:
+            // Exit menu to gameplay.
+            if (g_Controller0->clickedBtnFlags & (g_GameWorkPtr->config.controllerConfig.enter |
+                                                 g_GameWorkPtr->config.controllerConfig.cancel))
+            {
+                Sd_PlaySfx(Sfx_MenuCancel, 0, 64);
+
+                g_GameWork.gameStateSteps[0] = OptionsMenuState_Leave;
+                g_SysWork.counters_1C[1]              = 0;
+                g_GameWork.gameStateSteps[1] = 0;
+                g_GameWork.gameStateSteps[2] = 0;
+            }
+            break;
+
+        case MainOptionsMenuEntry_Controller:
+            // Enter controller screen.
+            if (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.enter)
+            {
+#ifdef SH_PC_PORT
+                /* On a phone the controls panel edits a paired controller and
+                 * needs one connected; without it this beeps and toasts
+                 * instead of leaving the list. Always passes on desktop. */
+                if (!Pc_BindPanel_CanOpen())
+                    break;
+#endif
+                Sd_PlaySfx(Sfx_MenuConfirm, 0, 64);
+                Fs_QueueStartReadTim(FILE_TIM_OPTION2_TIM, IMAGE_BUFFER_3, &g_ControllerButtonAtlasImg);
+
+                ScreenFade_Start(true, false, false);
+                g_GameWork.gameStateSteps[0] = OptionsMenuState_EnterController;
+                g_SysWork.counters_1C[1]              = 0;
+                g_GameWork.gameStateSteps[1] = 0;
+                g_GameWork.gameStateSteps[2] = 0;
+            }
+            break;
+
+        case MainOptionsMenuEntry_ScreenPosition:
+            // Enter screen position screen.
+            if (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.enter)
+            {
+                Sd_PlaySfx(Sfx_MenuConfirm, 0, 64);
+
+                ScreenFade_Start(true, false, false);
+#ifdef SH_PC_PORT
+                g_GameWork.gameStateSteps[0] = OptionsMenuState_EnterPcOptions;
+#else
+                g_GameWork.gameStateSteps[0] = OptionsMenuState_EnterScreenPos;
+#endif
+                g_SysWork.counters_1C[1]              = 0;
+                g_GameWork.gameStateSteps[1] = 0;
+                g_GameWork.gameStateSteps[2] = 0;
+            }
+            break;
+
+        case MainOptionsMenuEntry_Brightness:
+            if (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.enter)
+            {
+                Sd_PlaySfx(Sfx_MenuConfirm, 0, 64);
+                if (g_GameWork.gameStatePrev == GameState_MainMenu)
+                {
+                    Fs_QueueStartReadTim(FILE_TIM_OP_BRT_E_TIM, IMAGE_BUFFER_3, &g_BrightnessScreenImg0);
+                }
+                else
+                {
+                    Fs_QueueStartReadTim(FILE_TIM_OP_BRT_E_TIM, IMAGE_BUFFER_3, &g_BrightnessScreenImg1);
+                }
+
+                ScreenFade_Start(true, false, false);
+                g_GameWork.gameStateSteps[0] = OptionsMenuState_EnterBrightness;
+                g_SysWork.counters_1C[1]              = 0;
+                g_GameWork.gameStateSteps[1] = 0;
+                g_GameWork.gameStateSteps[2] = 0;
+            }
+            break;
+
+        case MainOptionsMenuEntry_Vibration:
+            if (g_Controller0->clickedBtnFlags & (ControllerFlag_LStickRight | ControllerFlag_LStickLeft))
+            {
+                Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+                g_GameWork.config.vibrationEnabled = !g_GameWork.config.vibrationEnabled << 7;
+            }
+            break;
+
+        case MainOptionsMenuEntry_AutoLoad:
+#ifdef SH_PC_PORT
+            /* PAL: this row is Language when the menu was entered from the
+             * title screen (retail SLES had a front-end Language option). */
+            if (Pc_LangMenuRowActive())
+            {
+                int langCount = Pc_LangSlotCount();
+                int slot      = Pc_LangSlotCurrent();
+
+                if (g_Controller0->clickedBtnFlags & ControllerFlag_LStickRight)
+                {
+                    Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+                    Pc_LangSlotSet((slot + 1) % langCount);
+                }
+                else if (g_Controller0->clickedBtnFlags & ControllerFlag_LStickLeft)
+                {
+                    Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+                    Pc_LangSlotSet((slot + langCount - 1) % langCount);
+                }
+                break;
+            }
+#endif
+#ifdef SH_PC_PORT
+            if (Pc_ExitToMenuRowActive())
+            {
+                if (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.enter)
+                {
+                    Sd_PlaySfx(Sfx_MenuConfirm, 0, 64);
+
+                    /* Warm boot IS the return-to-title path: it tears down
+                     * streaming audio, the radio loop and the sys work area,
+                     * then lands on the main menu. Requesting it by flag lets
+                     * the main loop reach it at a frame boundary instead of
+                     * unwinding the menu from underneath itself. */
+                    g_SysWork.sysFlags |= SysFlag_DoWarmReset;
+                }
+                break;
+            }
+#endif
+            if (g_Controller0->clickedBtnFlags & (ControllerFlag_LStickRight | ControllerFlag_LStickLeft))
+            {
+                Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+                g_GameWork.config.autoLoad = (s8)g_GameWork.config.autoLoad == 0;
+            }
+            break;
+
+        case MainOptionsMenuEntry_Sound:
+#ifdef SH_PC_PORT
+        {
+            /* PC: this row selects the SPEAKER LAYOUT (same audio_output the
+             * launcher writes), not the PSX stereo/mono mix. Internal mixing is
+             * forced Stereo so the spatial image the surround layouts need is
+             * never collapsed -- the vanilla Monaural option is dropped because
+             * it silently defeated 5.1/7.1. Cycle Auto/Stereo/Quad/5.1/7.1
+             * (0..4), skipping HRTF (5). */
+            int dir = (g_Controller0->clickedBtnFlags & ControllerFlag_LStickRight) ? 1
+                    : (g_Controller0->clickedBtnFlags & ControllerFlag_LStickLeft)  ? -1 : 0;
+            if (dir != 0)
+            {
+                extern void PsyX_SPUAL_SetOutputMode(int mode);
+                /* String ids exactly as the config parser + launcher use them. */
+                static const char* AUDIO_IDS[] = { "auto", "stereo", "quad", "51", "71", "hrtf" };
+                Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+                g_PcConfig.audioOutput = (g_PcConfig.audioOutput + dir + 5) % 5;
+                PcConfig_SaveKeyValue("audio_output", AUDIO_IDS[g_PcConfig.audioOutput]);
+                PsyX_SPUAL_SetOutputMode(g_PcConfig.audioOutput);
+                g_GameWork.config.soundType = 0; /* keep the savegame at Stereo */
+                SD_Call(AudioMode_Stereo);
+            }
+        }
+#else
+            if (g_Controller0->clickedBtnFlags & (ControllerFlag_LStickRight | ControllerFlag_LStickLeft))
+            {
+                Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+
+                // Set config.
+                audioType                           = AudioMode_Stereo;
+                g_GameWork.config.soundType = !g_GameWork.config.soundType;
+                if (g_GameWork.config.soundType)
+                {
+                    audioType = AudioMode_Mono;
+                }
+                SD_Call(audioType);
+            }
+#endif
+            break;
+
+        case MainOptionsMenuEntry_BgmVolume:
+            vol = g_GameWork.config.volumeBgm;
+
+            if ((vol < OPT_SOUND_VOLUME_MAX && (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickRight)) ||
+                (vol > 0                    && (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickLeft)))
+            {
+                SD_Call(Sfx_MenuMove);
+            }
+            if ((vol == OPT_SOUND_VOLUME_MAX && (g_Controller0->clickedBtnFlags & ControllerFlag_LStickRight)) ||
+                (vol == 0                    && (g_Controller0->clickedBtnFlags & ControllerFlag_LStickLeft)))
+            {
+                SD_Call(Sfx_MenuError);
+            }
+
+            // Scroll left/right.
+            if (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickRight)
+            {
+                vol = vol + SOUND_VOL_STEP;
+            }
+            if (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickLeft)
+            {
+                vol = vol - SOUND_VOL_STEP;
+            }
+
+            // Set config.
+            vol = CLAMP(vol, 0, OPT_SOUND_VOLUME_MAX);
+            Sd_SetVolume(OPT_SOUND_VOLUME_MAX, vol, g_GameWork.config.volumeSe);
+            g_GameWork.config.volumeBgm = vol;
+            break;
+
+        case MainOptionsMenuEntry_SfxVolume:
+            vol = g_GameWork.config.volumeSe;
+
+            if ((vol < OPT_SOUND_VOLUME_MAX && (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickRight)) ||
+                (vol > 0                    && (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickLeft)))
+            {
+                SD_Call(Sfx_MenuMove);
+            }
+            if ((vol == OPT_SOUND_VOLUME_MAX && (g_Controller0->clickedBtnFlags & ControllerFlag_LStickRight)) ||
+                (vol == 0                    && (g_Controller0->clickedBtnFlags & ControllerFlag_LStickLeft)))
+            {
+                SD_Call(Sfx_MenuError);
+            }
+
+            if (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickRight)
+            {
+                vol = vol + SOUND_VOL_STEP;
+            }
+            if (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickLeft)
+            {
+                vol = vol - SOUND_VOL_STEP;
+            }
+
+            vol = CLAMP(vol, 0, OPT_SOUND_VOLUME_MAX);
+
+            Sd_SetVolume(OPT_SOUND_VOLUME_MAX, vol, g_GameWork.config.volumeSe);
+            g_GameWork.config.volumeSe = vol;
+            break;
+
+#ifdef SH_PC_PORT
+        case MainOptionsMenuEntry_FmvVolume:
+        {
+            /* PC-only: XA cutscene-voice stream volume ("Voice"). Mirrors the
+             * BGM/SE slider feel (16 notches, step 8 over 0..128) but drives
+             * g_PcXaVolume in [0,1] and persists `xa_volume`. FMV movie audio is
+             * a separate slider (FMV Movie Vol on the PC Options page). */
+            extern float g_PcXaVolume;
+            extern void  PcConfig_ApplyXaVolume(float norm);
+
+            s32 fvol = (s32)((g_PcXaVolume * (float)OPT_SOUND_VOLUME_MAX) + 0.5f);
+            s32 oldFvol;
+
+            fvol    = CLAMP(fvol, 0, OPT_SOUND_VOLUME_MAX);
+            oldFvol = fvol;
+
+            if ((fvol < OPT_SOUND_VOLUME_MAX && (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickRight)) ||
+                (fvol > 0                    && (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickLeft)))
+            {
+                SD_Call(Sfx_MenuMove);
+            }
+            if ((fvol == OPT_SOUND_VOLUME_MAX && (g_Controller0->clickedBtnFlags & ControllerFlag_LStickRight)) ||
+                (fvol == 0                    && (g_Controller0->clickedBtnFlags & ControllerFlag_LStickLeft)))
+            {
+                SD_Call(Sfx_MenuError);
+            }
+
+            if (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickRight)
+            {
+                fvol += SOUND_VOL_STEP;
+            }
+            if (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickLeft)
+            {
+                fvol -= SOUND_VOL_STEP;
+            }
+            fvol = CLAMP(fvol, 0, OPT_SOUND_VOLUME_MAX);
+
+            if (fvol != oldFvol)
+            {
+                PcConfig_ApplyXaVolume((float)fvol / (float)OPT_SOUND_VOLUME_MAX);
+            }
+            break;
+        }
+#endif
+
+        default:
+            break;
+    }
+
+    vol = 0;
+
+    if (g_Controller0->clickedBtnFlags & (ControllerFlag_L2 | ControllerFlag_R2 |
+                                         ControllerFlag_L1 | ControllerFlag_R1))
+    {
+        if (g_GameWork.gameStateSteps[0] == OptionsMenuState_EnterExtraOptions)
+        {
+            return;
+        }
+
+        Sd_PlaySfx(Sfx_MenuConfirm, 0, 64);
+
+        ScreenFade_Start(true, false, false);
+        g_GameWork.gameStateSteps[0] = OptionsMenuState_EnterExtraOptions;
+        g_SysWork.counters_1C[1]              = 0;
+        g_GameWork.gameStateSteps[1] = 0;
+        g_GameWork.gameStateSteps[2] = 0;
+    }
+
+    // Reset selection cursor.
+    if (((g_GameWork.gameStateSteps[0] != OptionsMenuState_EnterExtraOptions && g_MainOptionsMenu_SelectedEntry != MainOptionsMenuEntry_Exit) &&
+         !(g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.enter)) &&
+        (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.cancel))
+    {
+        Sd_PlaySfx(Sfx_MenuCancel, 0, 64);
+
+        g_Options_SelectionHighlightTimer = 0;
+        g_MainOptionsMenu_SelectedEntry         = MainOptionsMenuEntry_Exit;
+    }
+
+    #undef SOUND_VOL_STEP
+}
+
+void Options_MainOptionsMenu_BgmVolumeBarDraw(void) // 0x801E3F68
+{
+    Options_MainOptionsMenu_VolumeBarDraw(0, g_GameWork.config.volumeBgm);
+}
+
+void Options_MainOptionsMenu_SfxVolumeBarDraw(void) // 0x801E3F90
+{
+    Options_MainOptionsMenu_VolumeBarDraw(1, g_GameWork.config.volumeSe);
+}
+
+#ifdef SH_PC_PORT
+void Options_MainOptionsMenu_FmvVolumeBarDraw(void)
+{
+    extern float g_PcXaVolume;
+    s32 fvol = (s32)((g_PcXaVolume * (float)OPT_SOUND_VOLUME_MAX) + 0.5f);
+    fvol = CLAMP(fvol, 0, OPT_SOUND_VOLUME_MAX);
+    Options_MainOptionsMenu_VolumeBarDraw(2, (u8)fvol);
+}
+#endif
+
+void Options_MainOptionsMenu_VolumeBarDraw(s32 row, u8 vol) // 0x801E3FB8
+{
+    #define STR_OFFSET_Y 16
+    #define NOTCH_SIZE_X 5
+    #define NOTCH_COUNT  16
+
+    s32      x0Offset;
+    s32      x0;
+    s32      offset;
+    s32      yOffset;
+    s32      localVol;
+    s32      i;
+    s32      j;
+    u32      colorComp;
+    s32      xOffset;
+    s32      color0;
+    s32      color1;
+    s32      color2;
+    GsOT*    ot;
+    POLY_F4* poly;
+
+    ot       = &g_OrderingTable2[g_ActiveBufferIdx];
+    localVol = vol;
+
+    // Draw bar notches.
+    for (i = 0; i < NOTCH_COUNT; i++)
+    {
+        colorComp = localVol & 0x7;
+        colorComp = (colorComp * 12) + 64;
+
+        for (j = 1; j >= 0; j--)
+        {
+            poly = (POLY_F4*)GsOUT_PACKET_P;
+            setPolyF4(poly);
+
+            if (i < (vol / 8))
+            {
+                color0 = 0xA0 + (0x40 * j);
+                setRGBC0(poly, color0, color0, color0, PRIM_POLY | RECT_SIZE_1);
+            }
+            else if (i > (vol / 8))
+            {
+                color1 = 0x40 + (0x40 * j);
+                setRGBC0(poly, color1, color1, color1, PRIM_POLY | RECT_SIZE_1);
+            }
+            else
+            {
+                color2 = colorComp + (0x40 * j);
+                setRGBC0(poly, color2, color2, color2, PRIM_POLY | RECT_SIZE_1);
+            }
+
+            xOffset = 24 + OPT_VOLUME_BAR_DX + (i * 6);
+            offset  = -69;
+
+            x0Offset = j + 24 + OPT_VOLUME_BAR_DX;
+            x0       = (x0Offset + (i * 6)) & 0xFFFF;
+            yOffset  = j + 56;
+
+            setXY0Fast(poly, x0,                           (row * STR_OFFSET_Y) + yOffset);
+            setXY1Fast(poly, x0,                           (row * STR_OFFSET_Y) - (j + offset));
+            setXY2Fast(poly, (xOffset - j) + NOTCH_SIZE_X, (row * STR_OFFSET_Y) + yOffset);
+            setXY3Fast(poly, (xOffset - j) + NOTCH_SIZE_X, (row * STR_OFFSET_Y) - (j + offset));
+            addPrim((u8*)ot->org + LAYER_24, poly);
+            GsOUT_PACKET_P = (u8*)poly + sizeof(POLY_F4);
+        }
+    }
+
+    #undef STR_OFFSET_Y
+    #undef NOTCH_SIZE_X
+    #undef NOTCH_COUNT
+}
+
+void Options_ExtraOptionsMenu_EntryStringsDraw(void) // 0x801E416C
+{
+    #define LINE_BASE_X   64
+    #define LINE_BASE_Y   64
+    #define LINE_OFFSET_X 16
+    #define LINE_OFFSET_Y 16
+
+    s32            i;
+    static DVECTOR selectionHighlightFromUnused;
+    static DVECTOR selectionHighlightToUnused;
+
+    const DVECTOR STR_POS = { 86, 20 };
+
+    const char* EXTRA_OPTIONS_STR = "EXTRA_OPTION_\x01\x01\x01\x01\x01S";
+
+    const char* ENTRY_STRS[] = {
+        "Weapon_Control",
+        "Blood_Color",
+        "View_Control",
+        "Retreat_Turn",
+        "\x01W"
+        "\x01"
+        "a\x01l\x01k/R\x01\x01u\x01n_\x01\x01\x01\x01"
+        "Co\x01n\x01t\x01ro\x01l",
+        "Auto_Aiming",
+        "View_Mode",
+        "Bullet_Adjust"
+    };
+
+    // @unused Likely an older implementation for active highlight selection position reference setup found in `Options_ExtraOptionsMenu_SelectionHighlightDraw`.
+    if (g_Options_SelectionHighlightTimer == 0)
+    {
+        selectionHighlightFromUnused.vx = LINE_BASE_X - LINE_OFFSET_X;
+        selectionHighlightToUnused.vx   = LINE_BASE_X;
+        selectionHighlightFromUnused.vy = ((u16)g_MainOptionsMenu_PrevSelectedEntry * LINE_OFFSET_Y) + LINE_BASE_Y;
+        selectionHighlightToUnused.vy   = ((u16)g_MainOptionsMenu_SelectedEntry     * LINE_OFFSET_Y) + LINE_BASE_Y;
+    }
+    Math_Sin(g_Options_SelectionHighlightTimer << 7);
+
+    // Draw heading string.
+    Gfx_StringSetColor(StringColorId_White);
+    Gfx_StringSetPosition(STR_POS.vx, STR_POS.vy);
+    Gfx_Strings2dLayerIdxSet(8);
+    Gfx_StringDraw(EXTRA_OPTIONS_STR, DEFAULT_MAP_MESSAGE_LENGTH);
+
+    // Draw entry strings.
+    for (i = 0; i < g_ExtraOptionsMenu_EntryCount; i++)
+    {
+        Gfx_StringSetPosition(LINE_BASE_X, LINE_BASE_Y + (i * LINE_OFFSET_Y));
+        Gfx_Strings2dLayerIdxSet(8);
+        Gfx_StringDraw(ENTRY_STRS[i], DEFAULT_MAP_MESSAGE_LENGTH);
+    }
+
+    #undef LINE_BASE_X
+    #undef LINE_BASE_Y
+    #undef LINE_OFFSET_X
+    #undef LINE_OFFSET_Y
+}
+
+void Options_MainOptionsMenu_EntryStringsDraw(void) // 0x801E42EC
+{
+    #define LINE_BASE_X   64
+    #define LINE_BASE_Y   56
+    #define LINE_OFFSET_X 16
+    #define LINE_OFFSET_Y 16
+
+    s32            i;
+    static DVECTOR selectionHighlightFromUnused;
+    static DVECTOR selectionHighlightToUnused;
+
+    DVECTOR strPos = { 121, 20 };
+
+    const char* OPTIONS_STR = "OPTION_\x01\x01\x01\x01\x01S";
+
+    const char* ENTRY_STRS[] = {
+        "Exit",
+        "Brightness_Level",
+        "Controller_Config",
+#if defined(SH_IOS)
+        "iOS_Options",
+#elif defined(__ANDROID__)
+        "Android_Options",
+#elif defined(SH_PC_PORT)
+        "PC_Options",
+#else
+        "Screen_Position",
+#endif
+        "Vibration",
+        "Auto_Load",
+        "Sound",
+        "BGM_Volume",
+        "SE_Volume"
+#ifdef SH_PC_PORT
+        ,
+        "Voice"
+#endif
+    };
+
+#ifdef SH_PC_PORT
+    if (Pc_LangMenuRowActive())
+    {
+        ENTRY_STRS[MainOptionsMenuEntry_AutoLoad] = "Language";
+    }
+    else if (Pc_ExitToMenuRowActive())
+    {
+        ENTRY_STRS[MainOptionsMenuEntry_AutoLoad] = "Exit_to_Menu";
+    }
+#endif
+
+    // @unused Likely an older implementation for active highlight selection position reference setup found in `Options_MainOptionsMenu_SelectionHighlightDraw`.
+    if (g_Options_SelectionHighlightTimer == 0)
+    {
+        selectionHighlightFromUnused.vx = LINE_BASE_X - LINE_OFFSET_X;
+        selectionHighlightToUnused.vx   = LINE_BASE_X;
+        selectionHighlightFromUnused.vy = ((u16)g_MainOptionsMenu_PrevSelectedEntry * LINE_OFFSET_Y) + LINE_BASE_Y;
+        selectionHighlightToUnused.vy   = ((u16)g_MainOptionsMenu_SelectedEntry     * LINE_OFFSET_Y) + LINE_BASE_Y;
+    }
+    Math_Sin(g_Options_SelectionHighlightTimer << 7);
+
+    // Draw heading string.
+    Gfx_StringSetColor(StringColorId_White);
+    Gfx_StringSetPosition(strPos.vx, strPos.vy);
+    Gfx_Strings2dLayerIdxSet(8);
+    Gfx_StringDraw(OPTIONS_STR, DEFAULT_MAP_MESSAGE_LENGTH);
+
+    // Draw entry strings.
+    for (i = 0; i < MainOptionsMenuEntry_Count; i++)
+    {
+        Gfx_StringSetPosition(LINE_BASE_X, LINE_BASE_Y + (i * LINE_OFFSET_Y));
+        Gfx_Strings2dLayerIdxSet(8);
+        Gfx_StringDraw(ENTRY_STRS[i], DEFAULT_MAP_MESSAGE_LENGTH);
+    }
+
+    Gfx_StringsReset2dLayerIdx();
+
+    #undef LINE_BASE_X
+    #undef LINE_BASE_Y
+    #undef LINE_OFFSET_X
+    #undef LINE_OFFSET_Y
+}
+
+void Options_ExtraOptionsMenu_SelectionHighlightDraw(void) // 0x801E4450
+{
+    #define BULLET_QUAD_COUNT  2
+    #define LINE_BASE_X        64
+    #define LINE_BASE_Y        56
+    #define LINE_OFFSET_X      16
+    #define LINE_OFFSET_Y      16
+    #define HIGHLIGHT_OFFSET_X -121
+    #define HIGHLIGHT_OFFSET_Y 50
+
+    s32            i;
+    s32            j;
+    q3_12          interpAlpha;
+    s_Line2d       highlightLine;
+    s_Quad2d       bulletQuads[BULLET_QUAD_COUNT];
+    DVECTOR*       quadVerts;
+    static DVECTOR selectionHighlightFrom;
+    static DVECTOR selectionHighlightTo;
+
+    const u8 SELECTION_HIGHLIGHT_WIDTHS[] = {
+        157, 126, 135, 135, 157, 130, 112, 134
+    };
+
+    // 12x12 quad.
+    const DVECTOR FRONT_BULLET_QUAD[] = {
+        { -120, -47 },
+        { -120, -35 },
+        { -108, -47 },
+        { -108, -35 }
+    };
+
+    // 14x14 quad.
+    const DVECTOR BACK_BULLET_QUAD[] = {
+        { -121, -48 },
+        { -121, -34 },
+        { -107, -48 },
+        { -107, -34 }
+    };
+
+    // Set active selection highlight position references.
+#ifdef SH_PC_PORT
+    if (g_Options_SelectionHighlightTimer == 0 || g_PcOptions_HighlightSnap)
+#else
+    if (g_Options_SelectionHighlightTimer == 0)
+#endif
+    {
+#ifdef SH_PC_PORT
+        g_PcOptions_HighlightSnap = 0;
+#endif
+        selectionHighlightFrom.vx = SELECTION_HIGHLIGHT_WIDTHS[g_ExtraOptionsMenu_PrevSelectedEntry] + (65536 + HIGHLIGHT_OFFSET_X); // TODO
+        selectionHighlightFrom.vy = ((u16)g_ExtraOptionsMenu_PrevSelectedEntry * LINE_OFFSET_Y)      - HIGHLIGHT_OFFSET_Y;
+        selectionHighlightTo.vx   = SELECTION_HIGHLIGHT_WIDTHS[g_ExtraOptionsMenu_SelectedEntry]     + (65536 + HIGHLIGHT_OFFSET_X); // TODO
+        selectionHighlightTo.vy   = ((u16)g_ExtraOptionsMenu_SelectedEntry * LINE_OFFSET_Y)          - HIGHLIGHT_OFFSET_Y;
+    }
+
+    // Compute sine-based interpolation alpha.
+    interpAlpha = Math_Sin(g_Options_SelectionHighlightTimer << 7);
+
+    // Draw active selection highlight.
+    highlightLine.vertex0.vx = HIGHLIGHT_OFFSET_X;
+    highlightLine.vertex1.vx = selectionHighlightFrom.vx +
+                               Q12_MULT(selectionHighlightTo.vx - selectionHighlightFrom.vx, interpAlpha);
+    highlightLine.vertex1.vy = selectionHighlightFrom.vy +
+                               Q12_MULT(selectionHighlightTo.vy - selectionHighlightFrom.vy, interpAlpha) +
+                               LINE_OFFSET_Y;
+    highlightLine.vertex0.vy = highlightLine.vertex1.vy;
+    Options_Selection_HighlightDraw(&highlightLine, true, false);
+
+    // Draw selection bullet points.
+    for (i = 0; i < g_ExtraOptionsMenu_EntryCount; i++)
+    {
+        // Set bullet quads.
+        quadVerts = (DVECTOR*)&bulletQuads;
+        for (j = 0; j < RECT_VERT_COUNT; j++)
+        {
+            quadVerts[j].vx                   = FRONT_BULLET_QUAD[j].vx;
+            quadVerts[j].vy                   = FRONT_BULLET_QUAD[j].vy + (i * LINE_OFFSET_Y);
+            quadVerts[j + sizeof(DVECTOR)].vx = BACK_BULLET_QUAD[j].vx;
+            quadVerts[j + sizeof(DVECTOR)].vy = BACK_BULLET_QUAD[j].vy + (i * LINE_OFFSET_Y);
+        }
+
+        // Active selection bullet point.
+        if (i == g_ExtraOptionsMenu_SelectedEntry)
+        {
+            Options_Selection_BulletPointDraw(&bulletQuads[0], false, false);
+            Options_Selection_BulletPointDraw(&bulletQuads[1], true,  false);
+        }
+        // Inactive selection bullet point.
+        else
+        {
+            Options_Selection_BulletPointDraw(&bulletQuads[0], false, true);
+            Options_Selection_BulletPointDraw(&bulletQuads[1], true,  true);
+        }
+    }
+
+    #undef BULLET_QUAD_COUNT
+    #undef LINE_BASE_X
+    #undef LINE_BASE_Y
+    #undef LINE_OFFSET_X
+    #undef LINE_OFFSET_Y
+    #undef HIGHLIGHT_OFFSET_X
+    #undef HIGHLIGHT_OFFSET_Y
+}
+
+void Options_MainOptionsMenu_SelectionHighlightDraw(void) // 0x801E472C
+{
+    #define LINE_OFFSET_Y      16
+    #define HIGHLIGHT_OFFSET_X -121
+    #define HIGHLIGHT_OFFSET_Y 58
+
+    s32            i;
+    s32            j;
+    s16            interpAlpha;
+    s_Line2d       highlightLine;
+    s_Quad2d       bulletQuads[2];
+    DVECTOR*       quadVerts;
+    static DVECTOR selectionHighlightFrom;
+    static DVECTOR selectionHighlightTo;
+
+    const u8 SELECTION_HIGHLIGHT_WIDTHS[] = {
+        59, 169, 174, 156, 104, 112, 75, 129, 112
+#ifdef SH_PC_PORT
+        , 75 /* Voice */
+#endif
+    };
+
+    // 12x12 quad.
+    const DVECTOR BULLET_QUAD_VERTS_FRONT[] = {
+        { -120, -55 },
+        { -120, -43 },
+        { -108, -55 },
+        { -108, -43 }
+    };
+
+    // 14x14 quad.
+    const DVECTOR BULLET_QUAD_VERTS_BACK[] = {
+        { -121, -56 },
+        { -121, -42 },
+        { -107, -56 },
+        { -107, -42 }
+    };
+
+    // Set active selection highlight position references.
+#ifdef SH_PC_PORT
+    if (g_Options_SelectionHighlightTimer == 0 || g_PcOptions_HighlightSnap)
+#else
+    if (g_Options_SelectionHighlightTimer == 0)
+#endif
+    {
+#ifdef SH_PC_PORT
+        g_PcOptions_HighlightSnap = 0;
+#endif
+        selectionHighlightFrom.vx = SELECTION_HIGHLIGHT_WIDTHS[g_MainOptionsMenu_PrevSelectedEntry] + (65536 + HIGHLIGHT_OFFSET_X); // TODO
+        selectionHighlightFrom.vy = ((u16)g_MainOptionsMenu_PrevSelectedEntry * LINE_OFFSET_Y)      - HIGHLIGHT_OFFSET_Y;
+        selectionHighlightTo.vx   = SELECTION_HIGHLIGHT_WIDTHS[g_MainOptionsMenu_SelectedEntry]     + (65536 + HIGHLIGHT_OFFSET_X); // TODO
+        selectionHighlightTo.vy   = ((u16)g_MainOptionsMenu_SelectedEntry * LINE_OFFSET_Y)          - HIGHLIGHT_OFFSET_Y;
+    }
+
+    // Compute sine-based interpolation alpha.
+    interpAlpha = Math_Sin(g_Options_SelectionHighlightTimer << 7);
+
+    // Draw active selection highlight.
+    highlightLine.vertex0.vx = HIGHLIGHT_OFFSET_X;
+    highlightLine.vertex1.vx = selectionHighlightFrom.vx +
+                               FP_FROM((selectionHighlightTo.vx - selectionHighlightFrom.vx) * interpAlpha, Q12_SHIFT);
+    highlightLine.vertex1.vy = selectionHighlightFrom.vy +
+                               FP_FROM((selectionHighlightTo.vy - selectionHighlightFrom.vy) * interpAlpha, Q12_SHIFT) +
+                               LINE_OFFSET_Y;
+    highlightLine.vertex0.vy = highlightLine.vertex1.vy;
+    Options_Selection_HighlightDraw(&highlightLine, true, false);
+
+    // Draw selection bullet points.
+    for (i = 0; i < MainOptionsMenuEntry_Count; i++)
+    {
+        // Set bullet quads.
+        quadVerts = (DVECTOR*)&bulletQuads;
+        for (j = 0; j < RECT_VERT_COUNT; j++)
+        {
+            quadVerts[j].vx                   = BULLET_QUAD_VERTS_FRONT[j].vx;
+            quadVerts[j].vy                   = BULLET_QUAD_VERTS_FRONT[j].vy + (i * LINE_OFFSET_Y);
+            quadVerts[j + sizeof(DVECTOR)].vx = BULLET_QUAD_VERTS_BACK[j].vx;
+            quadVerts[j + sizeof(DVECTOR)].vy = BULLET_QUAD_VERTS_BACK[j].vy + (i * LINE_OFFSET_Y);
+        }
+
+        // Active selection bullet point.
+        if (i == g_MainOptionsMenu_SelectedEntry)
+        {
+            Options_Selection_BulletPointDraw(&bulletQuads[0], false, false);
+            Options_Selection_BulletPointDraw(&bulletQuads[1], true,  false);
+        }
+        // Inactive selection bullet point.
+        else
+        {
+            Options_Selection_BulletPointDraw(&bulletQuads[0], false, true);
+            Options_Selection_BulletPointDraw(&bulletQuads[1], true,  true);
+        }
+    }
+
+    #undef LINE_OFFSET_Y
+    #undef HIGHLIGHT_OFFSET_X
+    #undef HIGHLIGHT_OFFSET_Y
+}
+
+void Options_Menu_VignetteDraw(void) // 0x801E49F0
+{
+    s32      y0;
+    s32      y1;
+    s32      xy2;
+    s32      xy3;
+    s32      i;
+    GsOT*    ot;
+    POLY_G4* poly;
+
+    ot = &g_OrderingTable0[g_ActiveBufferIdx];
+
+    xy3 = 160 + (0xFFA0 << 16); // TODO: -96
+    xy2 = 160 + (0xFF90 << 16); // TODO: -112
+    y1  = 0xFFA0 << 16;         // TODO: -96
+    y0  = 0xFF90 << 16;         // TODO: -112
+
+    for (i = 0; i < 2; i++)
+    {
+        poly = (POLY_G4*)GsOUT_PACKET_P;
+
+        setPolyG4(poly);
+        setSemiTrans(poly, true);
+
+        setRGB0(poly, 0x60, 0x60, 0x60);
+        setRGB1(poly, 0, 0, 0);
+        setRGB2(poly, 0x60, 0x60, 0x60);
+        setRGB3(poly, 0, 0, 0);
+
+        *(u32*)(&poly->x0) = 0xFF60 + (y0 + ((0xE0 * i) << 16)); // TODO: -160
+        *(u32*)(&poly->x1) = 0xFF60 + (y1 + ((0xA8 * i) << 16)); // TODO: -160
+        *(u32*)(&poly->x2) = xy2    + ((0xE0 * i) << 16);
+        *(u32*)(&poly->x3) = xy3    + ((0xA8 * i) << 16);
+
+        addPrim((u8*)ot->org + LAYER_8148, poly);
+        GsOUT_PACKET_P = (u8*)poly + sizeof(POLY_G4);
+    }
+
+    Gfx_Primitive2dTextureSet(0, 0, 2037, 6);
+}
+
+void Options_ExtraOptionsMenu_ConfigDraw(void) // 0x801E4B2C
+{
+    #define STR_BASE_Y   64
+    #define STR_OFFSET_Y 16
+
+    const s_Triangle2d FRONT_ARROWS[] = {
+        { { 38,  -42 }, { 46,  -50 }, { 46,  -34 } },
+        { { 120, -42 }, { 112, -50 }, { 112, -34 } },
+        { { 38,  -26 }, { 46,  -34 }, { 46,  -18 } },
+        { { 120, -26 }, { 112, -34 }, { 112, -18 } },
+        { { 35,  -10 }, { 43,  -18 }, { 43,  -2  } },
+        { { 123, -10 }, { 115, -18 }, { 115, -2  } },
+        { { 35,   6  }, { 43,  -2  }, { 43,   14 } },
+        { { 123,  6  }, { 115, -2  }, { 115,  14 } },
+        { { 35,   22 }, { 43,   14 }, { 43,   30 } },
+        { { 123,  22 }, { 115,  14 }, { 115,  30 } },
+        { { 51,   38 }, { 59,   30 }, { 59,   46 } },
+        { { 107,  38 }, { 99,   30 }, { 99,   46 } },
+        { { 24,   54 }, { 32,   46 }, { 32,   62 } },
+        { { 131,  54 }, { 123,  46 }, { 123,  62 } },
+        { { 57,   70 }, { 65,   62 }, { 65,   78 } },
+        { { 104,  70 }, { 96,   62 }, { 96,   78 } }
+    };
+
+    const s_Triangle2d BACK_ARROWS[] = {
+        { { 37,  -42 }, { 47,  -52 }, { 47,  -32 } },
+        { { 121, -42 }, { 111, -52 }, { 111, -32 } },
+        { { 37,  -26 }, { 47,  -36 }, { 47,  -16 } },
+        { { 121, -26 }, { 111, -36 }, { 111, -16 } },
+        { { 34,  -10 }, { 44,  -20 }, { 44,   0  } },
+        { { 124, -10 }, { 114, -20 }, { 114,  0  } },
+        { { 34,   6  }, { 44,  -4  }, { 44,   16 } },
+        { { 124,  6  }, { 114, -4  }, { 114,  16 } },
+        { { 34,   22 }, { 44,   12 }, { 44,   32 } },
+        { { 124,  22 }, { 114,  12 }, { 114,  32 } },
+        { { 50,   38 }, { 60,   28 }, { 60,   48 } },
+        { { 108,  38 }, { 98,   28 }, { 98,   48 } },
+        { { 23,   54 }, { 33,   44 }, { 33,   64 } },
+        { { 132,  54 }, { 122,  44 }, { 122,  64 } },
+        { { 56,   70 }, { 66,   60 }, { 66,   80 } },
+        { { 105,  70 }, { 95,   60 }, { 95,   80 } }
+    };
+
+    // TODO: Can this be split?
+    const char* CONFIG_STRS[] = {
+        "Press",
+        "Switch",
+
+        "Normal",
+        "Green",
+        "Violet",
+        "Black",
+
+        "_",
+
+        "Normal",
+        "Reverse",
+
+        "On",
+        "Off",
+
+        "Normal",
+        "Self_View",
+
+        "x1",
+        "x2",
+        "x3",
+        "x4",
+        "x5",
+        "x6"
+    };
+
+    s32 strPosX;
+    s32 i;
+    s32 j;
+
+    Gfx_StringSetColor(StringColorId_White);
+
+    // Draw left/right arrows for subset of options.
+    if (g_ExtraOptionsMenu_SelectedEntry < (u32)ExtraOptionsMenuEntry_Count)
+    {
+        // Draw flashing left/right arrows.
+        for (i = 0; i < 2; i++)
+        {
+            Options_Selection_ArrowDraw(&FRONT_ARROWS[(g_ExtraOptionsMenu_SelectedEntry * 2) + i], true, false);
+        }
+
+        // Draw border to highlight flashing left/right arrow corresponding to direction of UI navigation.
+        if (g_Controller0->heldBtnFlags & ControllerFlag_LStickLeft)
+        {
+            Options_Selection_ArrowDraw(&BACK_ARROWS[g_ExtraOptionsMenu_SelectedEntry << 1], false, false);
+        }
+        if (g_Controller0->heldBtnFlags & ControllerFlag_LStickRight)
+        {
+            Options_Selection_ArrowDraw(&BACK_ARROWS[(g_ExtraOptionsMenu_SelectedEntry << 1) + 1], false, false);
+        }
+    }
+
+    // Draw entry strings.
+    for (j = 0; j < g_ExtraOptionsMenu_EntryCount; j++)
+    {
+        switch (j)
+        {
+            case ExtraOptionsMenuEntry_WeaponCtrl:
+                strPosX = (g_GameWork.config.extraWeaponCtrl != 0) ? 217 : 212;
+                Gfx_StringSetPosition(strPosX, STR_BASE_Y + (STR_OFFSET_Y * ExtraOptionsMenuEntry_WeaponCtrl));
+                Gfx_StringDraw(CONFIG_STRS[!g_GameWork.config.extraWeaponCtrl], 10);
+                break;
+
+            case ExtraOptionsMenuEntry_Blood:
+                switch (g_ExtraOptionsMenu_SelectedBloodColorEntry)
+                {
+                    case BloodColorMenuEntry_Normal:
+                        Gfx_StringSetPosition(210, STR_BASE_Y + (STR_OFFSET_Y * ExtraOptionsMenuEntry_Blood));
+                        break;
+
+                    case BloodColorMenuEntry_Green:
+                        Gfx_StringSetPosition(214, STR_BASE_Y + (STR_OFFSET_Y * ExtraOptionsMenuEntry_Blood));
+                        break;
+
+                    case BloodColorMenuEntry_Violet:
+                        Gfx_StringSetPosition(214, STR_BASE_Y + (STR_OFFSET_Y * ExtraOptionsMenuEntry_Blood));
+                        break;
+
+                    case BloodColorMenuEntry_Black:
+                        Gfx_StringSetPosition(217, STR_BASE_Y + (STR_OFFSET_Y * ExtraOptionsMenuEntry_Blood));
+                        break;
+                }
+
+                Gfx_StringDraw(CONFIG_STRS[g_ExtraOptionsMenu_SelectedBloodColorEntry + 2], 10);
+                break;
+
+            case ExtraOptionsMenuEntry_ViewCtrl:
+                strPosX = !g_GameWork.config.extraViewCtrl ? 210 : 206;
+                Gfx_StringSetPosition(strPosX, STR_BASE_Y + (STR_OFFSET_Y * ExtraOptionsMenuEntry_ViewCtrl));
+                Gfx_StringDraw(CONFIG_STRS[((g_GameWork.config.extraViewCtrl != 0) ? 32 : 28) >> 2], 10);
+                break;
+
+            case ExtraOptionsMenuEntry_RetreatTurn:
+                strPosX = !g_GameWork.config.extraRetreatTurn ? 210 : 206;
+                Gfx_StringSetPosition(strPosX, STR_BASE_Y + (STR_OFFSET_Y * ExtraOptionsMenuEntry_RetreatTurn));
+                Gfx_StringDraw(CONFIG_STRS[((g_GameWork.config.extraRetreatTurn != 0) ? 32 : 28) >> 2], 10);
+                break;
+
+            case ExtraOptionsMenuEntry_MovementCtrl:
+                strPosX = !g_GameWork.config.extraWalkRunCtrl ? 210 : 206;
+                Gfx_StringSetPosition(strPosX, STR_BASE_Y + (STR_OFFSET_Y * ExtraOptionsMenuEntry_MovementCtrl));
+                Gfx_StringDraw(CONFIG_STRS[((g_GameWork.config.extraWalkRunCtrl != 0) ? 32 : 28) >> 2], 10);
+                break;
+
+            case ExtraOptionsMenuEntry_AutoAiming:
+                strPosX = !g_GameWork.config.extraAutoAiming ? 228 : 226;
+                Gfx_StringSetPosition(strPosX, STR_BASE_Y + (STR_OFFSET_Y * ExtraOptionsMenuEntry_AutoAiming));
+                Gfx_StringDraw(CONFIG_STRS[((g_GameWork.config.extraAutoAiming != 0) ? 40 : 36) >> 2], 10);
+                break;
+
+            case ExtraOptionsMenuEntry_ViewMode:
+                strPosX = !g_GameWork.config.extraViewMode ? 210 : 200;
+                Gfx_StringSetPosition(strPosX, STR_BASE_Y + (STR_OFFSET_Y * ExtraOptionsMenuEntry_ViewMode));
+                Gfx_StringDraw(CONFIG_STRS[(g_GameWork.config.extraViewMode ? 48 : 44) >> 2], 10);
+                break;
+
+            case ExtraOptionsMenuEntry_BulletMult:
+                Gfx_StringSetPosition(230, STR_BASE_Y + (STR_OFFSET_Y * ExtraOptionsMenuEntry_BulletMult));
+                Gfx_StringDraw(CONFIG_STRS[g_GameWork.config.extraBulletAdjust + 13], 10);
+                break;
+        }
+    }
+
+    #undef STR_BASE_Y
+    #undef STR_OFFSET_Y
+}
+
+void Options_MainOptionsMenu_ConfigDraw(void) // 0x801E4FFC
+{
+    const s_Triangle2d FRONT_ARROWS[] = {
+        { { 40,  14 }, { 48,  6  }, { 48,  22 } },
+        { { 96,  14 }, { 88,  6  }, { 88,  22 } },
+        { { 40,  30 }, { 48,  22 }, { 48,  38 } },
+        { { 96,  30 }, { 88,  22 }, { 88,  38 } },
+        { { 19,  46 }, { 27,  38 }, { 27,  54 } },
+        { { 124, 46 }, { 116, 38 }, { 116, 54 } },
+        { { 12,  62 }, { 20,  54 }, { 20,  70 } },
+        { { 131, 62 }, { 123, 54 }, { 123, 70 } },
+        { { 12,  78 }, { 20,  70 }, { 20,  86 } },
+        { { 131, 78 }, { 123, 70 }, { 123, 86 } }
+#ifdef SH_PC_PORT
+        ,
+        { { 12,  94 }, { 20,  86 }, { 20,  102 } }, /* PC: FMV/voice left  */
+        { { 131, 94 }, { 123, 86 }, { 123, 102 } }  /* PC: FMV/voice right */
+#endif
+    };
+
+    const s_Triangle2d BACK_ARROWS[] = {
+        { { 39,  14 }, { 49,  4  }, { 49,  24 } },
+        { { 97,  14 }, { 87,  4  }, { 87,  24 } },
+        { { 39,  30 }, { 49,  20 }, { 49,  40 } },
+        { { 97,  30 }, { 87,  20 }, { 87,  40 } },
+        { { 18,  46 }, { 28,  36 }, { 28,  56 } },
+        { { 125, 46 }, { 115, 36 }, { 115, 56 } },
+        { { 11,  62 }, { 21,  52 }, { 21,  72 } },
+        { { 132, 62 }, { 122, 52 }, { 122, 72 } },
+        { { 11,  78 }, { 21,  68 }, { 21,  88 } },
+        { { 132, 78 }, { 122, 68 }, { 122, 88 } }
+#ifdef SH_PC_PORT
+        ,
+        { { 11,  94 }, { 21,  84 }, { 21,  104 } }, /* PC: FMV/voice left  */
+        { { 132, 94 }, { 122, 84 }, { 122, 104 } }  /* PC: FMV/voice right */
+#endif
+    };
+
+    const char* CONFIG_STRS[] =
+    {
+        "On",
+        "Off",
+        "Stereo",
+        "Monaural"
+    };
+
+    s32 strPosX;
+    s32 strIdx;
+    s32 i;
+
+    Gfx_StringSetColor(StringColorId_White);
+
+    // Draw left/right arrows for subset of options.
+    if (g_MainOptionsMenu_SelectedEntry >= 4 && g_MainOptionsMenu_SelectedEntry < MainOptionsMenuEntry_Count)
+    {
+#ifdef SH_PC_PORT
+        /* The Language row's value names are far wider than the On/Off the
+         * arrow tables were sized for — pull its arrows outward so they
+         * flank every language name instead of overlapping it. */
+        s32 langDx = (g_MainOptionsMenu_SelectedEntry == MainOptionsMenuEntry_AutoLoad &&
+                      Pc_LangMenuRowActive()) ? 26 : 0;
+
+        /* Volume-bar rows moved right by OPT_VOLUME_BAR_DX; their flanking
+         * arrows follow so they still bracket the bar (both shift the same
+         * way, unlike the Language row's outward spread). */
+        s32 volDx = (g_MainOptionsMenu_SelectedEntry >= MainOptionsMenuEntry_BgmVolume) ? OPT_VOLUME_BAR_DX : 0;
+
+        #define ARROW_DRAW_DX(tris, idx, dx, flashing)              \
+        {                                                           \
+            s_Triangle2d shifted = (tris)[idx];                     \
+            shifted.vertex0.vx  += (dx);                            \
+            shifted.vertex1.vx  += (dx);                            \
+            shifted.vertex2.vx  += (dx);                            \
+            Options_Selection_ArrowDraw(&shifted, flashing, false); \
+        }
+
+        // Draw flashing left/right arrows.
+        for (i = 0; i < 2; i++)
+        {
+            ARROW_DRAW_DX(FRONT_ARROWS, ((g_MainOptionsMenu_SelectedEntry - 4) * 2) + i,
+                          ((i == 0) ? -langDx : langDx) + volDx, true);
+        }
+
+        // Draw border to highlight flashing left/right arrow corresponding to direction of UI navigation.
+        if (g_Controller0->heldBtnFlags & ControllerFlag_LStickLeft)
+        {
+            ARROW_DRAW_DX(BACK_ARROWS, (g_MainOptionsMenu_SelectedEntry - 4) << 1, -langDx + volDx, false);
+        }
+        if (g_Controller0->heldBtnFlags & ControllerFlag_LStickRight)
+        {
+            ARROW_DRAW_DX(BACK_ARROWS, ((g_MainOptionsMenu_SelectedEntry - 4) << 1) + 1, langDx + volDx, false);
+        }
+
+        #undef ARROW_DRAW_DX
+#else
+        // Draw flashing left/right arrows.
+        for (i = 0; i < 2; i++)
+        {
+            Options_Selection_ArrowDraw(&FRONT_ARROWS[(((g_MainOptionsMenu_SelectedEntry - 4) * 2) + i)], true, false);
+        }
+
+        // Draw border to highlight flashing left/right arrow corresponding to direction of UI navigation.
+        if (g_Controller0->heldBtnFlags & ControllerFlag_LStickLeft)
+        {
+            Options_Selection_ArrowDraw(&BACK_ARROWS[(g_MainOptionsMenu_SelectedEntry - 4) << 1], false, false);
+        }
+        if (g_Controller0->heldBtnFlags & ControllerFlag_LStickRight)
+        {
+            Options_Selection_ArrowDraw(&BACK_ARROWS[((g_MainOptionsMenu_SelectedEntry - 4) << 1) + 1], false, false);
+        }
+#endif
+    }
+
+    for (i = 0; i < 3; i++)
+    {
+        switch (i)
+        {
+            case 0:
+                strPosX = !g_GameWork.config.vibrationEnabled ? 214 : 216;
+                Gfx_StringSetPosition(strPosX, 120);
+
+                strIdx = !g_GameWork.config.vibrationEnabled;
+                Gfx_StringDraw(CONFIG_STRS[strIdx], 10);
+                break;
+
+            case 1:
+#ifdef SH_PC_PORT
+                if (Pc_LangMenuRowActive())
+                {
+                    /* The slot's own label and left edge — which languages the
+                     * row offers is the region's business, not this screen's. */
+                    int slot = Pc_LangSlotCurrent();
+
+                    Gfx_StringSetPosition(Pc_LangSlotNameX(slot), 136);
+                    Gfx_StringDraw(Pc_LangSlotName(slot), 10);
+                    break;
+                }
+#endif
+#ifdef SH_PC_PORT
+                /* Exit to Menu is an action, not a toggle: no On/Off value. */
+                if (Pc_ExitToMenuRowActive())
+                    break;
+#endif
+                strPosX = !g_GameWork.config.autoLoad ? 214 : 216;
+                Gfx_StringSetPosition(strPosX, 136);
+
+                strIdx = !g_GameWork.config.autoLoad;
+                Gfx_StringDraw(CONFIG_STRS[strIdx], 10);
+                break;
+
+            case 2:
+#ifdef SH_PC_PORT
+            {
+                /* Speaker layout name, right-aligned to the old label's edge
+                 * (~6 px/glyph). Matches the launcher's audio_output values. */
+                static const char* LAY[] = { "Auto", "Stereo", "Quad", "5.1", "7.1", "HRTF" };
+                int m = g_PcConfig.audioOutput;
+                const char* nm;
+                if (m < 0 || m > 5) m = 0;
+                nm = LAY[m];
+                Gfx_StringSetPosition(242 - (int)strlen(nm) * 6, 152);
+                Gfx_StringDraw(nm, 10);
+            }
+#else
+                strPosX = g_GameWork.config.soundType ? 194 : 206;
+                Gfx_StringSetPosition(strPosX, 152);
+
+                strIdx = g_GameWork.config.soundType + 2;
+                Gfx_StringDraw(CONFIG_STRS[strIdx], 10);
+#endif
+                break;
+        }
+    }
+}
+
+// ========================================
+// SCREEN POSITION OPTION SCREEN
+// ========================================
+
+void Options_ScreenPosMenu_Control(void) // 0x801E53A0
+{
+    #define OPT_SCREEN_POS_X_RANGE 11
+    #define OPT_SCREEN_POS_Y_RANGE 8
+    #define BG_FADE_STEP           16
+
+    s32        i;
+    s8         posX;
+    TILE*      tile;
+    PACKET*    packet;
+    static s32 screenPosMenu_BackgroundFade;
+    static s16 screenPosMenu_PositionX;
+    static s16 screenPosMenu_PositionY;
+
+    posX = g_GameWorkConst->config.screenPositionX;
+    if (posX != screenPosMenu_PositionX || g_GameWorkConst->config.screenPositionY != screenPosMenu_PositionY)
+    {
+        Screen_XyPositionSet(posX, g_GameWorkConst->config.screenPositionY);
+    }
+
+    screenPosMenu_PositionX = g_GameWorkConst->config.screenPositionX;
+    screenPosMenu_PositionY = g_GameWorkConst->config.screenPositionY;
+
+    switch (g_GameWork.gameStateSteps[1])
+    {
+        case ScreenPosMenuState_0:
+            ScreenFade_Start(true, true, false);
+            screenPosMenu_BackgroundFade  = 255;
+            g_GameWork.gameStateSteps[1] = ScreenPosMenuState_1;
+            g_GameWork.gameStateSteps[2] = 0;
+
+        case ScreenPosMenuState_1:
+            g_GameWork.gameStateSteps[2] = 0;
+            g_GameWork.gameStateSteps[1]++;
+            break;
+
+        case ScreenPosMenuState_2:
+            // Set config.
+            if (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickUp)
+            {
+                g_GameWorkConst->config.screenPositionY--;
+            }
+            if (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickDown)
+            {
+                g_GameWorkConst->config.screenPositionY++;
+            }
+            if (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickLeft)
+            {
+                g_GameWorkConst->config.screenPositionX--;
+            }
+            if (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickRight)
+            {
+                g_GameWorkConst->config.screenPositionX++;
+            }
+            g_GameWorkConst->config.screenPositionX = CLAMP(g_GameWorkConst->config.screenPositionX, -OPT_SCREEN_POS_X_RANGE, OPT_SCREEN_POS_X_RANGE);
+            g_GameWorkConst->config.screenPositionY = CLAMP(g_GameWorkConst->config.screenPositionY, -OPT_SCREEN_POS_Y_RANGE, OPT_SCREEN_POS_Y_RANGE);
+
+            // Play sound.
+            if (g_GameWorkConst->config.screenPositionX != screenPosMenu_PositionX ||
+                g_GameWorkConst->config.screenPositionY != screenPosMenu_PositionY)
+            {
+                Sd_PlaySfx(Sfx_MenuMove, 0, 64);
+            }
+
+            // Start background color fade.
+            if (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.enter)
+            {
+                if (screenPosMenu_BackgroundFade == 255)
+                {
+                    screenPosMenu_BackgroundFade       = 0;
+                    g_ScreenPosMenu_InvertBackgroundFade = (g_ScreenPosMenu_InvertBackgroundFade + 1) & (1 << 0);
+                }
+            }
+
+            // Leave menu.
+            if (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.cancel)
+            {
+                Sd_PlaySfx(Sfx_MenuCancel, 0, 64);
+
+                ScreenFade_Start(true, false, false);
+                g_GameWork.gameStateSteps[2] = 0;
+                g_GameWork.gameStateSteps[1]++;
+            }
+            break;
+
+        case ScreenPosMenuState_Leave:
+            // Switch to previous menu.
+            if (ScreenFade_IsFinished())
+            {
+                ScreenFade_Start(true, true, false);
+                g_GameWork.gameStateSteps[0]    = OptionsMenuState_LeaveScreenPos;
+                g_SysWork.counters_1C[1]                 = 0;
+                g_GameWork.gameStateSteps[1]    = 0;
+                g_GameWork.gameStateSteps[2]    = 0;
+                g_GameWork.background2dColor.r = 0;
+                g_GameWork.background2dColor.g = 0;
+                g_GameWork.background2dColor.b = 0;
+                return;
+            }
+            break;
+    }
+
+    // Update background fade.
+    screenPosMenu_BackgroundFade += BG_FADE_STEP;
+    screenPosMenu_BackgroundFade  = CLAMP(screenPosMenu_BackgroundFade, 0, 255);
+    switch (g_ScreenPosMenu_InvertBackgroundFade)
+    {
+        case false:
+            g_GameWork.background2dColor.r = ~screenPosMenu_BackgroundFade;
+            g_GameWork.background2dColor.g = ~screenPosMenu_BackgroundFade;
+            g_GameWork.background2dColor.b = ~screenPosMenu_BackgroundFade;
+            break;
+
+        case true:
+            g_GameWork.background2dColor.r = screenPosMenu_BackgroundFade;
+            g_GameWork.background2dColor.g = screenPosMenu_BackgroundFade;
+            g_GameWork.background2dColor.b = screenPosMenu_BackgroundFade;
+            break;
+    }
+
+    packet = GsOUT_PACKET_P;
+
+    for (i = 0; i < 6; i++)
+    {
+        tile = (TILE*)packet;
+
+        setTile(tile);
+
+        if (g_ScreenPosMenu_InvertBackgroundFade == 0)
+        {
+            setRGB0(tile, 0xFF, 0, 0);
+        }
+        else if (g_ScreenPosMenu_InvertBackgroundFade == 1)
+        {
+            setRGB0(tile, 0xFF, 0, 0);
+        }
+
+        if (i < 3)
+        {
+            setXY0(tile, -160, -97 + (96 * i));
+            setWH(tile, SCREEN_WIDTH, 2);
+        }
+        else
+        {
+            setXY0(tile, -577 + (144 * i), -120);
+            setWH(tile, 2, SCREEN_HEIGHT);
+        }
+
+        addPrim(g_OrderingTable0[g_ActiveBufferIdx].org, (TILE*)packet);
+        packet += sizeof(TILE);
+    }
+
+    for (i = 0; i < 28; i++)
+    {
+        tile = (TILE*)packet;
+
+        setTile(tile);
+
+        switch (g_ScreenPosMenu_InvertBackgroundFade)
+        {
+            case 0:
+                setRGB0(tile, screenPosMenu_BackgroundFade, screenPosMenu_BackgroundFade, screenPosMenu_BackgroundFade);
+                break;
+
+            case 1:
+                setRGB0(tile, ~screenPosMenu_BackgroundFade, ~screenPosMenu_BackgroundFade, ~screenPosMenu_BackgroundFade);
+                break;
+        }
+
+        if (i < 11)
+        {
+            setXY0(tile, -160, -81 + (16 * i));
+            setWH(tile, SCREEN_WIDTH, 2);
+        }
+        else
+        {
+            setXY0(tile, -305 + (16 * i), -120);
+            setWH(tile, 2, SCREEN_HEIGHT);
+        }
+
+        addPrim(g_OrderingTable0[g_ActiveBufferIdx].org, (TILE*)packet);
+        packet += sizeof(TILE);
+    }
+
+    GsOUT_PACKET_P = packet;
+
+    Options_ScreenPosMenu_ArrowsDraw();
+    Options_ScreenPosMenu_ConfigDraw();
+
+    #undef OPT_SCREEN_POS_X_RANGE
+    #undef OPT_SCREEN_POS_Y_RANGE
+    #undef BG_FADE_STEP
+}
+
+void Options_ScreenPosMenu_ArrowsDraw(void) // 0x801E5A08
+{
+    #define DIR_COUNT 4
+
+    const s_Triangle2d FRONT_ARROWS[] = {
+        { {  0,  -100 }, { -8,   -92 }, {  8,  -92 } },
+        { {  0,   100 }, { -8,    92 }, {  8,   92 } },
+        { { -148, 0   }, { -140, -8  }, { -140, 8  } },
+        { {  148, 0   }, {  140, -8  }, {  140, 8  } }
+    };
+
+    const s_Triangle2d BACK_ARROWS[] = {
+        { {  0,  -101 }, { -10,  -91 }, {  9,  -91 } },
+        { {  0,   101 }, { -10,   91 }, {  9,   91 } },
+        { { -149, 0   }, { -139, -10 }, { -139, 10 } },
+        { {  149, 0   }, {  139, -10 }, {  139, 10 } }
+    };
+
+    u8  dirs[DIR_COUNT]; // Booleans.
+    s32 i;
+
+    // Clear directions array for no reason.
+    memset(dirs, 0, DIR_COUNT);
+
+    // Draw flashing up/down/left/right arrows.
+    for (i = 0; i < DIR_COUNT; i++)
+    {
+        Options_Selection_ArrowDraw(&FRONT_ARROWS[i], true, false);
+    }
+
+    if ((g_Controller0->clickedBtnFlags & ControllerFlag_LStickUp) ||
+        (g_Controller0->heldBtnFlags     & ControllerFlag_LStickUp))
+    {
+        dirs[0] = true;
+    }
+    if ((g_Controller0->clickedBtnFlags & ControllerFlag_LStickDown) ||
+        (g_Controller0->heldBtnFlags     & ControllerFlag_LStickDown))
+    {
+        dirs[1] = true;
+    }
+    if ((g_Controller0->clickedBtnFlags & ControllerFlag_LStickLeft) ||
+        (g_Controller0->heldBtnFlags     & ControllerFlag_LStickLeft))
+    {
+        dirs[2] = true;
+    }
+    if ((g_Controller0->clickedBtnFlags & ControllerFlag_LStickRight) ||
+        (g_Controller0->heldBtnFlags     & ControllerFlag_LStickRight))
+    {
+        dirs[3] = true;
+    }
+
+    // Draw border to highlight flashing up/down/left/right arrow corresponding to direction of UI navigation.
+    for (i = 0; i < DIR_COUNT; i++)
+    {
+        if (dirs[i])
+        {
+            Options_Selection_ArrowDraw(&BACK_ARROWS[i], false, false);
+        }
+    }
+
+    #undef DIR_COUNT
+}
+
+void Options_ScreenPosMenu_ConfigDraw(void) // 0x801E5CBC
+{
+    s32      i;
+    LINE_F2* line;
+    POLY_F4* poly;
+    GsOT*    ot = &g_OrderingTable2[g_ActiveBufferIdx];
+
+    const DVECTOR LINE_BASES[] = {
+        { -60, 40 },
+        { -60, 70 },
+        { 60, 70 },
+        { 60, 40 }
+    };
+
+    const char* AXIS_OFFSET_STRS[] = {
+        "X:_",
+        "Y:_"
+    };
+
+    for (i = 0; i < 4; i++)
+    {
+        line = (LINE_F2*)GsOUT_PACKET_P;
+
+        setLineF2(line);
+        setCodeWord(line, 0x40, (i < 2) ? COLOR_RGBC(240, 240, 240, 0) : COLOR_RGBC(128, 128, 128, 0));
+
+        setXY0Fast(line, (u16)(LINE_BASES[i].vx             - g_GameWorkConst->config.screenPositionX), LINE_BASES[i].vy             - g_GameWorkConst->config.screenPositionY);
+        setXY1Fast(line, (u16)(LINE_BASES[(i + 1) & 0x3].vx - g_GameWorkConst->config.screenPositionX), LINE_BASES[(i + 1) & 0x3].vy - g_GameWorkConst->config.screenPositionY);
+
+        addPrim((u8*)ot->org + LAYER_40, line);
+        GsOUT_PACKET_P = (u8*)line + sizeof(LINE_F2);
+    }
+
+    poly = (POLY_F4*)GsOUT_PACKET_P;
+    setPolyF4(poly);
+
+    setCodeWord(poly, 40, 0);
+    setXY0Fast(poly, (u16)(LINE_BASES[0].vx - g_GameWorkConst->config.screenPositionX), LINE_BASES[0].vy - g_GameWorkConst->config.screenPositionY);
+    setXY1Fast(poly, (u16)(LINE_BASES[1].vx - g_GameWorkConst->config.screenPositionX), LINE_BASES[1].vy - g_GameWorkConst->config.screenPositionY);
+    setXY2Fast(poly, (u16)(LINE_BASES[3].vx - g_GameWorkConst->config.screenPositionX), LINE_BASES[3].vy - g_GameWorkConst->config.screenPositionY);
+    setXY3Fast(poly, (u16)(LINE_BASES[2].vx - g_GameWorkConst->config.screenPositionX), LINE_BASES[2].vy - g_GameWorkConst->config.screenPositionY);
+
+    addPrim((u8*)ot->org + LAYER_40, poly);
+    GsOUT_PACKET_P = (u8*)poly + sizeof(POLY_F4);
+
+    Gfx_StringSetPosition(108 - g_GameWorkConst->config.screenPositionX, 162 - g_GameWorkConst->config.screenPositionY);
+    Gfx_StringDraw(AXIS_OFFSET_STRS[0], 10);
+    Gfx_StringDrawInt(3, g_GameWorkConst->config.screenPositionX);
+
+    Gfx_StringSetPosition(168 - g_GameWorkConst->config.screenPositionX, 162 - g_GameWorkConst->config.screenPositionY);
+    Gfx_StringDraw(AXIS_OFFSET_STRS[1], 10);
+    Gfx_StringDrawInt(3, g_GameWorkConst->config.screenPositionY);
+}
+
+// ========================================
+// BRIGHTNESS OPTION SCREEN
+// ========================================
+
+#ifdef SH_PC_PORT
+/* The Brightness screen becomes a three-row image-adjust panel on PC:
+ * Brightness / Contrast / Saturation, each driving a g_PcConfig float and the
+ * matching live renderer global, saved to config on change. A procedural
+ * reference bar (g_cfg_calibBar, drawn in the post shader) sits behind it. */
+static s32 g_PcBrtRow = 0; /* 0 = Brightness, 1 = Contrast, 2 = Saturation */
+
+static void Pc_BrightnessRowAdjust(s32 row, int dir)
+{
+    extern float g_cfg_brightness, g_cfg_contrast, g_cfg_saturation;
+    struct { float* cfg; float* live; float mn, mx, step; const char* key; } R[3] = {
+        { &g_PcConfig.brightness, &g_cfg_brightness, 0.25f, 2.0f, 0.05f, "brightness" },
+        { &g_PcConfig.contrast,   &g_cfg_contrast,   0.5f,  2.0f, 0.05f, "contrast"   },
+        { &g_PcConfig.saturation, &g_cfg_saturation, 0.0f,  2.0f, 0.05f, "saturation" },
+    };
+    float v;
+
+    if (row < 0 || row > 2 || dir == 0)
+        return;
+
+    v = *R[row].cfg + (float)dir * R[row].step;
+    if (v < R[row].mn) v = R[row].mn;
+    if (v > R[row].mx) v = R[row].mx;
+
+    *R[row].cfg  = v;
+    *R[row].live = v;
+    { char b[16]; snprintf(b, sizeof(b), "%.3f", v); PcConfig_SaveKeyValue(R[row].key, b); }
+    Sd_PlaySfx(Sfx_MenuMove, 0, Q8(0.25f));
+}
+#endif
+
+void Options_BrightnessMenu_Control(void) // 0x801E6018
+{
+#ifdef SH_PC_PORT
+    /* Show the procedural reference bar while this screen is up. Cleared in the
+     * Leave state below. */
+    { extern int g_cfg_calibBar; g_cfg_calibBar = 1; }
+#endif
+    // Handle menu state.
+    switch (g_GameWork.gameStateSteps[1])
+    {
+        case BrightnessMenuState_0:
+            // Entry.
+            g_GameWork.gameStateSteps[1] = BrightnessMenuState_1;
+            g_GameWork.gameStateSteps[2] = 0;
+            break;
+
+        case BrightnessMenuState_1:
+            // Set fade.
+            ScreenFade_Start(true, true, false);
+            g_GameWork.gameStateSteps[1] = BrightnessMenuState_2;
+            g_GameWork.gameStateSteps[2] = 0;
+            break;
+
+        case BrightnessMenuState_2:
+#ifdef SH_PC_PORT
+            /* Up/Down select a row (Brightness/Contrast/Saturation), Left/Right
+             * adjust it. Mouse: wheel adjusts the selected row; hovering a row
+             * band selects it; left-click the arrow columns adjusts; right-click
+             * leaves. Rows drawn from y 74 at 16px pitch (see ConfigDraw). */
+            {
+                int mx, my;
+
+                if (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickUp)
+                {
+                    g_PcBrtRow = (g_PcBrtRow + 2) % 3;
+                    Sd_PlaySfx(Sfx_MenuMove, 0, Q8(0.25f));
+                }
+                if (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickDown)
+                {
+                    g_PcBrtRow = (g_PcBrtRow + 1) % 3;
+                    Sd_PlaySfx(Sfx_MenuMove, 0, Q8(0.25f));
+                }
+                if (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickLeft)
+                    Pc_BrightnessRowAdjust(g_PcBrtRow, -1);
+                if (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickRight)
+                    Pc_BrightnessRowAdjust(g_PcBrtRow, +1);
+
+                if (Pc_MouseCursor_UiPos(&mx, &my))
+                {
+                    int wheel = Pc_MouseCursor_WheelStep();
+
+                    /* Wheel adjusts the selected row; left of centre lowers, right
+                     * raises it; right-click leaves. Kept geometry-free (no
+                     * per-row hit-test) — Up/Down selects the row. */
+                    if (wheel != 0)
+                        Pc_BrightnessRowAdjust(g_PcBrtRow, wheel);
+                    else if (Pc_MouseCursor_LeftClicked())
+                    {
+                        /* Leaving was right-click only, and a touchscreen has no
+                         * second button -- so on a phone this screen could not be
+                         * left at all without a pad. A tap in the middle third
+                         * backs out; left and right still adjust, which is where
+                         * a finger naturally goes to change a value anyway.
+                         * Mouse behaviour is untouched. */
+                        if (Pc_Touch_UsedRecently() && mx >= 120 && mx <= 200)
+                        {
+                            /* Belt and braces: the Leave state clears this too,
+                             * but the bar is drawn by the post shader from a
+                             * global, so if any exit path ever misses it the bar
+                             * is left burned across the picture. */
+                            { extern int g_cfg_calibBar; g_cfg_calibBar = 0; }
+                            PcMouse_InjectCancel();
+                        }
+                        else
+                        {
+                            Pc_BrightnessRowAdjust(g_PcBrtRow, (mx < 160) ? -1 : +1);
+                        }
+                    }
+
+                    if (Pc_MouseCursor_RightClicked())
+                        PcMouse_InjectCancel();
+                }
+            }
+#else
+            // Set config.
+            if (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickLeft)
+            {
+                if (g_GameWork.config.brightness != 0)
+                {
+                    g_GameWork.config.brightness--;
+                    Sd_PlaySfx(Sfx_MenuMove, 0, Q8(0.25f));
+                }
+            }
+            if (g_Controller0->pulsedBtnFlags & ControllerFlag_LStickRight)
+            {
+                if (g_GameWork.config.brightness < 7)
+                {
+                    g_GameWork.config.brightness++;
+                    Sd_PlaySfx(Sfx_MenuMove, 0, Q8(0.25f));
+                }
+            }
+#endif
+
+            // Fade screen and leave menu.
+            if (g_Controller0->clickedBtnFlags & (g_GameWorkPtr->config.controllerConfig.enter |
+                                                 g_GameWorkPtr->config.controllerConfig.cancel))
+            {
+                if (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.enter)
+                {
+                    Sd_PlaySfx(Sfx_MenuConfirm, 0, Q8(0.25f));
+                }
+                else
+                {
+                    Sd_PlaySfx(Sfx_MenuCancel, 0, Q8(0.25f));
+                }
+
+                ScreenFade_Start(true, false, false);
+                g_GameWork.gameStateSteps[1]++;
+                g_GameWork.gameStateSteps[2] = 0;
+            }
+            break;
+
+        case BrightnessMenuState_Leave:
+#ifdef SH_PC_PORT
+            { extern int g_cfg_calibBar; g_cfg_calibBar = 0; }
+#endif
+            // Switch to previous menu.
+            // TODO: Odd check for `ScreenFade_IsFinished()`.
+            if ( (g_Screen_FadeStatus & (1 << 2)) &&
+                !(g_Screen_FadeStatus & (1 << 1)) &&
+                 (g_Screen_FadeStatus & (1 << 0)))
+            {
+                ScreenFade_Start(true, true, false);
+                g_GameWork.gameStateSteps[0]   = OptionsMenuState_LeaveBrightness;
+                g_SysWork.counters_1C[1]       = 0;
+                g_GameWork.gameStateSteps[1]   = 0;
+                g_GameWork.gameStateSteps[2]   = 0;
+                g_GameWork.background2dColor.r = 0;
+                g_GameWork.background2dColor.g = 0;
+                g_GameWork.background2dColor.b = 0;
+            }
+            break;
+    }
+
+    // Draw graphics.
+    if (g_GameWork.gameStatePrev == GameState_MainMenu)
+    {
+        Screen_BackgroundImgDraw(&g_BrightnessScreenImg0);
+    }
+    else
+    {
+        Screen_BackgroundImgDraw(&g_BrightnessScreenImg1);
+    }
+
+    Options_BrightnessMenu_LinesDraw(g_GameWork.config.brightness);
+    Options_BrightnessMenu_ArrowsDraw();
+    Options_BrightnessMenu_ConfigDraw();
+#ifdef SH_PC_PORT
+    Pc_MouseCursor_Draw();
+#endif
+}
+
+void Options_BrightnessMenu_ConfigDraw(void) // 0x801E6238
+{
+#ifdef SH_PC_PORT
+    /* Three rows: Brightness / Contrast / Saturation, values shown as a
+     * percentage (100 = neutral). The selected row is gold, the highlight
+     * bracket marks it. Values read from the live renderer globals so the text
+     * always matches what is applied. */
+    extern float g_cfg_brightness, g_cfg_contrast, g_cfg_saturation;
+    /* Trailing '_' pad the labels to equal RENDERED width so the value column
+     * lines up (the font is proportional, so "CONTRAST" + 3 spaces was 9px
+     * narrower than "BRIGHTNESS" + 1, pushing its number left). 5 underscores
+     * = 118px, matching BRIGHTNESS 117 / SATURATION 120. */
+    const char* const NAMES[3] = { "BRIGHTNESS_", "CONTRAST_____", "SATURATION_" };
+    const float*      vals[3];
+    s32 i;
+
+    vals[0] = &g_cfg_brightness;
+    vals[1] = &g_cfg_contrast;
+    vals[2] = &g_cfg_saturation;
+
+    for (i = 0; i < 3; i++)
+    {
+        /* Kept above the bottom reference bar (bar occupies ~the bottom 15%).
+         * Selection shown by gold vs white — no bracket glyph (the menu font
+         * renders '[' as a curly quote). */
+        Gfx_StringSetColor(i == g_PcBrtRow ? StringColorId_Gold : StringColorId_White);
+        Gfx_StringSetPosition(SCREEN_POSITION_X(22.0f), SCREEN_POSITION_Y(52.0f + (float)i * 8.0f));
+        Gfx_StringDraw(NAMES[i], 20);
+        Gfx_StringDrawInt(3, (s32)((*vals[i] * 100.0f) + 0.5f));
+    }
+#else
+    const char* LEVEL_STR = "LEVEL_________";
+
+    Gfx_StringSetColor(StringColorId_White);
+    Gfx_StringSetPosition(SCREEN_POSITION_X(25.0f), SCREEN_POSITION_Y(79.5f));
+    Gfx_StringDraw(LEVEL_STR, 20);
+    Gfx_StringDrawInt(1, g_GameWork.config.brightness);
+#endif
+}
+
+void Options_BrightnessMenu_ArrowsDraw(void) // 0x801E628C
+{
+#ifdef SH_PC_PORT
+    /* The knobs must flank the SELECTED row's value, not sit at a fixed y=84
+     * (which now lands on the reference bar as "ears"). ConfigDraw draws each
+     * row at SCREEN_POSITION_Y(52 + 8*row) in screen space; the arrow prims draw
+     * in centre-origin space, so subtract the 112 draw-offset (+5 to centre the
+     * knob on the text line, matching the original's 84 vs its 79.5% value row).
+     * X (8/64) already brackets the value column. */
+    s32 yc  = (s32)(SCREEN_HEIGHT * ((52.0f + (float)g_PcBrtRow * 8.0f) / 100.0f)) - 107;
+    /* Shift both knobs right so the left one clears the label and they bracket
+     * the value number (labels are longer than the retail "LEVEL"). With the
+     * value column now aligned across rows, 10 sits the knobs a touch tighter
+     * around the number than the old 14. */
+    const s32 xo = 10;
+    s32 dir = (g_Controller0->heldBtnFlags & ControllerFlag_LStickLeft)  ? 1 :
+              (g_Controller0->heldBtnFlags & ControllerFlag_LStickRight) ? 2 : 0;
+    const s_Triangle2d FRONT_ARROWS[2] = {
+        { { 8 + xo,  yc }, { 16 + xo, yc - 8 }, { 16 + xo, yc + 8 } },
+        { { 64 + xo, yc }, { 56 + xo, yc - 8 }, { 56 + xo, yc + 8 } }
+    };
+    const s_Triangle2d BORDER_ARROWS[2] = {
+        { { 7 + xo,  yc }, { 17 + xo, yc - 10 }, { 17 + xo, yc + 10 } },
+        { { 65 + xo, yc }, { 55 + xo, yc - 10 }, { 55 + xo, yc + 10 } }
+    };
+    s32 i;
+
+    for (i = 0; i < 2; i++)
+        Options_Selection_ArrowDraw(&FRONT_ARROWS[i], true, false);
+
+    /* Border highlights the side being pushed; dir 0 would read [-1] (OOB), so
+     * only draw when a direction is held. */
+    if (dir != 0)
+        Options_Selection_ArrowDraw(&BORDER_ARROWS[dir - 1], false, false);
+#else
+    const s_Triangle2d FRONT_ARROWS[] = {
+        { { 8, 84  }, { 16, 76 }, { 16, 92 } },
+        { { 64, 84 }, { 56, 76 }, { 56, 92 } }
+    };
+
+    const s_Triangle2d BORDER_ARROWS[] = {
+        { { 7, 84  }, { 17, 74 }, { 17, 94 } },
+        { { 65, 84 }, { 55, 74 }, { 55, 94 } }
+    };
+
+    s32 btnInput;
+    s32 i;
+    s32 dir;
+
+    // Determine UI movement direction.
+    btnInput = g_Controller0->heldBtnFlags;
+    if (btnInput & ControllerFlag_LStickLeft)
+    {
+        dir = 1;
+    }
+    else if (btnInput & ControllerFlag_LStickRight)
+    {
+        dir = 2;
+    }
+    else
+    {
+        dir = 0;
+    }
+
+    // Draw flashing left/right arrows.
+    for (i = 0; i < 2; i++)
+    {
+        Options_Selection_ArrowDraw(&FRONT_ARROWS[i], true, false);
+    }
+
+    // Draw border to highlight flashing left/right arrow corresponding to direction of UI navigation.
+    for (i = dir - 1; i < dir; i++)
+    {
+        Options_Selection_ArrowDraw(&BORDER_ARROWS[i], false, false);
+    }
+#endif
+}
+
+// ========================================
+// DRAW OPTIONS FEATURES SCREEN
+// ========================================
+
+void Options_Selection_HighlightDraw(const s_Line2d* line, bool hasShadow, bool invertGradient) // 0x801E641C
+{
+    #define STR_OFFSET_Y 16
+
+    s_Line2d* localLine;
+    LINE_G2*  linePrim;
+    POLY_G4*  poly;
+    GsOT*     ot;
+
+    ot        = &g_OrderingTable2[g_ActiveBufferIdx];
+    linePrim  = (LINE_G2*)GsOUT_PACKET_P;
+    localLine = line;
+
+    // Draw underline.
+    setLineG2(linePrim);
+
+    // @unused Non-functioning line color gradient inversion? Gradient is unchanged regardless of `invertGradient`'s value,
+    // which itself is always passed as `false`. Purpose is guessed based on a similar parameter in `Options_Selection_BulletPointDraw`.
+    if (invertGradient)
+    {
+        setRGBC0(linePrim, 176, 176, 176, PRIM_LINE | RECT_SIZE_8);
+        setRGBC1(linePrim, 160, 128, 64,  PRIM_LINE | RECT_SIZE_8);
+    }
+    else
+    {
+        setRGBC0(linePrim, 176, 176, 176, PRIM_LINE | RECT_SIZE_8);
+        setRGBC1(linePrim, 160, 128, 64,  PRIM_LINE | RECT_SIZE_8);
+    }
+
+    setXY0Fast(linePrim, localLine->vertex0.vx, localLine->vertex0.vy);
+    setXY1Fast(linePrim, localLine->vertex1.vx, localLine->vertex1.vy);
+    addPrim((u8*)ot->org + (hasShadow ? LAYER_36 : LAYER_24), linePrim);
+    GsOUT_PACKET_P = (u8*)linePrim + sizeof(LINE_G2);
+
+    // Draw shadow gradient.
+    if (hasShadow)
+    {
+        poly = (POLY_G4*)GsOUT_PACKET_P;
+        setPolyG4(poly);
+        setSemiTrans(poly, true);
+        setRGB0(poly, 0, 0, 0);
+        setRGB1(poly, Q8_COLOR(0.375f), Q8_COLOR(0.375f), Q8_COLOR(0.375f));
+        setRGB2(poly, 0, 0, 0);
+        setRGB3(poly, Q8_COLOR(0.375f), Q8_COLOR(0.375f), Q8_COLOR(0.375f));
+        setXY4(poly,
+               localLine->vertex0.vx, localLine->vertex0.vy - STR_OFFSET_Y, localLine->vertex0.vx, localLine->vertex0.vy,
+               localLine->vertex1.vx, localLine->vertex1.vy - STR_OFFSET_Y, localLine->vertex1.vx, localLine->vertex1.vy);
+        addPrim((u8*)ot->org + LAYER_36, poly);
+        GsOUT_PACKET_P = (u8*)poly + sizeof(POLY_G4);
+
+        Gfx_Primitive2dTextureSet(0, 0, 9, 2);
+    }
+
+    #undef STR_OFFSET_Y
+}
+
+void Options_Selection_ArrowDraw(const s_Triangle2d* arrow, bool isFlashing, bool resetColor) // 0x801E662C
+{
+    s32      colorFade;
+    s32      colorStart;
+    s32      colorEnd;
+    POLY_G3* arrowPoly;
+    GsOT*    ot;
+
+    ot = &g_OrderingTable2[g_ActiveBufferIdx];
+
+    // @unused `resetColor` doesn't serve any meaningful purpose.
+    if (resetColor)
+    {
+        colorEnd   = 0;
+        colorStart = 0;
+    }
+
+    colorFade = g_SysWork.counters_1C[0] & 0x7F;
+
+    // Fade start color.
+    if (colorFade >= 32)
+    {
+        colorStart = 32;
+        if (colorFade < 64)
+        {
+            colorStart = 32;
+        }
+        else if (colorFade < 96)
+        {
+            colorStart = 96 - colorFade;
+        }
+        else
+        {
+            colorStart = 0;
+        }
+    }
+    else
+    {
+        colorStart = colorFade;
+    }
+
+    // Fade end color.
+    if (colorFade >= 32)
+    {
+        if (colorFade < 64)
+        {
+            colorEnd = colorFade - 32;
+        }
+        else if (colorFade >= 96)
+        {
+            colorEnd = 128 - colorFade;
+        }
+        else
+        {
+            colorEnd = 32;
+        }
+    }
+    else
+    {
+        colorEnd = 0;
+    }
+
+    // Draw blue arrow.
+    arrowPoly = (POLY_G3*)GsOUT_PACKET_P;
+    setPolyG3(arrowPoly);
+
+    // Flash color from blue to cyan.
+    if (isFlashing)
+    {
+        // Base color is blue. `* 0x700` Shifts green component into place.
+        *((u32*)&arrowPoly->r0) = (colorEnd   * 0x700) + COLOR_RGBC(0, 0, 255, PRIM_POLY | RECT_SIZE_8);
+        *((u32*)&arrowPoly->r1) = (colorStart * 0x700) + COLOR_RGBC(0, 0, 255, PRIM_POLY | RECT_SIZE_8);
+        *((u32*)&arrowPoly->r2) = (colorStart * 0x700) + COLOR_RGBC(0, 0, 255, PRIM_POLY | RECT_SIZE_8);
+    }
+    // Set solid cyan color.
+    else
+    {
+        setRGBC0(arrowPoly, 0, 240, 240, PRIM_POLY | RECT_SIZE_8);
+        setRGBC1(arrowPoly, 0, 240, 240, PRIM_POLY | RECT_SIZE_8);
+        setRGBC2(arrowPoly, 0, 240, 240, PRIM_POLY | RECT_SIZE_8);
+    }
+
+    setXY0Fast(arrowPoly, arrow->vertex0.vx, arrow->vertex0.vy);
+    setXY1Fast(arrowPoly, arrow->vertex1.vx, arrow->vertex1.vy);
+    setXY2Fast(arrowPoly, arrow->vertex2.vx, arrow->vertex2.vy);
+    addPrim((u8*)ot->org + LAYER_40, arrowPoly);
+    GsOUT_PACKET_P = (u8*)arrowPoly + sizeof(POLY_G3);
+}
+
+void Options_Selection_BulletPointDraw(const s_Quad2d* quad, bool isBorder, bool isInactive) // 0x801E67B0
+{
+    #define TRI_COUNT 2
+
+    GsOT*    ot = &g_OrderingTable2[g_ActiveBufferIdx];
+    s32      i;
+    POLY_G3* poly;
+
+    // Draw quad as triangles to achieve diagonal gradient.
+    for (i = 0; i < TRI_COUNT; i++)
+    {
+        poly = (POLY_G3*)GsOUT_PACKET_P;
+        setPolyG3(poly);
+
+        if (isBorder)
+        {
+            // Set color.
+            switch (isInactive)
+            {
+                case false:
+                    setRGBC0(poly, 255, 255, 255, PRIM_POLY | RECT_SIZE_8);
+                    setRGBC1(poly, 160, 128, 64,  PRIM_POLY | RECT_SIZE_8);
+                    setRGBC2(poly, 64,  64,  64,  PRIM_POLY | RECT_SIZE_8);
+                    break;
+
+                case true:
+                    setRGBC0(poly, 128, 128, 128, PRIM_POLY | RECT_SIZE_8);
+                    setRGBC1(poly, 40,  32,  16,  PRIM_POLY | RECT_SIZE_8);
+                    setRGBC2(poly, 16,  16,  16,  PRIM_POLY | RECT_SIZE_8);
+                    break;
+            }
+
+            // Draw triangle.
+            if (i != 0)
+            {
+                setXY0Fast(poly, quad->vertex0.vx, quad->vertex0.vy);
+                setXY1Fast(poly, quad->vertex1.vx, quad->vertex1.vy);
+                setXY2Fast(poly, quad->vertex3.vx, quad->vertex3.vy);
+            }
+            else
+            {
+                setXY0Fast(poly, quad->vertex0.vx, quad->vertex0.vy);
+                setXY1Fast(poly, quad->vertex2.vx, quad->vertex2.vy);
+                setXY2Fast(poly, quad->vertex3.vx, quad->vertex3.vy);
+            }
+        }
+        else
+        {
+            // Set color.
+            switch (isInactive)
+            {
+                case false:
+                    setRGBC0(poly, 160, 128, 64,  PRIM_POLY | RECT_SIZE_8);
+                    setRGBC1(poly, 255, 255, 255, PRIM_POLY | RECT_SIZE_8);
+                    setRGBC2(poly, 255, 255, 255, PRIM_POLY | RECT_SIZE_8);
+                    break;
+
+                case true:
+                    setRGBC0(poly, 80,  64,  32,  PRIM_POLY | RECT_SIZE_8);
+                    setRGBC1(poly, 160, 160, 160, PRIM_POLY | RECT_SIZE_8);
+                    setRGBC2(poly, 160, 160, 160, PRIM_POLY | RECT_SIZE_8);
+                    break;
+            }
+
+            // Draw triangle.
+            if (i != 0)
+            {
+                setXY0Fast(poly, quad->vertex3.vx, quad->vertex3.vy);
+                setXY1Fast(poly, quad->vertex1.vx, quad->vertex1.vy);
+                setXY2Fast(poly, quad->vertex2.vx, quad->vertex2.vy);
+            }
+            else
+            {
+                setXY0Fast(poly, quad->vertex0.vx, quad->vertex0.vy);
+                setXY1Fast(poly, quad->vertex1.vx, quad->vertex1.vy);
+                setXY2Fast(poly, quad->vertex2.vx, quad->vertex2.vy);
+            }
+        }
+
+        addPrim((u8*)ot->org + LAYER_24, poly);
+        GsOUT_PACKET_P = (u8*)poly + sizeof(POLY_G3);
+    }
+
+    #undef TRI_COUNT
+}
+
+// ========================================
+// CONTROLS OPTION SCREEN
+// ========================================
+
+void Options_ControllerMenu_Control(void) // 0x801E69BC
+{
+    s32                                     boundActionIdx = NO_VALUE;
+    e_InputAction                           actionIdx;
+    static s_ControllerMenu_SelectedEntries selectedEntries;
+
+#ifdef SH_PC_PORT
+    /* PC: this screen is the in-game controls panel (pc_bind_panel.c), a GL
+     * overlay over the PSX layout. It opens once per visit, and the screen
+     * leaves the way EXIT does when the panel closes. The PSX actions pane
+     * only ever re-mapped PSX buttons onto game actions, which on PC sits
+     * under the launcher's physical binds and only confused them. */
+    {
+        static int s_bindPanelShown = 0;
+
+        if (g_GameWork.gameStateSteps[1] == ControllerMenuState_Leave)
+        {
+            /* The PSX leave path would draw the old layout under the fade-out;
+             * leave the same way without drawing anything. */
+            s_bindPanelShown = 0;
+            if (ScreenFade_IsFinished())
+            {
+                ScreenFade_Start(true, true, false);
+                g_GameWork.gameStateSteps[0] = OptionsMenuState_LeaveController;
+                g_SysWork.counters_1C[1]     = 0;
+                g_GameWork.gameStateSteps[1] = 0;
+                g_GameWork.gameStateSteps[2] = 0;
+            }
+            return;
+        }
+        else
+        {
+            if (!s_bindPanelShown)
+            {
+                /* Refused (a phone's controller went away on the way in):
+                 * Update below then reports closed and the screen leaves. */
+                Pc_BindPanel_TryOpen();
+                s_bindPanelShown = 1;
+            }
+            if (Pc_BindPanel_Update())
+            {
+                ScreenFade_Start(false, true, false);
+                g_Controller0->clickedBtnFlags   = 0;
+                g_Controller0->pulsedBtnFlags    = 0;
+                g_Controller0->pulsedGuiBtnFlags = 0;
+                return;
+            }
+            ScreenFade_Start(false, false, false);
+            g_GameWork.gameStateSteps[1] = ControllerMenuState_Leave;
+            g_GameWork.gameStateSteps[2] = 0;
+            s_bindPanelShown             = 0;
+
+            /* Return on the closing frame too. Without this the function ran on
+             * into the stock controller layout below and drew it once, which is
+             * the old screen flashing up for a frame as the panel exits. The
+             * Leave branch above handles every frame after this one and draws
+             * nothing. */
+            return;
+        }
+    }
+#endif
+
+#ifdef SH_PC_PORT
+    /* Mouse: hover selects in both panes; click confirms ONLY in the presets
+     * pane (EXIT applies enter, TYPE rows apply the preset). In the actions
+     * pane hover-select is all we do — while that state is live,
+     * Options_ControllerMenu_ConfigUpdate BINDS any clicked button to the
+     * hovered action, so injected enter/cancel bits would rebind instead of
+     * confirm. Rebinding stays a keyboard/pad press, as retail intends. */
+    {
+        int mx, my;
+        s32 st = g_GameWork.gameStateSteps[1];
+
+        if ((st == ControllerMenuState_Exit  || st == ControllerMenuState_Type1 ||
+             st == ControllerMenuState_Type2 || st == ControllerMenuState_Type3 ||
+             st == ControllerMenuState_Actions) &&
+            Pc_MouseCursor_UiPos(&mx, &my))
+        {
+            if (mx < 92) /* presets pane: rows at y = 22 + i*20 */
+            {
+                s32 row = -1, i;
+
+                for (i = 0; i < CONTROLLER_MENU_ROW_COUNT; i++)
+                {
+                    s32 top = 22 + (i * 20) - 3;
+                    if (my >= top && my < top + 20) { row = i; break; }
+                }
+                if (row >= 0)
+                {
+                    if (Pc_MouseCursor_Moved() && st != row)
+                    {
+                        g_GameWork.gameStateSteps[1] = row;
+                        g_GameWork.gameStateSteps[2] = 0;
+                        SD_Call(Sfx_MenuMove);
+                    }
+                    if (Pc_MouseCursor_LeftClicked() && st == row)
+                        PcMouse_InjectEnter();
+                    if (Pc_MouseCursor_RightClicked() && st == row && st != ControllerMenuState_Exit)
+                        PcMouse_InjectCancel();
+                }
+            }
+            else /* actions pane: rows at y = 22, pitch 12, extra gap after SKIP */
+            {
+                s32 row = -1, i, y = 22;
+
+                for (i = 0; i < InputAction_Count; i++)
+                {
+                    if (my >= y - 2 && my < y + 10) { row = i; break; }
+                    y += 12 + ((i == 2) ? 12 : 0);
+                }
+                if (row >= 0 && Pc_MouseCursor_Moved())
+                {
+                    if (st != ControllerMenuState_Actions)
+                    {
+                        selectedEntries.preset       = st;
+                        g_GameWork.gameStateSteps[1] = ControllerMenuState_Actions;
+                        g_GameWork.gameStateSteps[2] = 0;
+                    }
+                    if (selectedEntries.action != (e_InputAction)row)
+                    {
+                        selectedEntries.action = (e_InputAction)row;
+                        SD_Call(Sfx_MenuMove);
+                    }
+                }
+            }
+        }
+        Pc_MouseCursor_Draw();
+    }
+#endif
+
+    // Handle controller config menu state.
+    switch (g_GameWork.gameStateSteps[1])
+    {
+        case ControllerMenuState_Exit:
+            ScreenFade_Start(false, true, false);
+            selectedEntries.preset = ControllerMenuState_Exit;
+
+            // Leave menu.
+            if (g_Controller0->clickedBtnFlags & (g_GameWorkPtr->config.controllerConfig.enter |
+                                                 g_GameWorkPtr->config.controllerConfig.cancel))
+            {
+                SD_Call(Sfx_MenuCancel);
+
+                ScreenFade_Start(false, false, false);
+                g_GameWork.gameStateSteps[1] = ControllerMenuState_Leave;
+                g_GameWork.gameStateSteps[2] = 0;
+                break;
+            }
+
+            // Move selection cursor up/down.
+            if (g_Controller0->pulsedGuiBtnFlags & ControllerFlag_LStickUp)
+            {
+                g_GameWork.gameStateSteps[1] = CONTROLLER_MENU_ROW_COUNT - 1;
+                g_GameWork.gameStateSteps[2] = 0;
+            }
+            else if (g_Controller0->pulsedGuiBtnFlags & ControllerFlag_LStickDown)
+            {
+                g_GameWork.gameStateSteps[1] = ControllerMenuState_Type1;
+                g_GameWork.gameStateSteps[2] = 0;
+            }
+            // Move selection cursor left/right.
+            else if (g_Controller0->pulsedGuiBtnFlags & (ControllerFlag_LStickLeft | ControllerFlag_LStickRight))
+            {
+                g_GameWork.gameStateSteps[1] = ControllerMenuState_Actions;
+                g_GameWork.gameStateSteps[2] = 0;
+            }
+            break;
+
+        case ControllerMenuState_Type1:
+        case ControllerMenuState_Type2:
+        case ControllerMenuState_Type3:
+            selectedEntries.preset = g_GameWork.gameStateSteps[1];
+
+            // Set binding preset.
+            if (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.enter)
+            {
+#ifndef SH_PC_PORT
+                SD_Call(Sfx_MenuConfirm);
+                Settings_RestoreControlDefaults(g_GameWork.gameStateSteps[1] - 1);
+#endif
+                /* PC: the USER row REPORTS the launcher's bindings, so confirming
+                 * it must not overwrite them with a stock preset. */
+            }
+            // Reset selection cursor.
+            else if (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.cancel)
+            {
+                SD_Call(Sfx_MenuCancel);
+                g_GameWork.gameStateSteps[1] = ControllerMenuState_Exit;
+                g_GameWork.gameStateSteps[2] = 0;
+            }
+            // Move selection cursor.
+            else
+            {
+                // Move selection cursor up/down.
+                if (g_Controller0->pulsedGuiBtnFlags & ControllerFlag_LStickUp)
+                {
+#ifdef SH_PC_PORT
+                    g_GameWork.gameStateSteps[1] = (g_GameWork.gameStateSteps[1] + (CONTROLLER_MENU_ROW_COUNT - 1)) % CONTROLLER_MENU_ROW_COUNT;
+#else
+                    g_GameWork.gameStateSteps[1] = (g_GameWork.gameStateSteps[1] - 1) & 3;
+#endif
+                    g_GameWork.gameStateSteps[2] = 0;
+                }
+                else if (g_Controller0->pulsedGuiBtnFlags & ControllerFlag_LStickDown)
+                {
+#ifdef SH_PC_PORT
+                    g_GameWork.gameStateSteps[1] = (g_GameWork.gameStateSteps[1] + 1) % CONTROLLER_MENU_ROW_COUNT;
+#else
+                    g_GameWork.gameStateSteps[1] = (g_GameWork.gameStateSteps[1] + 1) & 3;
+#endif
+                    g_GameWork.gameStateSteps[2] = 0;
+                }
+                // Move selection cursor left/right.
+                else if (g_Controller0->pulsedGuiBtnFlags & (ControllerFlag_LStickLeft | ControllerFlag_LStickRight))
+                {
+                    g_GameWork.gameStateSteps[1] = ControllerMenuState_Actions;
+                    g_GameWork.gameStateSteps[2] = 0;
+                }
+            }
+            break;
+
+        case ControllerMenuState_Actions:
+            actionIdx = selectedEntries.action;
+
+            // Move selection cursor up/down.
+            if (g_Controller0->pulsedGuiBtnFlags & ControllerFlag_LStickUp)
+            {
+                if (actionIdx != InputAction_Enter)
+                {
+                    selectedEntries.action = actionIdx - 1;
+                }
+                else
+                {
+                    selectedEntries.action = InputAction_Option;
+                }
+            }
+            else if (g_Controller0->pulsedGuiBtnFlags & ControllerFlag_LStickDown)
+            {
+                if (actionIdx != InputAction_Option)
+                {
+                    selectedEntries.action = actionIdx + 1;
+                }
+                else
+                {
+                    selectedEntries.action = InputAction_Enter;
+                }
+            }
+            // Move selection cursor left/right.
+            else if (g_Controller0->pulsedGuiBtnFlags & (ControllerFlag_LStickLeft | ControllerFlag_LStickRight))
+            {
+                g_GameWork.gameStateSteps[2] = 0;
+                g_GameWork.gameStateSteps[1] = selectedEntries.preset;
+            }
+            // Bind button to input action.
+            else
+            {
+                boundActionIdx = Options_ControllerMenu_ConfigUpdate(actionIdx);
+            }
+            break;
+
+        case ControllerMenuState_Leave:
+            // Switch to previous menu.
+            if (ScreenFade_IsFinished())
+            {
+                ScreenFade_Start(true, true, false);
+                g_GameWork.gameStateSteps[0] = OptionsMenuState_LeaveController;
+                g_SysWork.counters_1C[1]              = 0;
+                g_GameWork.gameStateSteps[1] = 0;
+                g_GameWork.gameStateSteps[2] = 0;
+            }
+            break;
+    }
+
+    if (g_GameWork.gameStateSteps[1] == ControllerMenuState_Actions)
+    {
+        g_ControllerMenu_IsOnActionsPane = true;
+    }
+    else
+    {
+        g_ControllerMenu_IsOnActionsPane = false;
+    }
+
+    // Play cursor navigation SFX.
+    if (g_Controller0->pulsedGuiBtnFlags & (ControllerFlag_LStickUp    |
+                                           ControllerFlag_LStickRight |
+                                           ControllerFlag_LStickDown  |
+                                           ControllerFlag_LStickLeft))
+    {
+        SD_Call(Sfx_MenuMove);
+    }
+
+    // Draw menu graphics.
+    Options_ControllerMenu_EntriesDraw(g_ControllerMenu_IsOnActionsPane, selectedEntries.preset, selectedEntries.action, boundActionIdx);
+}
+
+s32 Options_ControllerMenu_ConfigUpdate(s32 actionIdx) // 0x801E6CF4
+{
+    u16* bindings;
+    u16  boundBtnFlag;
+    u16  btnFlag;
+    s32  curActionIdx;
+    s32  boundActionIdx;
+    s32  i;
+    u32  j;
+
+    boundActionIdx = NO_VALUE;
+    bindings       = (u16*)&g_GameWorkPtr->config.controllerConfig;
+
+    // Run through all controller flags, excluding stick axes.
+    for (i = 0; i < 16; i++)
+    {
+        btnFlag = 1 << i;
+
+        if ((btnFlag & (ControllerFlag_DpadUp    |
+                        ControllerFlag_DpadRight |
+                        ControllerFlag_DpadDown  |
+                        ControllerFlag_DpadLeft)) ||
+            !(btnFlag & g_Controller0->clickedBtnFlags))
+        {
+            continue;
+        }
+
+        boundBtnFlag = bindings[actionIdx];
+
+        // Remove binding.
+        if (boundBtnFlag & btnFlag)
+        {
+            if ((actionIdx <  InputAction_Skip   ||
+                 actionIdx == InputAction_Action ||
+                 actionIdx == InputAction_Aim    ||
+                 actionIdx == InputAction_Item) &&
+                !(bindings[actionIdx] & ~btnFlag))
+            {
+                boundActionIdx = actionIdx;
+                SD_Call(Sfx_MenuError);
+            }
+            else
+            {
+                bindings[actionIdx] &= ~btnFlag;
+                SD_Call(Sfx_MenuConfirm);
+            }
+        }
+        else
+        {
+            curActionIdx = NO_VALUE;
+            switch (actionIdx)
+            {
+                case 0:
+                case 1:
+                    curActionIdx = actionIdx == 0;
+                    if (bindings[curActionIdx] & btnFlag)
+                    {
+                        if (!(bindings[curActionIdx] & ~btnFlag))
+                        {
+                            boundActionIdx = curActionIdx;
+                            SD_Call(Sfx_MenuError);
+                        }
+                        else
+                        {
+                            bindings[curActionIdx] &= ~btnFlag;
+                            bindings[actionIdx]    |= btnFlag;
+                            SD_Call(Sfx_MenuConfirm);
+                        }
+                    }
+                    else
+                    {
+                        bindings[actionIdx] = boundBtnFlag | btnFlag;
+                        SD_Call(Sfx_MenuConfirm);
+                    }
+                    break;
+
+                case 2:
+                    bindings[InputAction_Skip] |= btnFlag;
+                    SD_Call(Sfx_MenuConfirm);
+                    break;
+
+                default:
+                    curActionIdx = NO_VALUE;
+                    for (j = InputAction_Action; j < InputAction_Count; j++)
+                    {
+                        if (bindings[j] & btnFlag)
+                        {
+                            curActionIdx = j;
+                            break;
+                        }
+                    }
+
+                    if (curActionIdx != NO_VALUE)
+                    {
+                        if ((curActionIdx <  InputAction_Skip   ||
+                             curActionIdx == InputAction_Action ||
+                             curActionIdx == InputAction_Aim    ||
+                             curActionIdx == InputAction_Item) &&
+                            !(bindings[curActionIdx] & ~btnFlag))
+                        {
+                            SD_Call(Sfx_MenuError);
+                            boundActionIdx = curActionIdx;
+                        }
+                        else
+                        {
+                            bindings[curActionIdx] &= ~btnFlag;
+                            bindings[actionIdx]    |= btnFlag;
+                            SD_Call(Sfx_MenuConfirm);
+                        }
+                    }
+                    else
+                    {
+                        bindings[actionIdx] |= btnFlag;
+                        SD_Call(Sfx_MenuConfirm);
+                    }
+                    break;
+            }
+        }
+    }
+
+    return boundActionIdx;
+}
+
+
+void Options_ControllerMenu_EntriesDraw(bool isOnRightPane, s32 presetsEntryIdx, s32 actionsEntryIdx, s32 boundActionIdx) // 0x801E6F60
+{
+    #define STR_BASE_Y    22
+    #define STR_OFFSET_Y  20
+    #define ICON_SIZE_Y   12
+    #define ICON_OFFSET_X -12
+
+    s16      highlightY0;
+    s16      highlightY1;
+    s32      strYPos;
+    s32      i;
+    u16*     contConfig;
+    DR_MODE* drMode;
+    POLY_G4* poly;
+    GsOT*    ot;
+
+    /** @brief Draw modes for textured entry selection highlights in the controller config menu.
+     * 0: Left presets pane.
+     * 1: Right actions pane.
+     */
+    static DR_MODE SELECTION_HIGHLIGHT_DRAW_MODES[2] = {
+        {
+#ifdef SH_PC_PORT
+            .len  = 3,
+#else
+            .tag  = 0x03000000,
+#endif
+            .code = { 0xE1000200, 0 }
+        },
+        {
+#ifdef SH_PC_PORT
+            .len  = 3,
+#else
+            .tag  = 0x03000000,
+#endif
+            .code = { 0xE1000200, 0 }
+        }
+    };
+
+    /** @brief Quads for textured entry selection highlights in the controller config menu.
+     * 0: Left presets pane.
+     * 1: Right actions pane.
+     */
+    static POLY_G4 SELECTION_HIGHLIGHT_QUADS[2] = {
+        {
+#ifdef SH_PC_PORT
+            .len  = 8,
+#else
+            .tag  = 0x08000000,
+#endif
+            .r0   = 255,
+            .g0   = 255,
+            .b0   = 255,
+            .code = 0x3A,
+            .r3   = 255,
+            .g3   = 255,
+            .b3   = 255
+        },
+        {
+#ifdef SH_PC_PORT
+            .len  = 8,
+#else
+            .tag  = 0x08000000,
+#endif
+            .code = 0x3A,
+            .r1   = 255,
+            .g1   = 255,
+            .b1   = 255,
+            .r2   = 255,
+            .g2   = 255,
+            .b2   = 255
+        },
+    };
+
+    /** @brief Controller menu entry strings for the presets pane on the left. */
+    static const char* CONTROLLER_MENU_PRESETS_PANE_ENTRY_STRINGS[] = {
+        "EXIT",
+#ifdef SH_PC_PORT
+        "USER",
+#else
+        "TYPE_1",
+#endif
+        "TYPE_2",
+        "TYPE_3"
+    };
+
+    /** @brief Controller menu entry strings for the actions pane on the right. */
+    static const char* CONTROLLER_MENU_ACTIONS_PANE_ENTRY_STRINGS[] = {
+        "ENTER",
+        "CANCEL",
+        "SKIP",
+        "ACTION",
+        "AIM",
+        "LIGHT",
+        "RUN",
+        "VIEW",
+        "STEP L",
+        "STEP R",
+        "PAUSE",
+        "ITEM",
+        "MAP",
+        "OPTION"
+    };
+
+
+    ot     = &g_OtTags0[g_ActiveBufferIdx][15];
+    poly   = &SELECTION_HIGHLIGHT_QUADS[g_ActiveBufferIdx];
+    drMode = &SELECTION_HIGHLIGHT_DRAW_MODES[g_ActiveBufferIdx];
+
+    // Draw entry strings.
+    for (i = 0; i < CONTROLLER_MENU_ROW_COUNT; i++)
+    {
+        Gfx_StringSetPosition(24, STR_BASE_Y + (i * STR_OFFSET_Y));
+        Gfx_StringDraw(CONTROLLER_MENU_PRESETS_PANE_ENTRY_STRINGS[i], 20);
+    }
+
+    if (!isOnRightPane)
+    {
+        highlightY1 = presetsEntryIdx * STR_OFFSET_Y;
+        highlightY0 = highlightY1 - 91;
+        setXY4(poly,
+               -137, highlightY0,
+               -76,  highlightY0,
+               -137, highlightY1 - 76,
+               -76,  highlightY1 - 76);
+    }
+
+    strYPos     = STR_BASE_Y;
+    highlightY0 = -300;
+
+    // Draw controller config.
+    for (i = 0, contConfig = (u16*)&g_GameWorkPtr->config.controllerConfig; i < (u32)InputAction_Count; i++, contConfig++)
+    {
+        // Draw action string.
+        Text_Debug_PositionSet(96, strYPos);
+        Text_Debug_Draw(CONTROLLER_MENU_ACTIONS_PANE_ENTRY_STRINGS[i]);
+
+        // Draw button icon.
+        if (i != boundActionIdx)
+        {
+            Options_ControllerMenu_ButtonIconsDraw(ICON_OFFSET_X, strYPos - 114, *contConfig);
+        }
+
+        if (i == actionsEntryIdx)
+        {
+            highlightY0 = strYPos - 113;
+        }
+
+#ifdef SH_PC_PORT
+        /* Status column: what the launcher actually bound this action to. The
+         * screen is read-only now, so it reports rather than edits. Only the
+         * lowest set bit is shown -- an action mapped to several PSX buttons
+         * would otherwise overrun the 320px frame at 8px/glyph. */
+        {
+            u16         bit  = (u16)(*contConfig & (u16)(-(s16)*contConfig));
+            /* Pad bind first (this IS the controller screen), keyboard as the
+             * fallback so the column is never blank for keyboard players.
+             * Scheme 0 = classic: control_style.c forces that scheme into the
+             * input layer while any menu is up, so it is what is live here. */
+            const char* name = PcConfig_BindName(bit, 1, 0, 0);
+            char        buf[14];
+            s32         n;
+
+            if (name[0] == '\0')
+                name = PcConfig_BindName(bit, 0, 0, 0);
+
+            for (n = 0; n < (s32)sizeof(buf) - 1 && name[n] != '\0'; n++)
+            {
+                /* Text_Debug_Draw's atlas starts at '*': anything below it
+                 * indexes off-atlas garbage. Uppercase, and drop the rest. */
+                s32 c = (unsigned char)name[n];
+                c     = toupper(c);
+                buf[n] = (c >= '*' && c <= 'i') ? (char)c : ' ';
+            }
+            buf[n] = '\0';
+
+            Text_Debug_PositionSet(184, strYPos);
+            Text_Debug_Draw(buf);
+        }
+#endif
+
+        strYPos = (strYPos + ICON_SIZE_Y) + ((i == 2) ? ICON_SIZE_Y : 0);
+    }
+
+    if (isOnRightPane == true)
+    {
+        setXY4(poly,
+               -65, highlightY0,
+               -15, highlightY0,
+               -65, highlightY0 + 10,
+               -15, highlightY0 + 10);
+    }
+
+    AddPrim(ot, poly);
+    AddPrim(ot, drMode);
+
+    #undef STR_BASE_Y
+    #undef STR_OFFSET_Y
+    #undef ICON_SIZE_Y
+    #undef ICON_OFFSET_X
+}
+
+void Options_ControllerMenu_ButtonIconsDraw(s32 baseX, s32 baseY, u16 config) // 0x801E716C
+{
+    #define ICON_SIZE_X   12
+    #define ICON_SIZE_Y   12
+    #define ICON_OFFSET_X 14
+
+    s32            i;
+    s32            posX;
+    u16            clutX;
+    u32            clutY;
+    s32            temp;
+    s32            v0;
+    GsOT*          ot;
+    SPRT*          prim;
+    DR_TPAGE*      tpage;
+    PACKET*        packet;
+    s_FsImageDesc* image;
+
+    image = &g_ControllerButtonAtlasImg;
+
+    ot     = &g_OtTags1[g_ActiveBufferIdx][16];
+    packet = GsOUT_PACKET_P;
+
+    // Draw button sprites.
+    for (posX = baseX, i = ICON_SIZE_X; i < 28; i++)
+    {
+        temp = i & 0xF;
+        v0   = ((temp + 8) & 0xF) << 4;
+
+        if (!((config >> temp) & (1 << 0)))
+        {
+            continue;
+        }
+
+        prim = (SPRT*)packet;
+        addPrimFast(ot, prim, 4);
+        setCodeWord(prim, PRIM_RECT | RECT_TEXTURE, COLOR_RGBC(128, 128, 128, 0));
+        setWH(prim, ICON_SIZE_X, ICON_SIZE_Y);
+
+        clutY = image->clutY;
+        clutX = image->clutX;
+
+        setXY0Fast(prim, posX, baseY);
+        posX += ICON_OFFSET_X;
+
+        // setUV0AndClut(prim, 0xF4, v0, clutY, clutX);
+        *(u32*)(&prim->u0) = 244 + (v0 << 8) + (((clutY << 6) | ((clutX >> 4) & 0x3F)) << 16);
+
+        packet = (u8*)prim + sizeof(SPRT);
+        tpage  = (DR_TPAGE*)packet;
+
+        setDrawTPage(tpage, 0, 1, getTPageN(0, 0, 7, 0));
+        AddPrim(ot, tpage);
+        packet = (u8*)tpage + sizeof(DR_TPAGE);
+    }
+
+    GsOUT_PACKET_P = packet;
+
+    #undef ICON_SIZE_X
+    #undef ICON_SIZE_Y
+    #undef ICON_OFFSET_X
+}
+
+
+/** @brief Unknown .rodata value.
+ * The type is assumed. It is unknown where this is used and
+ * could be something defined by a macro.
+ */
+static const u16 D_801E2D42 = 4160;

@@ -1,0 +1,422 @@
+#include "bodyprog/bodyprog.h"
+#include "bodyprog/dms.h"
+#include "bodyprog/events/bodyprog_data_800A99B4.h"
+#include "bodyprog/gfx/map_effects.h"
+#include "bodyprog/math/math.h"
+#include "bodyprog/player.h"
+#include "main/rng.h"
+#include "maps/map3/map3_s06.h"
+#include "maps/characters/dahlia.h"
+
+#include "../src/maps/chara_util.c" // 0x800CFCD8
+
+#include "maps/shared/sharedFunc_800D929C_0_s00.h" // 0x800D06E8
+
+#include "maps/shared/Map_RoomIdxGet.h" // 0x800D06F8
+
+#include "maps/shared/Map_RoomBgmInit_CheckCond.h" // 0x800D07A0
+
+#include "maps/shared/Map_RoomBgmInit_3_s00_CondTrue.h" // 0x800D07D4
+
+#include "maps/shared/Map_RoomBgmInit_3_s00_CondFalse.h" // 0x800D0814
+
+void GameBoot_LoadScreen_StageString(void) {}
+
+#include "maps/shared/MapEvent_DoorJammed.h" // 0x800D09BC
+
+#include "maps/shared/MapEvent_DoorLocked.h" // 0x800D0A50
+
+void func_800D0AE4(void) {}
+
+const char* MAP_MESSAGES[] = {
+    #include "maps/shared/map_msg_common.h"
+    /* 15 */ "~J0(1.5)\tWas_I_dreaming? ~E ",
+    /* 16 */ "~J0(2.6)\tYou_were_too_late. ~E ",
+    /* 17 */ "~J0(1.2)\tIt's_you... ~E ",
+    /* 18 */ "~J0(3.4)\tYes.__Dahlia_Gillespie. ~E ",
+    /* 19 */ "~J1(3.0)\tTell_me_everything_you_know. ~N\n\t\t\tWhat's_going_on? ",
+    /* 20 */ "~J1(1.5)\tDarkness. ",
+    /* 21 */ "~J1(3.9)\tThe_town_is_being_devoured ~N\n\t\t\tby_darkness. ",
+    /* 22 */ "~J1(5.8)\tStrength_must_overcome ~N\n\t\t\tpetty_desire. ~N\n\t\t\tChildish_sleep_talk. ",
+    /* 23 */ "~J1(3.4)\tI_knew_this_day_would_come. ",
+    /* 24 */ "~J1(4.0)\tWhat_are_you_talking_about? ~N\n\t\t\tI_don't_understand_a_word_of_this. ~E ",
+    /* 25 */ "~J0(3.8)\tBelieve_the_evidence ~N\n\t\t\tof_your_eyes. ",
+    /* 26 */ "~J0(5.3)\tThe_other_church_in_this_town. ~N\n\t\t\tThat_is_your_destination. ",
+    /* 27 */ "~J0(6.5)\tThis_is_beyond_my_abilities. ~N\n\t\t\tOnly_you_can_stop_it_now. ~E ",
+    /* 28 */ "~J0(5.0)\tHave_you_not_seen ~N\n\t\t\tthe_crest_marked ~N\n\t\t\ton_the_ground_all_over_town? ",
+    /* 29 */ "~J0(3.2)\tSo_that's_what_I_saw ~N\n\t\t\tin_the_schoolyard. ",
+    /* 30 */ "~J0(1.2)\tWhat_does_it_mean? ",
+    /* 31 */ "~J0(3.1)\tIt_is_the_mark_of_Samael... ",
+    /* 32 */ "~J0(2.8)\tDon't_let_it_be_completed. ~E ",
+    /* 33 */ "~J0(1.8)\tHey!__Wait! ~E ",
+    /* 34 */ "\tThe_elevator_doesn't ~N\n\tappear_to_be_working. ~E ",
+    /* 35 */ "~H\tThere_is_a_ ~C5 Hospital_map ~C7 . ~N\n\tTake_it? ~S4 ",
+    /* 36 */ "\tThere_is_an_ ~C2 Antique_shop_key ~C7 . ~N\n\tTake_it? ~S4 ",
+    /* 37 */ "\tThese_are_phones_and_phonebooks. ~N\n\tNo_need_to_examine_this. ~E ",
+    /* 38 */ "\tThese_are_phones_and_phonebooks. ",
+    /* 39 */ "\tI'll_copy_the_location_of ~N\n\tthe_antique_shop_to_the_map. ~E ",
+    /* 40 */ "\tThere's_a_vending_machine. ~N\n\tIt_doesn't_work. ~E ",
+    /* 41 */ "\tThere_is_a_newspaper. ",
+    /* 42 */ "\tThis_article's_been ~N\n\tclipped_out... ~E ",
+    /* 43 */ "\tNothing_unusual. ~E ",
+    /* 44 */ "\tThere's_a_white_board. ~N\n\tNothing_special_written_here. ~E ",
+    /* 45 */ "\tNothing_helpful. ~E ",
+    /* 46 */ "\tThe_phone's_out. ~N\n\tCan't_get_a_dial_tone. ~E "
+};
+
+void MapEvent_CommonItemTake(void) // 0x800D0AEC
+{
+    Event_CommonItemTake(CommonPickupItemId_FirstAidKit, EventFlag_M3S00_FirstAidKit);
+}
+
+void func_800D0B10(void) // 0x800D0B10
+{
+    const static VECTOR3 D_800CB21C = { Q12(61.72f), Q12(-0.8f), Q12(100.51f) };
+
+    if (g_SysWork.sysStateSteps[1] == 0)
+    {
+        Sfx_WithFlagsPlay(Sfx_MenuMap, &D_800CB21C, Q8(0.5f), SfxFlag_None);
+    }
+
+    Event_DisplayMapMsgWithBg(FILE_TIM_NEWSP1_TIM, Q12(0.0f), Q12(0.0f), 41);
+    Savegame_EventFlagSet(EventFlag_203);
+}
+
+#include "maps/shared/Event_CutsceneTimerAdvance.h" // 0x800D0B7C
+
+void func_800D0C14(void) // 0x800D0C14
+{
+    // Skip.
+    if ((g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.skip) &&
+        g_SysWork.sysStateSteps[0] >= 4 && g_SysWork.sysStateSteps[0] < 30)
+    {
+        SysWork_StateStepSet(0, 30);
+        Savegame_EventFlagSet(EventFlag_297);
+    }
+
+    switch (g_SysWork.sysStateSteps[0])
+    {
+        case 0:
+            Player_ControlFreeze();
+            CutsceneBorder_ForceShow();
+            ScreenFade_ResetTimestep();
+            g_SysWork.sysFlags |= SysFlag_CutsceneActive;
+
+            Sd_SfxStop(Sfx_Unk1522);
+
+            Fs_QueueStartRead(FILE_ANIM_HSPTL2_DMS, FS_BUFFER_15);
+            Fs_QueueWaitForEmpty();
+            Dms_HeaderFixOffsets(FS_BUFFER_15);
+
+            g_Cutscene_Timer = Q12(0.0f);
+            D_800D2736 = 0;
+            D_800D2737 = false;
+
+            func_8003D03C();
+            sharedFunc_800D2EB4_0_s00();
+
+            D_800D2738 = 0;
+            D_800D2734 = Q12(0.0f);
+
+            SysWork_StateStepIncrement(0);
+            break;
+
+        case 1:
+            Event_ScreenFadeCmd(ScreenFadeCmd_Start, false, 0, Q12(0.0f), false);
+
+            Chara_Load(0, Chara_Dahlia, &g_SysWork.npcBoneCoordBuffer[0], CHARA_FORCE_FREE_ALL, NULL, NULL);
+            Event_CharaAnimCmdExecute(CharaAnimCmd_SetState, &g_SysWork.playerWork.player, 117, false);
+
+            SysWork_StateStepIncrement(0);
+
+        case 2:
+            Event_ScreenFadeCmd(ScreenFadeCmd_Wait, false, 0, Q12(0.0f), false);
+            Event_CharaAnimCmdExecute(CharaAnimCmd_AnimLock, &g_SysWork.playerWork.player, 0, false);
+            break;
+
+        case 3:
+            Chara_ProcessLoads();
+            Chara_Spawn(Chara_Dahlia, 0, Q12(98.0f), Q12(100.0f), Q12_ANGLE(0.0f), 3);
+            sharedFunc_800D88AC_0_s00(&g_SysWork.npcs[0]);
+
+            D_800D2737 = true;
+            SysWork_StateStepIncrement(0);
+
+        case 4:
+            Event_DisplayMapMsgWithAudio(15, &D_800D2736, &D_800D26D0);
+            Event_CutsceneTimerAdvance(&g_Cutscene_Timer, Q12(6.0f), Q12(0.0f), Q12(39.0f), true, false);
+            break;
+
+        case 5:
+            Event_CharaAnimCmdExecute(CharaAnimCmd_AnimUnlock, &g_SysWork.playerWork.player, 0, false);
+            D_800D2738 = 0;
+            SysWork_StateStepIncrement(0);
+
+        case 6:
+            Event_DisplayMapMsgWithAudio(16, &D_800D2736, &D_800D26D0);
+            Event_CutsceneTimerAdvance(&g_Cutscene_Timer, Q12(6.0f), Q12(0.0f), Q12(39.0f), true, false);
+
+            if (D_800D2738 != 2)
+            {
+                g_SysWork.field_28 += g_DeltaTime;
+
+                if (D_800D2738 == 0 && !(g_SysWork.field_28 <= Q12(0.3f)))
+                {
+                    Sfx_WithFlagsPlay(Sfx_DoorOpen0, &D_800D26F8, Q8(0.5f), SfxFlag_None);
+                    D_800D2738++;
+                }
+                else if (D_800D2738 == 1 && !(g_SysWork.field_28 <= Q12(1.6f)))
+                {
+                    Sfx_WithFlagsPlay(Sfx_DoorClose0, &D_800D26F8, Q8(0.5f), SfxFlag_None);
+                    D_800D2738++;
+                }
+            }
+            break;
+
+        case 7:
+            if (!Sd_AmbientSfxInit())
+            {
+                SysWork_StateStepIncrement(0);
+            }
+
+        case 8:
+            D_800D2734 += g_DeltaTime;
+            if (D_800D2734 > Q12(2.0f) && g_SysWork.sysStateSteps[0] == 8)
+            {
+                SysWork_StateStepSet(0, 9);
+            }
+
+            Event_CutsceneTimerAdvance(&g_Cutscene_Timer, Q12(6.0f), Q12(0.0f), Q12(39.0f), true, false);
+            break;
+
+        case 9:
+            Event_DisplayMapMsgWithAudio(17, &D_800D2736, &D_800D26D0);
+            break;
+
+        case 10:
+            Event_WaitTimer(Q12(1.5f), false);
+            break;
+
+        case 11:
+            Event_CharaAnimCmdExecute(CharaAnimCmd_SetState, &g_SysWork.npcs[0], 11, false);
+            SysWork_StateStepIncrement(0);
+
+        case 12:
+            Event_DisplayMapMsgWithAudio(18, &D_800D2736, &D_800D26D0);
+            Event_CutsceneTimerAdvance(&g_Cutscene_Timer, Q12(6.5f), Q12(40.0f), Q12(60.0f), true, false);
+            break;
+
+        case 13:
+            Event_CutsceneTimerAdvance(&g_Cutscene_Timer, Q12(6.5f), Q12(40.0f), Q12(60.0f), true, true);
+            break;
+
+        case 14:
+            Event_ScreenFadeCmd(ScreenFadeCmd_Auto, true, 0, Q12(0.0f), false);
+            break;
+
+        case 15:
+            Event_CharaAnimCmdExecute(CharaAnimCmd_SetState, &g_SysWork.playerWork.player, 51, false);
+            Event_CharaAnimCmdExecute(CharaAnimCmd_SetState, &g_SysWork.npcs[0], 0, false);
+            SysWork_StateStepIncrement(0);
+
+        case 16:
+            Event_ScreenFadeCmd(ScreenFadeCmd_Auto, false, 0, Q12(0.0f), false);
+            g_Cutscene_Timer = Q12(61.0f);
+            break;
+
+        case 17:
+            Event_WaitTimer(Q12(2.0f), false);
+            break;
+
+        case 18:
+            Event_DisplayMapMsgWithAudio(19, &D_800D2736, &D_800D26D0);
+            Event_CutsceneTimerAdvance(&g_Cutscene_Timer, Q12(2.0f), Q12(61.0f), Q12(100.0f), true, false);
+            break;
+
+        case 19:
+            Event_CharaAnimCmdExecute(CharaAnimCmd_SetState, &g_SysWork.npcs[0], 9, false);
+            SysWork_StateStepIncrement(0);
+
+        case 20:
+            Event_DisplayMapMsgWithAudio(25, &D_800D2736, &D_800D26D0);
+            Event_CutsceneTimerAdvance(&g_Cutscene_Timer, Q12(2.0f), Q12(61.0f), Q12(126.0f), true, false);
+
+            if (g_Cutscene_Timer >= Q12(120.0f))
+            {
+                Model_AnimFlagsClear(&g_SysWork.playerWork.player.model, 2);
+            }
+            break;
+
+        case 21:
+            Event_CharaAnimCmdExecute(CharaAnimCmd_SetState, &g_SysWork.npcs[0], 10, false);
+            Model_AnimFlagsSet(&g_SysWork.playerWork.player.model, 2);
+            SysWork_StateStepIncrement(0);
+
+        case 22:
+            Event_DisplayMapMsgWithAudio(28, &D_800D2736, &D_800D26D0);
+            Event_CutsceneTimerAdvance(&g_Cutscene_Timer, Q12(10.0f), Q12(127.0f), Q12(177.0f), true, false);
+            Event_WaitTimer(Q12(9.8f), false);
+            break;
+
+        case 23:
+            Event_CharaAnimCmdExecute(CharaAnimCmd_SetState, &g_SysWork.npcs[0], 0, false);
+            SysWork_StateStepIncrement(0);
+
+        case 24:
+            Event_DisplayMapMsgWithAudio(28, &D_800D2736, &D_800D26D0);
+            Event_CutsceneTimerAdvance(&g_Cutscene_Timer, Q12(10.0f), Q12(127.0f), Q12(177.0f), true, false);
+            break;
+
+        case 25:
+            Savegame_EventFlagSet(EventFlag_297);
+            Event_CharaAnimCmdExecute(CharaAnimCmd_SetState, &g_SysWork.npcs[0], 11, false);
+            SysWork_StateStepIncrement(0);
+
+        case 26:
+            Event_CutsceneTimerAdvance(&g_Cutscene_Timer, Q12(13.5f), Q12(178.0f), Q12(194.0f), true, true);
+            break;
+
+        case 27:
+            Event_CharaAnimCmdExecute(CharaAnimCmd_SetState, &g_SysWork.playerWork.player, 111, false);
+            Chara_ModelCharaIdClear(&g_SysWork.npcs[0], 0, 0);
+            D_800D2738 = 0;
+            SysWork_StateStepIncrement(0);
+
+        case 28:
+            Event_DisplayMapMsgWithAudio(33, &D_800D2736, &D_800D26D0);
+
+            if (D_800D2738 != 1)
+            {
+                g_SysWork.field_28 += g_DeltaTime;
+                if (D_800D2738 == 0 && g_SysWork.field_28 > Q12(0.6f))
+                {
+                    Sfx_WithFlagsPlay(Sfx_DoorClose0, &D_800D26F8, Q8(0.5f), SfxFlag_None);
+                    D_800D2738++;
+                }
+            }
+
+            Event_CutsceneTimerAdvance(&g_Cutscene_Timer, Q12(10.0f), Q12(199.0f), Q12(244.0f), true, false);
+            break;
+
+        case 29:
+            Event_CutsceneTimerAdvance(&g_Cutscene_Timer, Q12(10.0f), Q12(199.0f), Q12(244.0f), true, true);
+            break;
+
+        case 30:
+            Event_ScreenFadeCmd(ScreenFadeCmd_Auto, true, 0, Q12(0.0f), false);
+            break;
+
+        case 31:
+            g_Cutscene_Timer = Q12(244.0f);
+            D_800D2737 = false;
+            SysWork_StateStepIncrement(0);
+            break;
+
+        case 32:
+            if (!Sd_AmbientSfxInit())
+            {
+                SysWork_StateStepIncrement(0);
+            }
+            else
+            {
+                break;
+            }
+
+        default:
+            Event_CharaAnimCmdExecute(CharaAnimCmd_AnimUnlock, &g_SysWork.playerWork.player, 0, false);
+
+            // Return to gameplay.
+            Player_ControlUnfreeze(true);
+            SysWork_StateSetNext(SysState_Gameplay);
+            vcReturnPreAutoCamWork(true);
+
+            g_Cutscene_Timer = NO_VALUE;
+
+            func_8003D01C();
+            sharedFunc_800D2EF4_0_s00();
+            Event_ScreenFadeCmd(ScreenFadeCmd_Start, false, 2, Q12(0.0f), false);
+            Event_ScreenFadeCmd(ScreenFadeCmd_Start, false, 0, Q12(0.0f), false);
+            Savegame_EventFlagSet(EventFlag_295);
+            SD_Call(19);
+
+            Chara_ModelCharaIdClear(&g_SysWork.npcs[0], 0, 0);
+            Model_AnimFlagsSet(&g_SysWork.playerWork.player.model, 2);
+            Game_TurnFlashlightOff();
+            break;
+    }
+
+    if (g_Cutscene_Timer >= Q12(0.0f))
+    {
+        Dms_CharacterTransformGet(&g_SysWork.playerWork.player.position, &g_SysWork.playerWork.player.rotation, "HERO", g_Cutscene_Timer, FS_BUFFER_15);
+        if (D_800D2737)
+        {
+            Dms_CharacterTransformGet(&g_SysWork.npcs[0].position, &g_SysWork.npcs[0].rotation, "DARIA", g_Cutscene_Timer, FS_BUFFER_15);
+        }
+
+        vcChangeProjectionValue(Dms_CameraTargetGet(&g_Cutscene_CameraPositionTarget, &g_Cutscene_CameraLookAtTarget, NULL, g_Cutscene_Timer, FS_BUFFER_15));
+        vcUserCamTarget(&g_Cutscene_CameraPositionTarget, NULL, true);
+        vcUserWatchTarget(&g_Cutscene_CameraLookAtTarget, NULL, true);
+    }
+}
+
+void MapEvent_PaperMapTake(void) // 0x800D17B0
+{
+    Event_PaperMapTake(17, EventFlag_M3S00_PickupMap, 35);
+}
+
+void func_800D17D8(void) // 0x800D17D8
+{
+    Event_ItemTake(InvItemId_AntiqueShopKey, DEFAULT_PICKUP_ITEM_COUNT, EventFlag_M3S06_PickupAntiqueShopKey, 36);
+}
+
+void Map_WorldObjectsInit(void) // 0x800D1804
+{
+    WorldObject_Init(&g_WorldObject_SavePad, D_800A99E4[1], 26.0f, -1.02f, 144.55f, 0.0f, 163.8f, 0.0f);
+    WorldObject_Init(&g_WorldObject_Map, "MAP_HIDE", 24.6f, -1.56f, 143.16f, 0.0f, 180.0f, 0.0f);
+    WorldObject_Init(&g_WorldObject_Map2, "MAP2_HID", 24.6f, -1.56f, 143.16f, 0.0f, 180.0f, 0.0f);
+    WorldObject_Init(&g_WorldObject_Key, "KEY_HIDE", 95.734f, -0.8062f, 99.8885f, 0.0f, -35.9f, 0.0f);
+    WorldObject_Init(&g_WorldObject_FirstAidKit, D_800A99E4[2], 27.6f, -0.45f, 143.6f, 0.0f, -90.0f, 0.0f);
+}
+
+void Map_WorldObjectsUpdate(void) // 0x800D197C
+{
+    MAP_CHUNK_CHECK_VARIABLE_DECL();
+
+    if (PLAYER_IN_MAP_CHUNK(vx, 1, 1, -1, 1))
+    {
+        if (PLAYER_IN_MAP_CHUNK(vz, 1, 4, -1, 4))
+        {
+            WorldGfx_ObjectAdd(&g_WorldObject_SavePad.object, &g_WorldObject_SavePad.position, &g_WorldObject_SavePad.rotation);
+
+            if (!(Savegame_EventFlagGet(EventFlag_M3S00_PickupMap)))
+            {
+                WorldGfx_ObjectAdd(&g_WorldObject_Map.object, &g_WorldObject_Map.position, &g_WorldObject_Map.rotation);
+            }
+            else
+            {
+                WorldGfx_ObjectAdd(&g_WorldObject_Map2.object, &g_WorldObject_Map2.position, &g_WorldObject_Map2.rotation);
+            }
+
+            if (!(Savegame_EventFlagGet(EventFlag_M3S00_FirstAidKit)))
+            {
+                WorldGfx_ObjectAdd(&g_WorldObject_FirstAidKit.object, &g_WorldObject_FirstAidKit.position, &g_WorldObject_FirstAidKit.rotation);
+            }
+        }
+    }
+
+    if (PLAYER_IN_MAP_CHUNK(vx, 1, 3, -1, 3))
+    {
+        if (PLAYER_IN_MAP_CHUNK(vz, 1, 3, -1, 3))
+        {
+            if (!Savegame_EventFlagGet(EventFlag_M3S06_PickupAntiqueShopKey) && Savegame_EventFlagGet(EventFlag_297))
+            {
+                WorldGfx_ObjectAdd(&g_WorldObject_Key.object, &g_WorldObject_Key.position, &g_WorldObject_Key.rotation);
+            }
+        }
+    }
+
+    if (Savegame_EventFlagGet(EventFlag_M3S06_PickupAntiqueShopKey) && Savegame_EventFlagGet(EventFlag_M2S00_PickupMap))
+    {
+        Savegame_EventFlagSet(EventFlag_317);
+    }
+}

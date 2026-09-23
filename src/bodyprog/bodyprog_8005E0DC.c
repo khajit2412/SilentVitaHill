@@ -1,0 +1,3066 @@
+#include "game.h"
+#include "inline_no_dmpsx.h"
+
+#include <psyq/gtemac.h>
+#include <psyq/libapi.h>
+#include <psyq/strings.h>
+
+#include "bodyprog/bodyprog.h"
+#include "bodyprog/gfx/map_effects.h"
+#include "bodyprog/math/math.h"
+#include "bodyprog/screen/screen_data.h"
+#include "bodyprog/screen/screen_draw.h"
+#include "bodyprog/item_screens.h"
+#include "bodyprog/player.h"
+#include "bodyprog/sound/sound_system.h"
+#include "main/rng.h"
+#ifdef SH_PC_PORT
+#include <stdio.h>
+/* Cap for the ADDITIVE blood layer color (spray/cloud). func_80055A90's fog-tint
+ * is unclamped; in high-fog maps it goes near-white and the additive pass blows
+ * the sprite's soft edge to white. Capping it keeps dark-scene red intact (dim
+ * tint is already below this) while killing the white fringe. Tunable. */
+#define BLOOD_ADD_MAX 0x80
+#include <string.h>
+#include "sh_log.h"
+/* Fades the additive blood layers toward black with world fog (bodyprog_80055028.c). */
+extern int Pc_BloodFogKeep(s32 z);
+
+#ifdef SH_PC_PORT
+/* Fade a blood prim's source colour with world fog.
+ *
+ * BOTH blood blend modes vanish as their source goes to zero: additive
+ * (dest + src) adds nothing, subtractive (dest - src) removes nothing. So
+ * scaling by the same fogRamp the world uses makes blood recede into fog at the
+ * world's own rate, which is what the additive layers already did.
+ *
+ * The SUBTRACTIVE layers are why splatters and pools stayed bright against the
+ * fog, and they were worse than merely unfogged: func_80055A90 tints toward the
+ * FOG colour, which BRIGHTENS the source, and a brighter source under
+ * subtractive blending removes MORE from the floor. Distant blood was getting
+ * stronger the thicker the fog got. */
+#define PC_BLOOD_FOG_FADE(p, z)                        do {                                                   POLY_FT4* _p = (p);                                int       _k = Pc_BloodFogKeep(z);                 _p->r0 = (_p->r0 * _k) >> 8;                       _p->g0 = (_p->g0 * _k) >> 8;                       _p->b0 = (_p->b0 * _k) >> 8;                   } while (0)
+#endif
+#endif
+
+s_800C42E8     D_800C42E8[24];
+s16            D_800C4408;
+s16            __pad_bss_800C440A;
+GsCOORDINATE2* D_800C440C;
+GsCOORDINATE2* D_800C4410;
+s8             D_800C4414; /** Flags. */
+s8             __pad_bss_800C4415[3];
+s_800C4418     D_800C4418;
+
+// ========================================
+// ENVIRONMENT EFFECTS HANDLING
+// ========================================
+
+void Map_EffectTexturesLoad(s32 mapIdx) // 0x8005E0DC
+{
+    s32        i;
+    s32        effectTexFlags;
+    static u16 loadedEffectTextureFlags;
+    static s16 __pad_bss_800C42DA[7];
+
+    D_800A908C.v     = 0;
+    D_800A908C.clutY = 0;
+    D_800A9094.v     = 128;
+
+    // Get effect texture flags.
+    effectTexFlags = EffectTextureFlag_None;
+    switch (mapIdx)
+    {
+        case NO_VALUE:
+            Fs_QueueStartReadTim(FILE_TIM_BLD_TIM, (void*)((uintptr_t)FONT24_BUFFER - ALIGN(Fs_GetFileSize(FILE_TIM_BLD_TIM), 0x800)), &D_800A9084);
+            loadedEffectTextureFlags = EffectTextureFlag_None;
+            break;
+
+        case MapIdx_MAP0_S01:
+            if (!Savegame_EventFlagGet(EventFlag_47))
+            {
+                effectTexFlags = EffectTextureFlag_Glass;
+            }
+            break;
+
+        case MapIdx_MAP1_S02:
+        case MapIdx_MAP1_S03:
+            effectTexFlags = EffectTextureFlag_Water;
+            break;
+
+        case MapIdx_MAP1_S05:
+            effectTexFlags = EffectTextureFlag_Fire | EffectTextureFlag_Ef;
+            break;
+
+        case MapIdx_MAP3_S05:
+            if (!Savegame_EventFlagGet(EventFlag_284))
+            {
+                effectTexFlags = EffectTextureFlag_Fire;
+            }
+            break;
+
+        case MapIdx_MAP4_S01:
+            if (!Savegame_EventFlagGet(EventFlag_306))
+            {
+                effectTexFlags = EffectTextureFlag_Fire;
+            }
+            break;
+
+        case MapIdx_MAP4_S05:
+            effectTexFlags = EffectTextureFlag_Blood;
+            break;
+
+        case MapIdx_MAP5_S00:
+        case MapIdx_MAP6_S03:
+        case MapIdx_MAPX_S00: // @unused
+            effectTexFlags = EffectTextureFlag_WaterRefract;
+            break;
+    }
+
+#ifdef SH_PC_PORT
+    /* Blue-blood fix (#41): blood color is config.extraBloodColor (Extra Options;
+     * Normal=0/Green=2/Violet=5/Black=11), selecting blood CLUT rows via
+     * func_8005F55C. A per-map buffer overrun corrupts it on some maps (seen as 2
+     * = green on maps 2/10), re-paletting all blood. The legit writers mirror the
+     * real value into g_PcTrustedBloodColor; re-apply it here each map load so map
+     * corruption can't change blood color. Runs BEFORE the no-flags early-out. */
+    {
+        extern unsigned char g_PcTrustedBloodColor;
+        if (g_GameWork.config.extraBloodColor != g_PcTrustedBloodColor)
+        {
+            g_GameWork.config.extraBloodColor = g_PcTrustedBloodColor;
+        }
+    }
+#endif
+
+    if (effectTexFlags == EffectTextureFlag_None)
+    {
+        return;
+    }
+
+    // Run through effect texture flags.
+    loadedEffectTextureFlags = EffectTextureFlag_None;
+    for (i = 0; i < 16; i++)
+    {
+        if (!((effectTexFlags >> i) & (1 << 0)))
+        {
+            continue;
+        }
+
+        // Set global flag.
+        loadedEffectTextureFlags |= 1 << i;
+
+        // TODO: Not sure if this is actually checking something gte related, but the macro/pointless branch is needed for match.
+        if (gte_IsDisabled())
+        {
+            continue;
+        }
+
+        // Load effect textures.
+        switch (1 << i)
+        {
+#ifdef SH_PC_PORT
+            /* The Ef case below permanently mutates the SHARED descriptor
+             * (v=64, clutY=4); on PSX the retail map order apparently never
+             * loads Glass/Water/Blood after an Ef map, but with level select
+             * and free roaming we do — and the TIM then uploads its pixels/
+             * palette to the wrong VRAM rows (off-palette "blue blood" class).
+             * Restore the static defaults (screen_data.c) before each use. */
+            #define EFFECT_IMG_RESET() (D_800A908C.v = 0, D_800A908C.clutY = 0)
+#else
+            #define EFFECT_IMG_RESET()
+#endif
+            case EffectTextureFlag_Glass:
+                EFFECT_IMG_RESET();
+                Fs_QueueStartReadTim(FILE_TIM_GLASS_TIM, (void*)((uintptr_t)FONT24_BUFFER - ALIGN(Fs_GetFileSize(FILE_TIM_GLASS_TIM), 0x800)), &D_800A908C);
+                break;
+
+            case EffectTextureFlag_WaterRefract:
+                EFFECT_IMG_RESET();
+                Fs_QueueStartReadTim(FILE_TIM_DR_WAVE_TIM, (void*)((uintptr_t)FONT24_BUFFER - ALIGN(Fs_GetFileSize(FILE_TIM_DR_WAVE_TIM), 0x800)), &D_800A908C);
+                break;
+
+            case EffectTextureFlag_Water:
+                EFFECT_IMG_RESET();
+                Fs_QueueStartReadTim(FILE_TIM_WATER_TIM, (void*)((uintptr_t)FONT24_BUFFER - ALIGN(Fs_GetFileSize(FILE_TIM_WATER_TIM), 0x800)), &D_800A908C);
+                break;
+
+            case EffectTextureFlag_Fire:
+                D_800A9094.v = 120;
+                Fs_QueueStartReadTim(FILE_TIM_FIRE_TIM, (void*)((uintptr_t)FONT24_BUFFER - ALIGN(Fs_GetFileSize(FILE_TIM_FIRE_TIM), 0x800)), &D_800A9094);
+                break;
+
+            case EffectTextureFlag_Ef:
+                D_800A908C.v     = 64;
+                D_800A908C.clutY = 4;
+                Fs_QueueStartReadTim(FILE_TIM_EF_TIM, (void*)((uintptr_t)FONT24_BUFFER - ALIGN(Fs_GetFileSize(FILE_TIM_EF_TIM), 0x800)), &D_800A908C);
+                break;
+
+            case EffectTextureFlag_Blood:
+                EFFECT_IMG_RESET();
+                Fs_QueueStartReadTim(FILE_TIM_BLOOD_TIM, (void*)((uintptr_t)FONT24_BUFFER - ALIGN(Fs_GetFileSize(FILE_TIM_BLOOD_TIM), 0x800)), &D_800A908C);
+                break;
+
+            case EffectTextureFlag_WarmTest: // @unused See `e_EffectTextureFlags`.
+                Fs_QueueStartReadTim(FILE_TEST_WARMTEST_TIM, (void*)((uintptr_t)FONT24_BUFFER - ALIGN(Fs_GetFileSize(FILE_TEST_WARMTEST_TIM), 0x800)), &D_800A9094);
+                break;
+        }
+    }
+}
+
+void func_8005E414(s32 orgIdx) // 0x8005E414
+{
+    RECT*      rect;
+    PACKET*    packet;
+    DR_AREA*   area;
+    DR_OFFSET* offset;
+
+    ClearImage(&D_800AE5A8[2], 0, 0, 0);
+
+    area = (DR_AREA*)GsOUT_PACKET_P;
+
+    SetDrawArea(area, &D_800AE5A8[2]);
+
+    rect = &D_800AE5A8[0];
+
+    addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[ORDERING_TABLE_SIZE - 1], area);
+    area++;
+
+    if (g_ActiveBufferIdx == 0)
+    {
+        rect = &D_800AE5A8[1];
+    }
+
+    SetDrawArea(area, rect);
+
+    addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[orgIdx], area);
+    area++;
+
+    offset = area;
+
+    SetDrawOffset(offset, &D_800AE5C8[0]);
+
+    rect = D_800AE5C8 - 4;
+
+    addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[ORDERING_TABLE_SIZE - 1], offset);
+    offset++;
+
+    if (g_ActiveBufferIdx == 0)
+    {
+        rect = D_800AE5C8 - 2;
+    }
+
+    SetDrawOffset(offset, rect);
+
+    addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[orgIdx], offset);
+    offset++;
+
+    GsOUT_PACKET_P = offset;
+}
+
+void func_8005E650(s32 mapId) // 0x8005E650
+{
+    s32 i;
+    s16 count;
+
+    count = g_MapOverlayHdr.unkTable1Count_50;
+    for (i = 0; i < count; i++)
+    {
+        g_MapOverlayHdr.unkTable1_4C[i].field_A = 0;
+    }
+
+    count = g_MapOverlayHdr.bloodSplatCount;
+    for (i = 0; i < count; i++)
+    {
+        g_MapOverlayHdr.bloodSplats[i].field_0 = NO_VALUE;
+    }
+
+    D_800C4408 = 0;
+    D_800C4414 = 0;
+
+    if (g_MapOverlayHdr.initWorldObjects != NULL)
+    {
+        g_MapOverlayHdr.initWorldObjects();
+    }
+}
+
+void func_8005E70C(void) // 0x8005E70C
+{
+    s32 i;
+    s16 count;
+    u8  temp_v0;
+
+    count = g_MapOverlayHdr.unkTable1Count_50;
+    for (i = 0; i < count; i++)
+    {
+        temp_v0 = g_MapOverlayHdr.unkTable1_4C[i].field_A;
+        switch (temp_v0)
+        {
+            case 1:
+            case 2:
+            case 3:
+            case 15:
+            case 16:
+            case 17:
+            case 20:
+            case 21:
+            case 22:
+                g_MapOverlayHdr.unkTable1_4C[i].field_A = 0;
+                break;
+        }
+    }
+
+    count = g_MapOverlayHdr.bloodSplatCount;
+    for (i = 0; i < count; i++)
+    {
+        g_MapOverlayHdr.bloodSplats[i].field_0 = NO_VALUE;
+    }
+
+    D_800C4414 = 0;
+}
+
+s32 func_8005E7E0(s32 arg0) // 0x8005E7E0
+{
+    s32 idx;
+    s32 i;
+
+    idx = D_800C4408;
+
+    for (i = 0; i < g_MapOverlayHdr.unkTable1Count_50; i++, idx++)
+    {
+        if (idx >= g_MapOverlayHdr.unkTable1Count_50)
+        {
+            idx = 0;
+        }
+
+        if (g_MapOverlayHdr.unkTable1_4C[idx].field_A == 0)
+        {
+            break;
+        }
+    }
+
+    if (i == g_MapOverlayHdr.unkTable1Count_50)
+    {
+        return NO_VALUE;
+    }
+
+    g_MapOverlayHdr.unkTable1_4C[idx].field_A = arg0;
+
+    D_800C4408 = idx + 1;
+    return idx;
+}
+
+void func_8005E89C(void) // 0x8005E89C
+{
+    #define CLAMP_CUSTOM(a, b, min, max) \
+        ((((a) >= (max)) ? (max) : (b)) < (min) ? (min) : (((b) >= (max)) ? (max) : (a)))
+
+    SVECTOR          sp10;
+    s32              posX;
+    s32              posZ;
+    s32              posY;
+    s32              i;
+    POLY_FT4*        poly;
+    s_SubCharacter*  chara;
+    s_func_8005E89C* ptr;
+    s_800C42E8*      curPtr;
+
+    ptr = PSX_SCRATCH;
+
+    posX            = FP_FROM(g_SysWork.playerWork.player.position.vx, Q12_SHIFT);
+    posY            = FP_FROM(g_SysWork.playerWork.player.position.vy, Q12_SHIFT);
+    posZ            = FP_FROM(g_SysWork.playerWork.player.position.vz, Q12_SHIFT);
+    ptr->field_0.vx = Q8(posX);
+    ptr->field_0.vy = Q8(posY);
+    ptr->field_0.vz = Q8(posZ);
+
+    Vw_WorldScreenMatrixAtPositionGet(&ptr->field_C, Q12(posX), Q12(posY), Q12(posZ));
+
+    gte_SetRotMatrix(&ptr->field_C);
+    gte_SetTransMatrix(&ptr->field_C);
+    gte_ReadGeomScreen(&ptr->field_2C);
+
+    vwGetViewAngle(&sp10);
+    ptr->field_30.vx = sp10.vx;
+    ptr->field_30.vy = sp10.vy;
+
+    if (D_800C4414 & 0x1)
+    {
+        ptr->field_C4 = Q12_MULT_PRECISE(g_DeltaTime, g_MapOverlayHdr.field_5C->field_E);
+        ptr->field_C8 = g_MapOverlayHdr.field_5C->field_4 * 16;
+        ptr->field_CA = g_MapOverlayHdr.field_5C->field_5 * 16;
+        ptr->field_CC = (0x100 - g_MapOverlayHdr.field_5C->field_5) * 16;
+#ifdef SH_PC_PORT
+        /* x86 idiv faults on zero; a map with a zeroed weather config
+         * (field_16 == 0) just gets no rotation step. */
+        ptr->field_CE = (g_MapOverlayHdr.field_5C->field_16 != 0)
+            ? (g_DeltaTime * g_MapOverlayHdr.field_5C->field_E) / g_MapOverlayHdr.field_5C->field_16 : 0;
+#else
+        ptr->field_CE = (g_DeltaTime * g_MapOverlayHdr.field_5C->field_E) / g_MapOverlayHdr.field_5C->field_16;
+#endif
+        ptr->field_C6 = (u16)g_MapOverlayHdr.field_5C->field_A >> 2;
+        ptr->field_D0 = g_MapOverlayHdr.field_5C->field_20;
+        ptr->field_D4 = g_MapOverlayHdr.field_5C->field_24;
+        ptr->field_D8 = g_MapOverlayHdr.field_5C->field_6 * (2 * ptr->field_2C);
+
+        switch (g_MapOverlayHdr.field_5C->field_1)
+        {
+            case 0:
+                for (i = 0; i < g_MapOverlayHdr.unkTable1Count_50; i++)
+                {
+                    if (g_MapOverlayHdr.unkTable1_4C[i].field_A == 12)
+                    {
+                        g_MapOverlayHdr.func_60(i, 0);
+                    }
+                }
+                break;
+
+            case 1:
+                g_MapOverlayHdr.field_5C->field_10 = MIN(g_MapOverlayHdr.field_5C->field_10 + ((g_DeltaTime * g_MapOverlayHdr.field_5C->field_2) >> 5),
+                                                            Q12(1.0f));
+                break;
+
+            case 2:
+                for (i = 0; i < g_MapOverlayHdr.unkTable1Count_50; i++)
+                {
+                    switch (g_MapOverlayHdr.unkTable1_4C[i].field_A)
+                    {
+                        case 8:
+                        case 9:
+                        case 10:
+                        case 11:
+                            g_MapOverlayHdr.unkTable1_4C[i].field_A = 12;
+                            break;
+                    }
+                }
+                break;
+
+            case 3:
+                g_MapOverlayHdr.field_5C->field_10 = CLAMP_LOW(g_MapOverlayHdr.field_5C->field_10 - ((g_DeltaTime * g_MapOverlayHdr.field_5C->field_2) >> 5),
+                                                                  Q12(0.0f));
+
+                for (i = 0; i < g_MapOverlayHdr.unkTable1Count_50; i++)
+                {
+                    if (g_MapOverlayHdr.unkTable1_4C[i].field_A == 12 &&
+                        Rng_GenerateUInt(0, 4095) > g_MapOverlayHdr.field_5C->field_10 &&
+                        Rng_GenerateInt(0, 15) != 0)
+                    {
+                        g_MapOverlayHdr.func_60(i, 1);
+                    }
+                }
+                break;
+        }
+    }
+    else if (D_800C4414 & 2)
+    {
+        if (g_MapOverlayHdr.field_7C->field_1C > 0)
+        {
+            g_MapOverlayHdr.field_7C->field_1C -= g_DeltaTime;
+            g_MapOverlayHdr.field_7C->field_1C  = MAX(g_MapOverlayHdr.field_7C->field_1C, 0);
+        }
+        else
+        {
+            g_MapOverlayHdr.field_7C->field_10 = Q12_MULT_PRECISE(g_DeltaTime, g_MapOverlayHdr.field_7C->field_E) +
+                                                    g_MapOverlayHdr.field_7C->field_10;
+            g_MapOverlayHdr.field_7C->field_10 = MIN(g_MapOverlayHdr.field_7C->field_10, Q12(0.25f));
+        }
+    }
+    else if (D_800C4414 & 8)
+    {
+        for (i = 0; i < g_MapOverlayHdr.field_94->field_78; i++)
+        {
+            if (g_MapOverlayHdr.field_94->field_30[i] == 0)
+            {
+                ptr->field_DC[i]         = Math_Sin(g_MapOverlayHdr.field_94->field_34[i]);
+                ptr->field_E4[i]         = Math_Cos(g_MapOverlayHdr.field_94->field_34[i]);
+                ptr->u_field_EC.raw_0[i] = (g_MapOverlayHdr.field_94->field_5C[i] >> 1) * Math_Sin(g_MapOverlayHdr.field_94->field_34[i]);
+                ptr->u_field_FC.raw_0[i] = (g_MapOverlayHdr.field_94->field_5C[i] >> 1) * Math_Cos(g_MapOverlayHdr.field_94->field_34[i]);
+                ptr->field_10C[i]        = g_MapOverlayHdr.field_94->field_64[i] * Math_Sin(g_MapOverlayHdr.field_94->field_34[i]);
+                ptr->field_11C[i]        = g_MapOverlayHdr.field_94->field_64[i] * Math_Cos(g_MapOverlayHdr.field_94->field_34[i]);
+            }
+            else
+            {
+                ptr->u_field_EC.field_0[i].vx = Q12_MULT(g_MapOverlayHdr.field_94->field_5C[i] >> 1, Math_Sin(ptr->field_30.vy - Q12_ANGLE(90.0f)));
+                ptr->u_field_EC.field_0[i].vy = Q12_MULT(g_MapOverlayHdr.field_94->field_5C[i] >> 1, Math_Sin(ptr->field_30.vy + Q12_ANGLE(90.0f)));
+                ptr->u_field_FC.field_0[i].vx = Q12_MULT(g_MapOverlayHdr.field_94->field_5C[i] >> 1, Math_Cos(ptr->field_30.vy - Q12_ANGLE(90.0f)));
+                ptr->u_field_FC.field_0[i].vy = Q12_MULT(g_MapOverlayHdr.field_94->field_5C[i] >> 1, Math_Cos(ptr->field_30.vy + Q12_ANGLE(90.0f)));
+            }
+        }
+
+        g_MapOverlayHdr.func_9C();
+    }
+
+    for (i = 0; i < ARRAY_SIZE(D_800C42E8); i++)
+    {
+        curPtr = &D_800C42E8[i];
+
+        if (D_800C42E8[i].field_0 != 0)
+        {
+            if (D_800C42E8[i].field_1 == 6)
+            {
+                chara = &g_SysWork.playerWork.player;
+            }
+            else
+            {
+                chara = &g_SysWork.npcs[D_800C42E8[i].field_1];
+            }
+
+            ptr->field_34[i] = CLAMP_CUSTOM((chara->position.vx + chara->collision.shapeOffsets.box.vx) - D_800C42E8[i].field_4,
+                                            (chara->position.vx + chara->collision.shapeOffsets.box.vx) - curPtr->field_4,
+                                            -Q12_MULT_PRECISE(g_DeltaTime, Q12(1.25f)),
+                                             Q12_MULT_PRECISE(g_DeltaTime, Q12(1.25f)));
+
+            ptr->field_64[i] = CLAMP_CUSTOM((chara->position.vy + chara->collision.box.offsetY) - D_800C42E8[i].field_2,
+                                            (chara->position.vy + chara->collision.box.offsetY) - curPtr->field_2,
+                                            -Q12_MULT_PRECISE(g_DeltaTime, Q12(1.25f)) >> 4,
+                                            Q12_MULT_PRECISE(g_DeltaTime, Q12(1.25f)));
+
+            ptr->field_94[i] = CLAMP_CUSTOM((chara->position.vz + chara->collision.shapeOffsets.box.vz) - D_800C42E8[i].field_8,
+                                            (chara->position.vz + chara->collision.shapeOffsets.box.vz) - curPtr->field_8,
+                                            -Q12_MULT_PRECISE(g_DeltaTime, Q12(1.25f)),
+                                             Q12_MULT_PRECISE(g_DeltaTime, Q12(1.25f)));
+
+            D_800C42E8[i].field_4 += ptr->field_34[i];
+            D_800C42E8[i].field_2 += ptr->field_64[i];
+            D_800C42E8[i].field_8 += ptr->field_94[i];
+        }
+        else
+        {
+            ptr->field_34[i] = Q12(0.0f);
+            ptr->field_64[i] = Q12(0.0f);
+            ptr->field_94[i] = Q12(0.0f);
+        }
+    }
+
+    poly = (POLY_FT4*)GsOUT_PACKET_P;
+
+    for (i = 0; i < g_MapOverlayHdr.unkTable1Count_50; i++)
+    {
+        switch (g_MapOverlayHdr.unkTable1_4C[i].field_A)
+        {
+            case 0:
+                break;
+
+            case 1:
+                func_80060044(&poly, i);
+                break;
+
+            case 2:
+                func_800611C0(&poly, i);
+                break;
+
+            case 3:
+            case 4:
+                func_80062708(&poly, i);
+                break;
+
+            case 15:
+            case 16:
+            case 17:
+            case 18:
+            case 19:
+                func_80063A50(&poly, i);
+                break;
+
+            case 20:
+            case 21:
+            case 22:
+                func_80064334(&poly, i);
+                break;
+
+            case 8:
+            case 10:
+                g_MapOverlayHdr.func_64(&poly, i);
+                break;
+
+            case 9:
+            case 11:
+                g_MapOverlayHdr.func_68(&poly, i);
+                break;
+
+            case 7:
+                g_MapOverlayHdr.func_70(&poly, i);
+                break;
+
+            case 5:
+                g_MapOverlayHdr.func_78(&poly, i);
+                break;
+
+            case 13:
+                g_MapOverlayHdr.func_80(i);
+                break;
+
+            case 14:
+                g_MapOverlayHdr.func_84(&poly, i);
+                break;
+
+            case 23:
+            case 24:
+            case 25:
+            case 26:
+                g_MapOverlayHdr.func_8C(&poly, i);
+                break;
+
+            case 27:
+                g_MapOverlayHdr.func_98(&poly, i);
+                break;
+
+            case 28:
+                g_MapOverlayHdr.func_A4(&poly, i);
+                break;
+
+            case 31:
+                func_80064FC0(&poly, i);
+                break;
+
+            case 32:
+                g_MapOverlayHdr.func_90(&poly, i);
+                break;
+
+            case 33:
+                g_MapOverlayHdr.func_AC(&poly, i);
+                break;
+
+            case 34:
+                g_MapOverlayHdr.func_B0(&poly, i);
+                break;
+
+            case 35:
+                g_MapOverlayHdr.func_B4(&poly, i);
+                break;
+        }
+    }
+
+    GsOUT_PACKET_P = (PACKET*)poly;
+
+    /* Blood-splat recycle restored on PC: frees splat slots whose owning
+     * unkTable1_4C entry went inactive (field_A==0). Layout-safe on 64-bit
+     * (s_MapHdr_field_4C is STATIC_ASSERT 20, s_MapOverlayHdr is 4172) and the
+     * field_0 != NO_VALUE guard prevents any OOB index of unkTable1_4C. Without
+     * this, splats leak/persist on PC. */
+    for (i = 0; i < g_MapOverlayHdr.bloodSplatCount; i++)
+    {
+        if (g_MapOverlayHdr.bloodSplats[i].field_0 != NO_VALUE &&
+            g_MapOverlayHdr.unkTable1_4C[g_MapOverlayHdr.bloodSplats[i].field_0].field_A == 0)
+        {
+            g_MapOverlayHdr.bloodSplats[i].field_0 = NO_VALUE;
+        }
+    }
+
+    if (D_800C4414 & (1 << 5))
+    {
+        g_MapOverlayHdr.func_A8();
+    }
+
+    if (g_SysWork.field_2388.isFlashlightUnavailable_16 && g_SysWork.sysState == 0)
+    {
+        Game_TurnFlashlightOff();
+    }
+}
+
+s32 func_8005F55C(s32 arg0) // 0x8005F55C
+{
+    if (arg0 == 15)
+    {
+        return 0;
+    }
+
+    // TODO: Use available enums.
+    switch (g_GameWork.config.extraBloodColor)
+    {
+        case 3:
+            return 6;
+
+        case 6:
+            return 7;
+
+        case 9:
+            return 5;
+
+        case 12:
+            return 4;
+
+        case 13:
+            return 0;
+    }
+
+    switch (arg0)
+    {
+        case 4:
+            return 9;
+
+        case 1:
+        case 14:
+        {
+            // TODO: Use available enums. Some values appear unused.
+            switch (g_GameWork.config.extraBloodColor)
+            {
+                case 5:
+                    return 7;
+
+                case 2:
+                    return 6;
+
+                case 8:
+                    return 5;
+
+                case 11:
+                    return 4;
+
+                default:
+                    return 0;
+            }
+        }
+
+        case 5:
+        case 8:
+        case 12:
+            return 6;
+
+        case 10:
+            return 7;
+    }
+
+    // TODO: Use available enums. Some values appear unused.
+    switch (g_GameWork.config.extraBloodColor)
+    {
+        case 1:
+        case 2:
+            return 6;
+
+        case 4:
+        case 5:
+            return 7;
+
+        case 7:
+        case 8:
+            return 5;
+
+        case 10:
+        case 11:
+            return 4;
+    }
+
+    return 0;
+}
+
+bool func_8005F680(s_CollisionSurface* coll) // 0x8005F680
+{
+    bool cond;
+    s8   temp_v1;
+
+    temp_v1 = coll->groundType;
+
+    cond = false;
+    if (temp_v1 == 0 || temp_v1 == 12 || temp_v1 == 7)
+    {
+        cond = true;
+    }
+    return cond;
+}
+
+void func_8005F6B0(s_SubCharacter* chara, VECTOR* pos, s32 arg2, s32 arg3) // 0x8005F6B0
+{
+    s_CollisionSurface    coll;
+    VECTOR3        camPos; // Q19.12
+    q19_12         newPosX;
+    q19_12         newPosZ;
+    q20_12         dists[150];
+    s32            idx;
+    s32            unkCount;
+    s32            var_s5;
+    s32            i;
+    s32            j;
+    s32            k;
+    s32            count;
+    s32            curDist;
+    GsCOORDINATE2* camCoord;
+
+#ifdef SH_PC_PORT
+    /* PC: re-enabled. Diagnostic disable in be46ec01e confirmed the
+     * spawn → dispatch → addPrim chain was the OT corruption source.
+     * Root cause was gte_stsz3c writing halfwords (0, 2, 4) instead
+     * of words (0, 4, 8) — left field_160 stale → OOB OT bucket avg.
+     * Fixed in pc_port/include/inline_no_dmpsx.h (commit e4afc3e18). */
+#endif
+
+    if (g_GameWork.config.extraBloodColor == 14) // TODO: Demagic 14.
+    {
+        arg3 = 5;
+    }
+    else
+    {
+        arg3 = func_8005F55C(arg3);
+    }
+
+    switch (arg2)
+    {
+        case 1:
+            var_s5 = 1;
+            count = 0;
+            unkCount = 6;
+            break;
+
+        case 2:
+            var_s5 = 2;
+            count = 1;
+            unkCount = 12;
+            break;
+
+        case 3:
+            var_s5 = 3;
+            count = Rng_GenerateUInt(1, 2);
+            unkCount = 18;
+            break;
+
+        case 4:
+            var_s5 = 3;
+            count = Rng_GenerateUInt(1, 4);
+            unkCount = 24;
+            break;
+
+        case 5:
+            var_s5 = 4;
+            count = Rng_GenerateUInt(2, 5);
+            unkCount = 0x1E;
+            break;
+
+        case 6:
+            var_s5 = 4;
+            count = Rng_GenerateUInt(1, 8);
+            unkCount = 36;
+            break;
+
+        case 7:
+            var_s5 = 5;
+            count = Rng_GenerateUInt(2, 9);
+            unkCount = 42;
+            break;
+
+        case 0:
+        default:
+            var_s5 = 0;
+            count = 0;
+            unkCount = 0;
+            break;
+
+        case 8:
+            var_s5 = 3;
+            count = 0;
+            unkCount = 16;
+            break;
+
+        case 9:
+            var_s5 = 1;
+            count = 0;
+            unkCount = 16;
+            break;
+    }
+
+    if (g_GameWork.config.extraBloodColor == 14)
+    {
+        count = 0;
+    }
+
+    if (arg2 != 8)
+    {
+        for (i = 0; i < ARRAY_SIZE(D_800C42E8); i++)
+        {
+            if (D_800C42E8[i].field_0 == 0)
+            {
+                break;
+            }
+        }
+
+        if (chara->model.charaId == Chara_SplitHead)
+        {
+            i = ARRAY_SIZE(D_800C42E8);
+        }
+
+        if (i != ARRAY_SIZE(D_800C42E8))
+        {
+            D_800C42E8[i].field_0 = 1;
+            D_800C42E8[i].field_1 = Chara_NpcIdxGet(chara);
+            D_800C42E8[i].field_4 = chara->position.vx + chara->collision.shapeOffsets.box.vx;
+            D_800C42E8[i].field_2 = chara->position.vy + chara->collision.box.offsetY;
+            D_800C42E8[i].field_8 = chara->position.vz + chara->collision.shapeOffsets.box.vz;
+        }
+    }
+    else
+    {
+        i = ARRAY_SIZE(D_800C42E8);
+    }
+
+    for (j = 0; j < var_s5; j++)
+    {
+        idx = func_8005E7E0(1);
+
+        if (idx != NO_VALUE)
+        {
+            if (arg2 != 9)
+            {
+                g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0 = Rng_AddGeneratedUInt(pos->vx, -255, 256);
+                g_MapOverlayHdr.unkTable1_4C[idx].vy_8         = Rng_AddGeneratedUInt(pos->vy, -255, 256);
+                g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4 = Rng_AddGeneratedUInt(pos->vz, -255, 256);
+            }
+            else
+            {
+                g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0 = pos->vx;
+                g_MapOverlayHdr.unkTable1_4C[idx].vy_8         = pos->vy;
+                g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4 = pos->vz;
+            }
+
+            if (Rng_GenerateInt(0, 1) != 0) // 1 in 2 chance.
+            {
+                g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_0 = Rng_GenerateInt(0, 2) + (Rng_GenerateUInt(0, 7) * 8);
+            }
+            else
+            {
+                g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_0 = Rng_GenerateUInt(3, 4) + (Rng_GenerateUInt(0, 1) * 8);
+            }
+
+            g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_1  = unkCount;
+            g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_2  = arg3;
+            g_MapOverlayHdr.unkTable1_4C[idx].field_B              = i * 4;
+            g_MapOverlayHdr.unkTable1_4C[idx].field_10.s_0.field_0 = Rng_GenerateUInt(0, 255);
+
+            if (chara->model.charaId == Chara_Floatstinger)
+            {
+                g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_3 = 96;
+            }
+            else
+            {
+                g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_3 = 32;
+            }
+
+            if (arg2 == 9)
+            {
+                g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_3 = 33;
+            }
+        }
+        else
+        {
+            return;
+        }
+    }
+
+    if (count == 0)
+    {
+        return;
+    }
+
+    vwGetViewPosition(&camPos);
+    camCoord   = vwGetViewCoord();
+    camPos.vx += camCoord->coord.m[0][2] * 2;
+    camPos.vz += camCoord->coord.m[2][2] * 2;
+
+    for (j = 0; j < g_MapOverlayHdr.bloodSplatCount; j++)
+    {
+        if (g_MapOverlayHdr.bloodSplats[j].field_0 == NO_VALUE)
+        {
+            dists[j] = INT_MAX;
+        }
+        else
+        {
+            if (g_MapOverlayHdr.unkTable1_4C[g_MapOverlayHdr.bloodSplats[j].field_0].field_B != 2)
+            {
+                dists[j] = Q12(0.0f);
+            }
+            else
+            {
+                newPosX = ABS(camPos.vx - g_MapOverlayHdr.unkTable1_4C[g_MapOverlayHdr.bloodSplats[j].field_0].field_0.vx_0);
+                newPosZ = ABS(camPos.vz - g_MapOverlayHdr.unkTable1_4C[g_MapOverlayHdr.bloodSplats[j].field_0].field_4.vz_4);
+
+                dists[j] = MAX(newPosX, newPosZ) + (CLAMP_HIGH(newPosX, newPosZ) >> 1);
+
+                if (dists[j] > Q12(80.0f))
+                {
+                    g_MapOverlayHdr.unkTable1_4C[g_MapOverlayHdr.bloodSplats[j].field_0].field_A = 0;
+                    g_MapOverlayHdr.bloodSplats[j].field_0                                          = NO_VALUE;
+                    dists[j]                                                                              = INT_MAX;
+                }
+                else
+                {
+                    dists[j] += Rng_GenerateUInt(Q12(0.0f), Q12(4.0f) - 1);
+                }
+            }
+        }
+    }
+
+    for (j = 0; j < count; j++)
+    {
+        if (dists[j] != INT_MAX)
+        {
+            for (k = j + 1; k < g_MapOverlayHdr.bloodSplatCount; k++)
+            {
+                curDist = dists[j];
+                if (dists[k] <= curDist)
+                {
+                    continue;
+                }
+
+                dists[j] = dists[k];
+                dists[k] = curDist;
+
+                unkCount                                       = g_MapOverlayHdr.bloodSplats[j].field_0;
+                g_MapOverlayHdr.bloodSplats[j].field_0 = g_MapOverlayHdr.bloodSplats[k].field_0;
+                g_MapOverlayHdr.bloodSplats[k].field_0 = unkCount;
+
+                if (dists[j] == INT_MAX)
+                {
+                    break;
+                }
+            }
+
+            if (dists[j] == Q12(0.0f))
+            {
+                count = j;
+                break;
+            }
+        }
+    }
+
+    unkCount = 0;
+
+    for (j = 0; j < count; j++)
+    {
+        if (g_MapOverlayHdr.bloodSplats[j].field_0 != NO_VALUE)
+        {
+            g_MapOverlayHdr.unkTable1_4C[g_MapOverlayHdr.bloodSplats[j].field_0].field_B          = 3;
+            g_MapOverlayHdr.unkTable1_4C[g_MapOverlayHdr.bloodSplats[j].field_0].field_10.field_0 = 0;
+            g_MapOverlayHdr.bloodSplats[j].field_0                                                   = NO_VALUE;
+        }
+
+        idx = func_8005E7E0(2);
+        if (idx != NO_VALUE)
+        {
+            g_MapOverlayHdr.unkTable1_4C[idx].field_B      = i * 4;
+            g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0 = Rng_AddGeneratedUInt(pos->vx, -1023, 1024);
+            g_MapOverlayHdr.unkTable1_4C[idx].vy_8         = Rng_AddGeneratedUInt(pos->vy, -2047, 2048);
+            g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4 = Rng_AddGeneratedUInt(pos->vz, -1023, 1024);
+
+            Collision_SurfaceGet(&coll, g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0, g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4);
+
+            if (func_8005F680(&coll) || (coll.groundHeight < (pos->vy - Q12(0.2f))))
+            {
+                g_MapOverlayHdr.unkTable1_4C[idx].field_A = 0;
+            }
+            else
+            {
+                if (coll.groundHeight < g_MapOverlayHdr.unkTable1_4C[idx].vy_8)
+                {
+                    g_MapOverlayHdr.unkTable1_4C[idx].vy_8 = coll.groundHeight;
+
+                    // @hack
+                    unkCount++;
+                    unkCount--;
+                }
+
+                g_MapOverlayHdr.unkTable1_4C[idx].field_10.s_0.field_0 = -(Rng_Rand16() & 0x800);
+                g_MapOverlayHdr.unkTable1_4C[idx].field_10.s_0.field_2 = coll.groundHeight;
+                g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_0  = Rng_GenerateUInt(0, 15);
+                g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_2  = arg3;
+                g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_1  = Rng_GenerateUInt(6, 21);
+                g_MapOverlayHdr.bloodSplats[j].field_0              = idx;
+                unkCount++;
+            }
+        }
+        else
+        {
+            return;
+        }
+    }
+
+    if (unkCount != 0 && i != 24)
+    {
+        D_800C42E8[i].field_0 += 2;
+    }
+}
+
+bool func_80060044(POLY_FT4** poly, s32 idx) // 0x80060044
+{
+    s32              temp_v0_2;
+    s32              temp_v1_5;
+    s32              temp_v1_5_;
+    s32              var_a2;
+    s32              var_v0_6;
+    s32              temp_a1;
+    s32              temp_a2_2;
+    u8               temp_s0;
+    s_func_80060044* ptr;
+    POLY_FT4*        next;
+
+    ptr = PSX_SCRATCH;
+
+    ptr->field_148 = g_MapOverlayHdr.unkTable1_4C[idx].field_10.s_0.field_0;
+
+    if (g_GameWork.config.extraBloodColor == 14)
+    {
+        g_MapOverlayHdr.unkTable1_4C[idx].field_10.s_0.field_0 += (u16)g_DeltaTime * 4;
+    }
+    else if (g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_3 == 33)
+    {
+        g_MapOverlayHdr.unkTable1_4C[idx].field_10.s_0.field_0 += (u16)g_DeltaTime * 2;
+    }
+    else
+    {
+        g_MapOverlayHdr.unkTable1_4C[idx].field_10.s_0.field_0 += g_DeltaTime;
+    }
+
+    temp_a1 = g_MapOverlayHdr.unkTable1_4C[idx].field_B >> 2;
+    if ((u16)g_MapOverlayHdr.unkTable1_4C[idx].field_10.s_0.field_0 >= 5233)
+    {
+        g_MapOverlayHdr.unkTable1_4C[idx].field_A = 0;
+
+        if (temp_a1 != 24)
+        {
+            if (D_800C42E8[temp_a1].field_0 & 1)
+            {
+                D_800C42E8[temp_a1].field_0 -= 1;
+            }
+        }
+
+        return false;
+    }
+
+    if (temp_a1 != 24)
+    {
+        g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0 += ptr->field_0.field_34[temp_a1];
+        g_MapOverlayHdr.unkTable1_4C[idx].vy_8 += ptr->field_0.field_64[temp_a1];
+        g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4 += ptr->field_0.field_94[temp_a1];
+    }
+
+    Math_SetSVectorFastSum(&ptr->field_138,
+                           Q12_TO_Q8(g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0) - (u16)ptr->field_0.field_0.vx,
+                           Q12_TO_Q8(g_MapOverlayHdr.unkTable1_4C[idx].vy_8) - ptr->field_0.field_0.vy,
+                           Q12_TO_Q8(g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4) - ptr->field_0.field_0.vz);
+
+    gte_ldv0(&ptr->field_138);
+    gte_rtps();
+    gte_stsxy(&ptr->field_144);
+    gte_stsz(&ptr->field_140);
+
+    temp_v0_2 = ptr->field_140 - g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_3;
+
+    if (temp_v0_2 <= 0 || (temp_v0_2 >> 3) >= ORDERING_TABLE_SIZE ||
+        ABS(ptr->field_144.vx) > 200 ||
+        ABS(ptr->field_144.vy) > 160)
+    {
+        return false;
+    }
+
+    ptr->field_14C = ((g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_1 * 3) + ((ptr->field_148 * 2) / 327) +
+                      (g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_0 < 3 ? g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_1 : 0)) *
+                     ptr->field_0.field_2C / ptr->field_140;
+
+#ifdef SH_PC_PORT
+    /* PC: clamp the blood-drop half-size on BOTH sides.
+     * Initial findings: log showed field_14C= -84049 (huge NEGATIVE)
+     * — comes through as 0xFFFEB7AF when cast to u16 in setXY*Fast,
+     * producing wildly wrong quad vertices that span the whole screen.
+     * That's the giant black/blue walls/clouds the user kept seeing.
+     * The formula `(numerator) * field_2C / field_140` produces
+     * negatives when `field_2C` (PSX's H register / focal-length-ish)
+     * is computed differently on PC — overflow from intermediate
+     * (numerator * field_2C) likely flipping sign for high z values.
+     * Cap absolute size at 80 either way. Skip the prim entirely when
+     * it would have to be clamped a LOT (>1000 absolute) — those are
+     * pure garbage values, not legit close-camera splats. */
+    {
+        static int _bloodSizeLogN = 0;
+        s32 _origSize = ptr->field_14C;
+        s32 _abs = (_origSize < 0) ? -_origSize : _origSize;
+        if (_abs > 1000) {
+            if (_bloodSizeLogN < 30) {
+                _bloodSizeLogN++;
+            }
+            return false;  /* skip emit — garbage size is the bug */
+        }
+        if (_abs > 80) {
+            if (_bloodSizeLogN < 30) {
+                _bloodSizeLogN++;
+            }
+            ptr->field_14C = (_origSize < 0) ? -80 : 80;
+        }
+    }
+#endif
+
+    setPolyFT4(*poly);
+
+    setXY0Fast(*poly, (u16)ptr->field_144.vx - (u16)ptr->field_14C, ptr->field_144.vy - ptr->field_14C);
+    setXY1Fast(*poly, (u16)ptr->field_144.vx + (u16)ptr->field_14C, ptr->field_144.vy - ptr->field_14C);
+    setXY2Fast(*poly, (u16)ptr->field_144.vx - (u16)ptr->field_14C, ptr->field_144.vy + ptr->field_14C);
+    setXY3Fast(*poly, (u16)ptr->field_144.vx + (u16)ptr->field_14C, ptr->field_144.vy + ptr->field_14C);
+
+    var_a2    = (g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_0) >> 3;
+    temp_a2_2 = var_a2;
+
+    temp_v1_5_ = temp_a2_2 ^ 0x1;
+    temp_v1_5_ = temp_v1_5_ & 0x1;
+
+    temp_v1_5 = (u32)temp_a2_2 >> 1;
+    temp_v1_5 = temp_v1_5 ^ 0x1;
+    temp_v1_5 = temp_v1_5 & 0x1;
+
+    temp_v1_5 = temp_v1_5_ ^ temp_v1_5;
+
+    if ((!(temp_a2_2 & 4) && (temp_v1_5 ^ 1) != 0) || ((temp_a2_2 & 4) && (temp_v1_5) != 0))
+    {
+        var_v0_6 = 0;
+    }
+    else
+    {
+        var_v0_6 = 0x1F;
+    }
+    ptr->field_154 = var_v0_6;
+
+    if (temp_a2_2 >= 4)
+    {
+        ptr->field_168 = 0x1F;
+    }
+    else
+    {
+        ptr->field_168 = 0;
+    }
+
+    temp_v1_5 = temp_a2_2 ^ 0x1;
+    temp_v1_5 = temp_v1_5 & 0x1;
+
+    if ((!(temp_a2_2 & 4) && (temp_v1_5 ^ 1) != 0) || ((temp_a2_2 & 4) && (temp_v1_5) != 0))
+    {
+        var_v0_6 = 0;
+    }
+    else
+    {
+        var_v0_6 = 0x1F;
+    }
+    ptr->field_158 = var_v0_6;
+
+    temp_v1_5 = (u32)temp_a2_2 >> 1;
+    temp_v1_5 = temp_v1_5 ^ 1;
+    temp_v1_5 = temp_v1_5 & 1;
+
+    if ((!(temp_a2_2 & 0x4) && (temp_v1_5 ^ 0x1) != 0) || ((temp_a2_2 & 0x4) && temp_v1_5 != 0))
+    {
+        var_v0_6 = 0x1F;
+    }
+    else
+    {
+        var_v0_6 = 0;
+    }
+    ptr->field_16C = var_v0_6;
+
+    temp_v1_5 = temp_a2_2 ^ 0x1;
+    temp_v1_5 = temp_v1_5 & 0x1;
+
+    if ((!(temp_a2_2 & 0x4) && (temp_v1_5 ^ 0x1) != 0) || ((temp_a2_2 & 0x4) && temp_v1_5 != 0))
+    {
+        var_v0_6 = 0x1F;
+    }
+    else
+    {
+        var_v0_6 = 0;
+    }
+    ptr->field_15C = var_v0_6;
+
+    temp_v1_5 = (u32)temp_a2_2 >> 1;
+    temp_v1_5 = temp_v1_5 ^ 1;
+    temp_v1_5 = temp_v1_5 & 1;
+
+    if ((!(temp_a2_2 & 0x4) && (temp_v1_5 ^ 0x1) != 0) || ((temp_a2_2 & 0x4) && temp_v1_5 != 0))
+    {
+        var_v0_6 = 0;
+    }
+    else
+    {
+        var_v0_6 = 0x1F;
+    }
+    ptr->field_170 = var_v0_6;
+
+    temp_v1_5_ = temp_a2_2 ^ 0x1;
+    temp_v1_5_ = temp_v1_5_ & 0x1;
+
+    temp_v1_5 = (u32)temp_a2_2 >> 1;
+    temp_v1_5 = temp_v1_5 ^ 0x1;
+    temp_v1_5 = temp_v1_5 & 0x1;
+
+    temp_v1_5 = temp_v1_5_ ^ temp_v1_5;
+
+    if ((!(temp_a2_2 & 0x4) && (temp_v1_5 ^ 0x1) != 0) || ((temp_a2_2 & 0x4) && temp_v1_5 != 0))
+    {
+        var_v0_6 = 0x1F;
+    }
+    else
+    {
+        var_v0_6 = 0;
+    }
+    ptr->field_160 = var_v0_6;
+
+    if (temp_a2_2 < 4)
+    {
+        ptr->field_174 = 0x1F;
+    }
+    else
+    {
+        ptr->field_174 = 0;
+    }
+
+    ptr->field_150 = ((g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_0 & 0x7) + 2);
+    ptr->field_164 = CLAMP_LOW_THEN_MIN((ptr->field_148 / 327), 0, 7);
+
+    setSemiTrans(*poly, true);
+
+    if (g_GameWork.config.extraBloodColor == 14)
+    {
+        *(s32*)&(*poly)->u1 = (((ptr->field_164 << 5) + ptr->field_16C) << 8) + 0x2B0000 + ((ptr->field_150 << 5) + ptr->field_158);
+        *(s32*)&(*poly)->u2 = (((ptr->field_164 << 5) + ptr->field_170) << 8) + ((ptr->field_150 << 5) + ptr->field_15C);
+        *(s32*)&(*poly)->u3 = (((ptr->field_164 << 5) + ptr->field_174) << 8) + ((ptr->field_150 << 5) + ptr->field_160);
+    }
+    else
+    {
+        *(s32*)&(*poly)->u1 = (((ptr->field_164 << 5) + ptr->field_16C) << 8) + 0x4B0000 + ((ptr->field_150 << 5) + ptr->field_158);
+        *(s32*)&(*poly)->u2 = (((ptr->field_164 << 5) + ptr->field_170) << 8) + ((ptr->field_150 << 5) + ptr->field_15C);
+        *(s32*)&(*poly)->u3 = (((ptr->field_164 << 5) + ptr->field_174) << 8) + ((ptr->field_150 << 5) + ptr->field_160);
+    }
+
+    if (!(g_SysWork.field_2388.field_154.effectsInfo_0.field_0.field_0 & 3))
+    {
+        if (g_GameWork.config.extraBloodColor == 14)
+        {
+            func_80055A90(&ptr->field_130, &ptr->field_134, 0x40, ptr->field_140 * 16);
+
+            *(u16*)&(*poly)->r0 = ptr->field_130.r + (ptr->field_130.g << 8);
+            (*poly)->b0         = ptr->field_130.b;
+
+            *(s32*)&(*poly)->u0 = (((ptr->field_164 << 5) + ptr->field_154) << 8) + 0x930000 + ((ptr->field_150 << 5) + ptr->field_168);
+
+            *(*poly + 1) = **poly;
+
+            *(u16*)&(*poly + 1)->r0 = ptr->field_134.r + ((ptr->field_134.g >> 4) << 8);
+            (*poly + 1)->b0         = ptr->field_134.b >> 4;
+            (*poly + 1)->clut       = (g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_2 << 6) | 0x13;
+
+            setSemiTrans(*poly + 1, false);
+
+#ifdef SH_PC_PORT
+            /* Bounds-check the OT bucket index. The expression
+             *   (field_140 - field_3) >> 3
+             * has NO clamp in the original code (other particle funcs
+             * line 2350 / 2445 DO clamp). With deep-Z geometry or
+             * negative offsets the index can go OOB the org[2048]
+             * array and addPrim then writes prim data INTO the OT
+             * array itself — that's the source of the persistent
+             * `0x...NHS.` bad nextPtrs (POLY_FT4 vertex+UV bytes
+             * landing in OT_TAG addr fields). */
+            {
+                s32 _bucket1 = (ptr->field_140 - g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_3) >> 3;
+                if (_bucket1 < 0) _bucket1 = 0;
+                if (_bucket1 >= ORDERING_TABLE_SIZE) _bucket1 = ORDERING_TABLE_SIZE - 1;
+                addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[_bucket1], *poly);
+                addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[_bucket1], *poly + 1);
+            }
+#else
+            addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[(ptr->field_140 - g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_3) >> 3], *poly);
+            addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[(ptr->field_140 - g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_3) >> 3], *poly + 1);
+#endif
+            *poly += 2;
+        }
+        else
+        {
+            var_a2 = 0xFF - ((ptr->field_148 * 0x10) / 327);
+            if (var_a2 < 0)
+            {
+                var_a2 = 0;
+            }
+            func_80055A90(&ptr->field_130, &ptr->field_134, var_a2, ptr->field_140 * 16);
+
+            *(u16*)&(*poly)->r0 = ptr->field_130.r + (ptr->field_130.g << 8);
+            (*poly)->b0         = ptr->field_130.b;
+
+            *(s32*)&(*poly)->u0 = (((ptr->field_164 << 5) + ptr->field_154) << 8) + 0x930000 + ((ptr->field_150 << 5) + ptr->field_168);
+
+#ifdef SH_PC_PORT
+            /* Layered spray: 2 ADDITIVE (tpage 43) + 2 SUBTRACTIVE (0x4B) so the
+             * spray renders red over ANY background (a subtractive-only quad,
+             * like the floor pool, goes black in dark air). Safe now that the
+             * setaddr macro parenthesizes its addr arg (PsyCross) — the missing
+             * parens silently corrupted every multi-prim emit, which is the real
+             * reason this was collapsed to one poly. Drop only the two no-op
+             * SetPriority DR_MODE prims; each POLY_FT4 carries its own ABR.
+             * Garbage-size + OOB-bucket guards stay. */
+            *(*poly + 3) = *(*poly + 2) = *(*poly + 1) = **poly;
+            *(u16*)&(*poly + 1)->r0 = ptr->field_134.r + (ptr->field_134.g << 8);
+            (*poly + 1)->b0         = ptr->field_134.b;
+#ifdef SH_PC_PORT
+            PC_BLOOD_FOG_FADE(*poly + 1, ptr->field_140);
+            /* poly+2 is the SECOND subtractive layer, cloned from poly0 BEFORE
+             * any cap or fade -- and poly0's colour is the fog glow, which
+             * GROWS toward the fog colour with distance. An unfaded subtractive
+             * of near-fog-grey against a fogged background is what read as
+             * pitch black spray at range. */
+            PC_BLOOD_FOG_FADE(*poly + 2, ptr->field_140);
+
+#endif
+            (*poly)->tpage          = 43;
+            (*poly + 1)->clut       = (g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_2 << 6) | 0x13;
+            (*poly + 3)->tpage      = 43;
+            /* Cap the ADDITIVE layer color (poly[0]/poly[3]). func_80055A90's
+             * fog-tint is unclamped, so in high-fog maps (e.g. map4_s05) it goes
+             * near-white; additive (GL_ONE,GL_ONE) over the texture's soft alpha
+             * edge — where the subtractive layer is already transparent — then
+             * blows that fringe to WHITE (the "white blood edges"). Dark scenes
+             * have a dim tint already below the cap, so red-over-dark is untouched. */
+            {
+                int _c;
+                int _keep = Pc_BloodFogKeep(ptr->field_140);
+                POLY_FT4* _add[2]; _add[0] = *poly; _add[1] = *poly + 3;
+                for (_c = 0; _c < 2; _c++) {
+                    if (_add[_c]->r0 > BLOOD_ADD_MAX) _add[_c]->r0 = BLOOD_ADD_MAX;
+                    if (_add[_c]->g0 > BLOOD_ADD_MAX) _add[_c]->g0 = BLOOD_ADD_MAX;
+                    if (_add[_c]->b0 > BLOOD_ADD_MAX) _add[_c]->b0 = BLOOD_ADD_MAX;
+                    /* fade the additive layer with world fog so distant blood stops
+                     * over-adding red and disappears into the fog like the world. */
+                    _add[_c]->r0 = (_add[_c]->r0 * _keep) >> 8;
+                    _add[_c]->g0 = (_add[_c]->g0 * _keep) >> 8;
+                    _add[_c]->b0 = (_add[_c]->b0 * _keep) >> 8;
+                }
+            }
+
+            /* Glow balance. [BLOOD4] measured the emitted layers: TWO additive
+             * fog-glows (L0, L3) against ONE subtractive glow (L2), all the
+             * same colour -- a full additive haze left over every droplet cell,
+             * which is the pale/white square edging. On PSX the second additive
+             * was confined by the SetPriority DR_MODE mask packets the PC path
+             * drops as no-ops; they were the containment, not a no-op. Instead
+             * of emulating mask bits, make the subtractive glow the exact SUM
+             * of the two additive glows -- cancellation then holds whatever the
+             * caps and fades did to them, at every distance. The red layer (L1)
+             * is untouched. */
+            {
+                int _br = (*poly)->r0 + (*poly + 3)->r0;
+                int _bg = (*poly)->g0 + (*poly + 3)->g0;
+                int _bb = (*poly)->b0 + (*poly + 3)->b0;
+
+                (*poly + 2)->r0 = (_br > 255) ? 255 : (u8)_br;
+                (*poly + 2)->g0 = (_bg > 255) ? 255 : (u8)_bg;
+                (*poly + 2)->b0 = (_bb > 255) ? 255 : (u8)_bb;
+            }
+            {
+                s32 _bucketS = (ptr->field_140 - g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_3) >> 3;
+                if (_bucketS < 0) _bucketS = 0;
+                if (_bucketS >= ORDERING_TABLE_SIZE) _bucketS = ORDERING_TABLE_SIZE - 1;
+                addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[_bucketS], *poly);
+                addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[_bucketS], *poly + 1);
+                addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[_bucketS], *poly + 2);
+                addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[_bucketS], *poly + 3);
+            }
+            *poly += 4;
+#else
+            *(*poly + 3) = *(*poly + 2) = *(*poly + 1) = **poly;
+
+            *(u16*)&(*poly + 1)->r0 = ptr->field_134.r + (ptr->field_134.g << 8);
+            (*poly + 1)->b0         = ptr->field_134.b;
+#ifdef SH_PC_PORT
+            PC_BLOOD_FOG_FADE(*poly + 1, ptr->field_140);
+            /* poly+2 is the SECOND subtractive layer, cloned from poly0 BEFORE
+             * any cap or fade -- and poly0's colour is the fog glow, which
+             * GROWS toward the fog colour with distance. An unfaded subtractive
+             * of near-fog-grey against a fogged background is what read as
+             * pitch black spray at range. */
+            PC_BLOOD_FOG_FADE(*poly + 2, ptr->field_140);
+#endif
+            (*poly)->tpage          = 43;
+            (*poly + 1)->clut       = (g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_2 << 6) | 0x13;
+            (*poly + 3)->tpage      = 43;
+
+
+            /* Glow balance. [BLOOD4] measured the emitted layers: TWO additive
+             * fog-glows (L0, L3) against ONE subtractive glow (L2), all the
+             * same colour -- a full additive haze left over every droplet cell,
+             * which is the pale/white square edging. On PSX the second additive
+             * was confined by the SetPriority DR_MODE mask packets the PC path
+             * drops as no-ops; they were the containment, not a no-op. Instead
+             * of emulating mask bits, make the subtractive glow the exact SUM
+             * of the two additive glows -- cancellation then holds whatever the
+             * caps and fades did to them, at every distance. The red layer (L1)
+             * is untouched. */
+            {
+                int _br = (*poly)->r0 + (*poly + 3)->r0;
+                int _bg = (*poly)->g0 + (*poly + 3)->g0;
+                int _bb = (*poly)->b0 + (*poly + 3)->b0;
+
+                (*poly + 2)->r0 = (_br > 255) ? 255 : (u8)_br;
+                (*poly + 2)->g0 = (_bg > 255) ? 255 : (u8)_bg;
+                (*poly + 2)->b0 = (_bb > 255) ? 255 : (u8)_bb;
+            }
+            ptr->field_12C = (PACKET*)*poly + 0xA0;
+            SetPriority(ptr->field_12C, 0, 0);
+            SetPriority(ptr->field_12C + 0xC, 1, 1);
+
+            addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[(ptr->field_140 - g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_3) >> 3], *poly);
+            addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[(ptr->field_140 - g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_3) >> 3], *poly + 1);
+            addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[(ptr->field_140 - g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_3) >> 3], *poly + 2);
+            addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[(ptr->field_140 - g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_3) >> 3], ptr->field_12C);
+            addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[(ptr->field_140 - g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_3) >> 3], *poly + 3);
+            addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[(ptr->field_140 - g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_3) >> 3], ptr->field_12C + 12);
+            *poly = ptr->field_12C + 0x18;
+#endif
+        }
+        return true;
+    }
+
+    if (g_GameWork.config.extraBloodColor == 14)
+    {
+        temp_s0             = func_80055D78(g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0, g_MapOverlayHdr.unkTable1_4C[idx].vy_8, g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4);
+        *(u16*)&(*poly)->r0 = temp_s0 + (func_80055D78(g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0, g_MapOverlayHdr.unkTable1_4C[idx].vy_8, g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4) << 8);
+        (*poly)->b0         = func_80055D78(g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0, g_MapOverlayHdr.unkTable1_4C[idx].vy_8, g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4);
+    }
+    else
+    {
+        var_a2 = 0xFF - (ptr->field_148 * 16) / 327;
+        if (var_a2 < 0)
+        {
+            var_a2 = 0;
+        }
+        *(u16*)&(*poly)->r0 = var_a2 + (var_a2 << 8);
+        (*poly)->b0         = var_a2;
+    }
+
+    *(s32*)&(*poly)->u0 = (((g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_2 << 6) | 0x13) << 16) + (((ptr->field_164 << 5) + ptr->field_168) << 8) + ((ptr->field_150 << 5) + ptr->field_154);
+
+#ifdef SH_PC_PORT
+    /* Same OOB-bucket fix as the if/else branches above. */
+    {
+        s32 _bucketT = (ptr->field_140 - g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_3) >> 3;
+        if (_bucketT < 0) _bucketT = 0;
+        if (_bucketT >= ORDERING_TABLE_SIZE) _bucketT = ORDERING_TABLE_SIZE - 1;
+        addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[_bucketT], *poly);
+    }
+#else
+    addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[(ptr->field_140 - g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_3) >> 3], *poly);
+#endif
+
+    *poly += 1;
+
+    return true;
+}
+
+bool func_800611C0(POLY_FT4** poly, s32 idx) // 0x800611C0
+{
+    s_func_800611C0  sp10;
+    s_CollisionSurface      colls[4];
+    s16              temp_v1_6;
+    s32              temp_v1_15;
+    s32              temp_v1_15_;
+    s32              var_t0;
+    s32              var_v0_6;
+    u32              idx0;
+    u32              var_a0_3;
+    s32              temp;
+    s_func_800611C0* ptr;
+
+    ptr = PSX_SCRATCH;
+
+    if (!(g_MapOverlayHdr.unkTable1_4C[idx].field_B & 0x3))
+    {
+        idx0 = g_MapOverlayHdr.unkTable1_4C[idx].field_B >> 2;
+
+        if (idx0 != 24)
+        {
+            g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0 += ptr->field_0.field_34[idx0];
+            g_MapOverlayHdr.unkTable1_4C[idx].vy_8 += ptr->field_0.field_64[idx0];
+            g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4 += ptr->field_0.field_94[idx0];
+        }
+
+        g_MapOverlayHdr.unkTable1_4C[idx].field_10.s_0.field_0 = MIN(g_MapOverlayHdr.unkTable1_4C[idx].field_10.s_0.field_0 + (g_GravitySpeed >> 2), 0x2000);
+
+        g_MapOverlayHdr.unkTable1_4C[idx].vy_8 += g_MapOverlayHdr.unkTable1_4C[idx].field_10.s_0.field_0;
+
+        if (g_MapOverlayHdr.unkTable1_4C[idx].vy_8 > g_MapOverlayHdr.unkTable1_4C[idx].field_10.s_0.field_2)
+        {
+            if (idx0 != 24)
+            {
+                if (D_800C42E8[idx0].field_0 & (1 << 1))
+                {
+                    D_800C42E8[idx0].field_0 -= 2;
+                }
+            }
+
+            g_MapOverlayHdr.unkTable1_4C[idx].vy_8 = g_MapOverlayHdr.unkTable1_4C[idx].field_10.s_0.field_2;
+
+            sp10 = *ptr;
+
+            ptr->field_178 = g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_1 << 5;
+
+            Collision_SurfaceGet(&colls[0], g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0 + ptr->field_178, g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4);
+            Collision_SurfaceGet(&colls[1], g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0 - ptr->field_178, g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4);
+            Collision_SurfaceGet(&colls[2], g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0, g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4 + ptr->field_178);
+            Collision_SurfaceGet(&colls[3], g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0, g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4 - ptr->field_178);
+
+            if (func_8005F680(&colls[0]) || func_8005F680(&colls[1]) || func_8005F680(&colls[2]) || func_8005F680(&colls[3]) ||
+                (g_MapOverlayHdr.unkTable1_4C[idx].vy_8 - colls[0].groundHeight) < Q12(-0.2f) ||
+                (g_MapOverlayHdr.unkTable1_4C[idx].vy_8 - colls[1].groundHeight) < Q12(-0.2f) ||
+                (g_MapOverlayHdr.unkTable1_4C[idx].vy_8 - colls[2].groundHeight) < Q12(-0.2f) ||
+                (g_MapOverlayHdr.unkTable1_4C[idx].vy_8 - colls[3].groundHeight) < Q12(-0.2f))
+            {
+                g_MapOverlayHdr.unkTable1_4C[idx].field_A = 0;
+            }
+            else
+            {
+                g_MapOverlayHdr.unkTable1_4C[idx].field_B          = 1;
+                g_MapOverlayHdr.unkTable1_4C[idx].field_10.field_0 = Rng_GenerateUInt(0, 255);
+            }
+
+            *ptr = sp10;
+
+            gte_SetRotMatrix(&ptr->field_0.field_C);
+            gte_SetTransMatrix(&ptr->field_0.field_C);
+        }
+
+        return true;
+    }
+
+    ptr->field_168 = g_MapOverlayHdr.unkTable1_4C[idx].field_10.field_0;
+
+    if (g_MapOverlayHdr.unkTable1_4C[idx].field_B == 2)
+    {
+        if (*g_MapOverlayHdr.data_190 != 0)
+        {
+            g_MapOverlayHdr.unkTable1_4C[idx].field_10.field_0 += g_DeltaTime;
+            if (g_MapOverlayHdr.unkTable1_4C[idx].field_10.field_0 > Q12(50.0f))
+            {
+                g_MapOverlayHdr.unkTable1_4C[idx].field_10.field_0 = Q12(50.0f);
+            }
+
+            ptr->field_168 = 0xCC0;
+        }
+    }
+    else
+    {
+        g_MapOverlayHdr.unkTable1_4C[idx].field_10.field_0 += g_DeltaTime;
+
+        if (g_MapOverlayHdr.unkTable1_4C[idx].field_10.field_0 > 0xCC0)
+        {
+            if (g_MapOverlayHdr.unkTable1_4C[idx].field_B == 1)
+            {
+                g_MapOverlayHdr.unkTable1_4C[idx].field_10.field_0    = 0xCC0;
+                g_MapOverlayHdr.unkTable1_4C[idx].field_B             = 2;
+                g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_3 = 0x80;
+            }
+            else
+            {
+                g_MapOverlayHdr.unkTable1_4C[idx].field_A = 0;
+                return false;
+            }
+        }
+    }
+
+    vwGetViewPosition(&ptr->field_14C);
+
+    if (ABS(ptr->field_14C.vx - g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0) +
+        ABS(ptr->field_14C.vz - g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4) > Q12(20.0f))
+    {
+        if (g_MapOverlayHdr.unkTable1_4C[idx].field_B == 3)
+        {
+            g_MapOverlayHdr.unkTable1_4C[idx].field_A = 0;
+        }
+
+        return false;
+    }
+
+    if ((u32)(g_MapOverlayHdr.unkTable1_4C[idx].field_B & 3) < 3u)
+    {
+        temp           = g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_1 * 16;
+        temp           = (ptr->field_168 * temp) / 816;
+        ptr->field_178 = temp < (g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_1 << 5) ? temp : (g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_1 << 5);
+    }
+    else
+    {
+        ptr->field_178 = g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_1 << 5;
+    }
+
+    setPolyFT4(*poly);
+
+    Math_SetSVectorFastSum(&ptr->field_134,
+                           Q12_TO_Q8(g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0 - ptr->field_178) - (u16)ptr->field_0.field_0.vx,
+                           Q12_TO_Q8(g_MapOverlayHdr.unkTable1_4C[idx].vy_8) - ptr->field_0.field_0.vy,
+                           Q12_TO_Q8(g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4 + ptr->field_178) - ptr->field_0.field_0.vz);
+    Math_SetSVectorFastSum(&ptr->field_13C,
+                           Q12_TO_Q8(g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0 + ptr->field_178) - (u16)ptr->field_0.field_0.vx,
+                           Q12_TO_Q8(g_MapOverlayHdr.unkTable1_4C[idx].vy_8) - ptr->field_0.field_0.vy,
+                           Q12_TO_Q8(g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4 + ptr->field_178) - ptr->field_0.field_0.vz);
+    Math_SetSVectorFastSum(&ptr->field_144,
+                           Q12_TO_Q8(g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0 - ptr->field_178) - (u16)ptr->field_0.field_0.vx,
+                           Q12_TO_Q8(g_MapOverlayHdr.unkTable1_4C[idx].vy_8) - ptr->field_0.field_0.vy,
+                           Q12_TO_Q8(g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4 - ptr->field_178) - ptr->field_0.field_0.vz);
+
+    gte_ldv3c(&ptr->field_134);
+    gte_rtpt();
+    gte_stsxy3_g3(*poly);
+    gte_stsz3c(&ptr->field_158);
+
+    Math_SetSVectorFastSum(&ptr->field_134,
+                           Q12_TO_Q8(g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0 + ptr->field_178) - (u16)ptr->field_0.field_0.vx,
+                           Q12_TO_Q8(g_MapOverlayHdr.unkTable1_4C[idx].vy_8) - ptr->field_0.field_0.vy,
+                           Q12_TO_Q8(g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4 - ptr->field_178) - ptr->field_0.field_0.vz);
+
+    gte_ldv0(&ptr->field_134);
+    gte_rtps();
+    gte_stsxy(&ptr->field_16C);
+    gte_stsz(&ptr->field_164);
+
+    ptr->field_158 = (ptr->field_158 + ptr->field_15C + ptr->field_160 + ptr->field_164) >> 2;
+
+    if ((ptr->field_158 - 8) <= 0 || ((ptr->field_158 - 8) >> 3) >= ORDERING_TABLE_SIZE)
+    {
+        return false;
+    }
+
+    if (ABS(ptr->field_16C.vx) > 200)
+    {
+        return false;
+    }
+
+    if (ABS(ptr->field_16C.vy) > 160)
+    {
+        return false;
+    }
+
+    *(s32*)&(*poly)->x3 = *(s32*)&ptr->field_16C;
+
+    ptr->field_17C = !(g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_0 & 8) << 5;
+
+    if (g_MapOverlayHdr.unkTable1_4C[idx].field_B == 3)
+    {
+        ptr->field_190 = 224;
+    }
+    else
+    {
+        ptr->field_190 = MIN(ptr->field_168 / 408, 7) << 5;
+    }
+
+    var_t0 = g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_0 & 7;
+
+    temp_v1_15_ = var_t0 ^ 0x1;
+    temp_v1_15_ = temp_v1_15_ & 0x1;
+
+    temp_v1_15 = (u32)var_t0 >> 1;
+    temp_v1_15 = temp_v1_15 ^ 0x1;
+    temp_v1_15 = temp_v1_15 & 0x1;
+
+    temp_v1_15 = temp_v1_15_ ^ temp_v1_15;
+
+    if ((!(var_t0 & 0x4) && (temp_v1_15 ^ 0x1) != 0) || ((var_t0 & 0x4) && temp_v1_15 != 0))
+    {
+        var_v0_6 = 0;
+    }
+    else
+    {
+        var_v0_6 = 0x1F;
+    }
+    ptr->field_180 = var_v0_6;
+
+    if (var_t0 >= 4)
+    {
+        ptr->field_194 = 0x1F;
+    }
+    else
+    {
+        ptr->field_194 = 0;
+    }
+
+    temp_v1_15 = var_t0 ^ 0x1;
+    temp_v1_15 = temp_v1_15 & 0x1;
+
+    if ((!(var_t0 & 0x4) && (temp_v1_15 ^ 0x1) != 0) || ((var_t0 & 0x4) && temp_v1_15 != 0))
+    {
+        var_v0_6 = 0;
+    }
+    else
+    {
+        var_v0_6 = 0x1F;
+    }
+    ptr->field_184 = var_v0_6;
+
+    temp_v1_15 = (u32)var_t0 >> 1;
+    temp_v1_15 = temp_v1_15 ^ 1;
+    temp_v1_15 = temp_v1_15 & 1;
+
+    if ((!(var_t0 & 0x4) && (temp_v1_15 ^ 0x1) != 0) || ((var_t0 & 0x4) && temp_v1_15 != 0))
+    {
+        var_v0_6 = 0x1F;
+    }
+    else
+    {
+        var_v0_6 = 0;
+    }
+    ptr->field_198 = var_v0_6;
+
+    temp_v1_15 = var_t0 ^ 1;
+    temp_v1_15 = temp_v1_15 & 1;
+
+    if ((!(var_t0 & 0x4) && (temp_v1_15 ^ 0x1) != 0) || ((var_t0 & 0x4) && temp_v1_15 != 0))
+    {
+        var_v0_6 = 0x1F;
+    }
+    else
+    {
+        var_v0_6 = 0;
+    }
+    ptr->field_188 = var_v0_6;
+
+    temp_v1_15 = (u32)var_t0 >> 1;
+    temp_v1_15 = temp_v1_15 ^ 1;
+    temp_v1_15 = temp_v1_15 & 1;
+
+    if ((!(var_t0 & 0x4) && (temp_v1_15 ^ 0x1) != 0) || ((var_t0 & 0x4) && temp_v1_15 != 0))
+    {
+        var_v0_6 = 0;
+    }
+    else
+    {
+        var_v0_6 = 0x1F;
+    }
+    ptr->field_19C = var_v0_6;
+
+    temp_v1_15_ = var_t0 ^ 0x1;
+    temp_v1_15_ = temp_v1_15_ & 0x1;
+
+    temp_v1_15 = (u32)var_t0 >> 1;
+    temp_v1_15 = temp_v1_15 ^ 0x1;
+    temp_v1_15 = temp_v1_15 & 0x1;
+
+    temp_v1_15 = temp_v1_15_ ^ temp_v1_15;
+
+    if ((!(var_t0 & 0x4) && (temp_v1_15 ^ 0x1) != 0) || ((var_t0 & 0x4) && temp_v1_15 != 0))
+    {
+        var_v0_6 = 0x1F;
+    }
+    else
+    {
+        var_v0_6 = 0;
+    }
+    ptr->field_18C = var_v0_6;
+
+    if (var_t0 < 4)
+    {
+        ptr->field_1A0 = 0x1F;
+    }
+    else
+    {
+        ptr->field_1A0 = 0;
+    }
+
+    if (g_MapOverlayHdr.unkTable1_4C[idx].field_B == 1)
+    {
+        var_t0 = 0xFF - ((ptr->field_168 * 0x10) / 204);
+        var_t0 = MAX(var_t0, 0x80);
+    }
+    else if (g_MapOverlayHdr.unkTable1_4C[idx].field_B == 2)
+    {
+        if (*g_MapOverlayHdr.data_190 != 0)
+        {
+            temp_v1_6                                                 = (0x80 - (((g_MapOverlayHdr.unkTable1_4C[idx].field_10.field_0 - 0xCC0) << 7) / 204800)) < 0x20;
+            var_a0_3                                                  = !(temp_v1_6) ? (0x80 - (((g_MapOverlayHdr.unkTable1_4C[idx].field_10.field_0 - 0xCC0) << 7) / 204800)) : 0x20;
+            g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_3 = var_a0_3;
+            var_t0                                                    = Q8_FRACT(var_a0_3);
+        }
+        else
+        {
+            var_t0 = g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_3;
+        }
+    }
+    else
+    {
+        var_t0 = g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_3 - ((ptr->field_168 * 8) / 204);
+        var_t0 = MAX(var_t0, 0);
+    }
+
+    *(s32*)&(*poly)->u1 = ((ptr->field_190 + ptr->field_198) << 8) + 0x4B0000 + (ptr->field_17C + ptr->field_184);
+    *(s32*)&(*poly)->u2 = ((ptr->field_190 + ptr->field_19C) << 8) + (ptr->field_17C + ptr->field_188);
+    *(s32*)&(*poly)->u3 = ((ptr->field_190 + ptr->field_1A0) << 8) + (ptr->field_17C + ptr->field_18C);
+
+    setSemiTrans(*poly, true);
+
+    if (!(g_SysWork.field_2388.field_154.effectsInfo_0.field_0.field_0 & 0x3))
+    {
+        *(s32*)&(*poly)->u0 = ((ptr->field_190 + ptr->field_194) << 8) + 0x930000 + (ptr->field_17C + ptr->field_180);
+        func_80055A90(&ptr->field_12C, &ptr->field_130, var_t0, ptr->field_158 * 16);
+        *(u16*)&(*poly)->r0 = ptr->field_12C.r + (ptr->field_12C.g << 8);
+        (*poly)->b0         = ptr->field_12C.b;
+
+#ifdef SH_PC_PORT
+        PC_BLOOD_FOG_FADE(*poly, ptr->field_158);
+
+        /* Red-bias + tpage fix for the ground-decal blood. Two issues
+         * the PSX 3-prim emit hid that surface in our single-prim PC
+         * simplification:
+         *   tpage 0x4B and 0x2B are the SAME texture page (704) — they differ
+         *   ONLY in the ABR (semi-transparency) bits: 0x4B = ABR 2 (SUBTRACTIVE),
+         *   0x2B = ABR 1 (ADDITIVE). The prior override to 0x2B misread 0x4B as
+         *   "a different texture page". The blood CLUT (row 0) is CYAN (R low,
+         *   G/B high); SUBTRACTIVE removes G/B from the floor -> leaves RED (what
+         *   PSX/Duckstation shows). ADDITIVE adds the cyan -> blue. The drawers
+         *   that kept 0x4B (func_80064334/func_80064FC0) render red; restore 0x4B
+         *   here so this blood matches. */
+        (*poly)->tpage = 0x4B;
+        (*poly)->clut  = (g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_2 << 6) | 0x13;
+        /* No +96 red boost: it was tuned for additive blend and HURTS the
+         * subtractive blend (lowering the poly's G/B reduces the G/B subtraction
+         * that creates red). With subtractive + the raw fog-tinted color, the
+         * cyan texel removes G/B from the floor and the result is red. r0/g0/b0
+         * were already set from the raw field_12C above. */
+#endif
+
+#ifdef SH_PC_PORT
+        /* PC simplification: emit a single POLY_FT4 instead of the PSX
+         * 3-prim layered layout. The original used a struct copy
+         * `*(*poly + 2) = *(*poly + 1) = **poly` that propagated the
+         * OT addr field, then poked tpage/clut/color into the second
+         * copy and three sequential addPrim calls. The struct copy +
+         * sequential addPrim was the same pattern as the prior knife
+         * blood-splat bug (commit edd9e2098): later addPrim links wrote
+         * back into the prim's own addr field via aliasing, producing
+         * persistent OT chain corruption that the OT0 sanitizer
+         * masked by re-linking to org[0] — manifesting as huge mid-
+         * distance geometry vanishing on bullet impact (same path as
+         * knife since pistol-on-enemy uses this same blood spawner).
+         * Drop the additive-overlay second prim; visual loses one of
+         * the layered blend passes but no longer trashes adjacent OT
+         * buckets. The bucket-bounds clamp stays — defensive against
+         * the earlier off-by-one guard mismatch. */
+        {
+            s32 _bucket = ptr->field_158 >> 3;
+            if (_bucket < 0) _bucket = 0;
+            if (_bucket >= ORDERING_TABLE_SIZE) _bucket = ORDERING_TABLE_SIZE - 1;
+            addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[_bucket], *poly);
+        }
+        *poly = *poly + 1;
+#else
+        *(*poly + 2) = *(*poly + 1) = **poly;
+
+        (*poly)->tpage          = 0x2B;
+        (*poly + 1)->clut       = (g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_2 << 6) | 0x13;
+        *(u16*)&(*poly + 1)->r0 = ptr->field_130.r + (ptr->field_130.g << 8);
+        (*poly + 1)->b0         = ptr->field_130.b;
+
+        addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[ptr->field_158 >> 3], *poly);
+        addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[ptr->field_158 >> 3], *poly + 1);
+        addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[ptr->field_158 >> 3], *poly + 2);
+
+        *poly = *poly + 3;
+#endif
+    }
+    else
+    {
+        *(s32*)&(*poly)->u0 = (((g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_2 << 6) | 0x13) << 16) +
+                              ((ptr->field_190 + ptr->field_194) << 8) + (ptr->field_17C + ptr->field_180);
+        *(u16*)&(*poly)->r0 = var_t0 + (var_t0 << 8);
+        (*poly)->b0         = var_t0;
+
+#ifdef SH_PC_PORT
+        /* The ground decal's OTHER branch -- the blood pools. Unlike the branch
+         * above it never calls func_80055A90, so it gets no fog treatment at
+         * all: a pool stayed at full strength however far away or however thick
+         * the fog, which is the puddle still standing out after the splatters
+         * were fixed. Same depth field as its sibling. */
+        PC_BLOOD_FOG_FADE(*poly, ptr->field_158);
+
+        /* Same off-by-one bound clamp as the if-branch above. */
+        {
+            s32 _bucket = ptr->field_158 >> 3;
+            if (_bucket < 0) _bucket = 0;
+            if (_bucket >= ORDERING_TABLE_SIZE) _bucket = ORDERING_TABLE_SIZE - 1;
+            addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[_bucket], *poly);
+        }
+#else
+        addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[ptr->field_158 >> 3], *poly);
+#endif
+
+        *poly = *poly + 1;
+    }
+
+    return true;
+}
+
+void func_800622B8(s32 unused, s_SubCharacter* chara, s32 animStatus, s32 arg3) // 0x800622B8
+{
+    s_CollisionSurface coll;
+    s32         temp_s0;
+    s32         temp_s2;
+    s32         temp_s3;
+    s32         idx;
+    s32         i;
+
+    if (g_GameWork.config.extraBloodColor == 14)
+    {
+        return;
+    }
+
+    // Related to blood.
+    arg3 = func_8005F55C(arg3);
+
+    i = D_800AE5CC[animStatus + 1] - D_800AE5CC[animStatus];
+    while (i > 0)
+    {
+        idx = func_8005E7E0(3);
+        if (idx == NO_VALUE)
+        {
+            break;
+        }
+
+        temp_s0 = (D_800AE5CC[animStatus] + i) - 1;
+
+        temp_s3 = Rng_Rand16() % D_800AE5F0[temp_s0 * 4]       + D_800AE5F0[(temp_s0 * 4) + 1];
+        temp_s2 = Rng_Rand16() % D_800AE5F0[(temp_s0 * 4) + 2] + D_800AE5F0[(temp_s0 * 4) + 3];
+
+        g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0 = chara->position.vx +
+                                                            Q12_MULT(temp_s3, Math_Sin(chara->rotation.vy)) -
+                                                            Q12_MULT(temp_s2, Math_Cos(chara->rotation.vy));
+        g_MapOverlayHdr.unkTable1_4C[idx].vy_8 = chara->position.vy;
+        g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4 = chara->position.vz +
+                                                            Q12_MULT(temp_s3, Math_Cos(chara->rotation.vy)) +
+                                                            Q12_MULT(temp_s2, Math_Sin(chara->rotation.vy));
+
+        Collision_SurfaceGet(&coll, g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0, g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4);
+
+        if (ABS_DIFF(coll.groundHeight, chara->position.vy) > Q12(0.15f))
+        {
+            g_MapOverlayHdr.unkTable1_4C[(idx)].field_A = 0;
+        }
+        else
+        {
+            g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_0.field_2 = D_800AE700[animStatus] + (Rng_Rand16() % (D_800AE700[animStatus] >> 2));
+            g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_1 = arg3;
+            g_MapOverlayHdr.unkTable1_4C[idx].field_B             = Rng_GenerateUInt(4, 7);
+            g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_0 = Chara_NpcIdxGet(chara);
+            g_MapOverlayHdr.unkTable1_4C[idx].field_10.field_0    = Rng_GenerateUInt(0, 8191);
+        }
+
+        i--;
+    }
+}
+
+void func_800625F4(VECTOR3* arg0, q3_12 angle, s32 arg2, s32 arg3) // 0x800625F4
+{
+    s32 idx;
+    s8  var;
+
+    var = func_8005F55C(arg2);
+
+    idx = func_8005E7E0(4);
+    if (idx == NO_VALUE)
+    {
+        return;
+    }
+
+    g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0        = arg0->vx;
+    g_MapOverlayHdr.unkTable1_4C[idx].vy_8                = arg0->vy;
+    g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4        = arg0->vz;
+    g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_0.field_2 = angle;
+    g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_1 = var;
+    g_MapOverlayHdr.unkTable1_4C[idx].field_B             = Rng_GenerateUInt(0, 3);
+    g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_0 = 6;
+    g_MapOverlayHdr.unkTable1_4C[idx].field_10.field_0    = arg3 * Q12(5.0f);
+}
+
+bool func_80062708(POLY_FT4** poly, s32 idx) // 0x80062708
+{
+    s_func_80062708  sp10;
+    s_CollisionSurface      colls[4];
+    s32              temp_a1_3;
+    s32              temp_s2;
+    s32              j;
+    s32              i;
+    s32              var_s7;
+    u32              temp_v1_6;
+    s_func_80062708* ptr;
+
+    ptr = PSX_SCRATCH;
+
+    if (g_MapOverlayHdr.unkTable1_4C[idx].field_A == 3)
+    {
+        var_s7 = 0xC;
+        if (g_SysWork.npcs[g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_0].model.charaId == Chara_None)
+        {
+            g_MapOverlayHdr.unkTable1_4C[idx].field_A = 0;
+            return false;
+        }
+    }
+    else
+    {
+        var_s7 = 0x100;
+    }
+
+    if (g_MapOverlayHdr.unkTable1_4C[idx].field_B & (1 << 2))
+    {
+        g_MapOverlayHdr.unkTable1_4C[idx].field_10.field_0 += g_DeltaTime;
+        if (g_MapOverlayHdr.unkTable1_4C[idx].field_10.field_0 > Q12(2.5f))
+        {
+            g_MapOverlayHdr.unkTable1_4C[idx].field_B         -= 4;
+            g_MapOverlayHdr.unkTable1_4C[idx].field_10.field_0 = 0;
+        }
+
+        return false;
+    }
+
+    ptr->field_208 = g_MapOverlayHdr.unkTable1_4C[idx].field_10.field_0;
+
+    if (*g_MapOverlayHdr.data_190 != NULL)
+    {
+        g_MapOverlayHdr.unkTable1_4C[idx].field_10.field_0 += g_DeltaTime;
+        if (g_MapOverlayHdr.unkTable1_4C[idx].field_10.field_0 > Q12(45.0f))
+        {
+            g_MapOverlayHdr.unkTable1_4C[idx].field_10.field_0 = Q12(45.0f);
+        }
+    }
+    else
+    {
+        if (g_MapOverlayHdr.unkTable1_4C[idx].field_10.field_0 < Q12(5.0f))
+        {
+            g_MapOverlayHdr.unkTable1_4C[idx].field_10.field_0 += g_DeltaTime;
+        }
+    }
+
+    vwGetViewPosition(&ptr->field_1FC);
+
+    if ((ABS(ptr->field_1FC.vx - g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0) +
+         ABS(ptr->field_1FC.vz - g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4)) > Q12(20.0f))
+    {
+        return false;
+    }
+
+    if (ptr->field_208 >= Q12(5.0f))
+    {
+        ptr->field_2DC = (u16)g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_0.field_2;
+    }
+    else
+    {
+        ptr->field_2DC = (ptr->field_208 * (u16)g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_0.field_2) / Q12(5.0f);
+        temp_s2        = (ptr->field_2DC >> 1) * 16; // To Q12.
+
+        sp10 = *ptr;
+
+        if (Rng_GenerateUInt(0, 1) != 0) // 1 in 2 chance.
+        {
+            Collision_SurfaceGet(&colls[0], g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0 - temp_s2, g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4);
+            Collision_SurfaceGet(&colls[1], g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0 + temp_s2, g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4);
+            Collision_SurfaceGet(&colls[2], g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0, g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4 - temp_s2);
+            Collision_SurfaceGet(&colls[3], g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0, g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4 + temp_s2);
+        }
+        else
+        {
+            Collision_SurfaceGet(&colls[0], g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0 - temp_s2, g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4 - temp_s2);
+            Collision_SurfaceGet(&colls[1], g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0 + temp_s2, g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4 - temp_s2);
+            Collision_SurfaceGet(&colls[2], g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0 - temp_s2, g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4 + temp_s2);
+            Collision_SurfaceGet(&colls[3], g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0 + temp_s2, g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4 + temp_s2);
+        }
+
+        if (func_8005F680(&colls[0]) || func_8005F680(&colls[1]) || func_8005F680(&colls[2]) || func_8005F680(&colls[3]) ||
+            ABS(colls[0].groundHeight - g_MapOverlayHdr.unkTable1_4C[idx].vy_8) > Q12(0.15f) ||
+            ABS(colls[1].groundHeight - g_MapOverlayHdr.unkTable1_4C[idx].vy_8) > Q12(0.15f) ||
+            ABS(colls[2].groundHeight - g_MapOverlayHdr.unkTable1_4C[idx].vy_8) > Q12(0.15f) ||
+            ABS(colls[3].groundHeight - g_MapOverlayHdr.unkTable1_4C[idx].vy_8) > Q12(0.15f))
+        {
+            g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_0.field_2  = ptr->field_2DC;
+            g_MapOverlayHdr.unkTable1_4C[idx].field_10.field_0 = Q12(5.0f);
+        }
+
+        *ptr = sp10;
+
+        gte_SetRotMatrix(&ptr->field_0.field_C);
+        gte_SetTransMatrix(&ptr->field_0.field_C);
+    }
+
+    ptr->field_210 = (g_MapOverlayHdr.unkTable1_4C[idx].field_B << 13) + 224;
+
+    for (i = 0; i < 5; i++)
+    {
+        for (j = 0; j < 5; j++)
+        {
+            Math_SetSVectorFastSum(&ptr->field_134[(i * 5) + j],
+                                   ((Q12_TO_Q8(g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0) - (u16)ptr->field_0.field_0.vx) - (u16)ptr->field_2DC) + ((ptr->field_2DC >> 1) * j),
+                                   Q12_TO_Q8(g_MapOverlayHdr.unkTable1_4C[idx].vy_8) - ptr->field_0.field_0.vy,
+                                   ((Q12_TO_Q8(g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4) - ptr->field_0.field_0.vz) - ptr->field_2DC) + ((ptr->field_2DC >> 1) * i));
+        }
+    }
+
+    for (i = 0; i < 24; i += 3)
+    {
+        gte_ldv3c(&ptr->field_134[i]);
+        gte_rtpt();
+        gte_stsxy3c(&ptr->field_278[i]);
+        gte_stsz3c(&ptr->field_214[i]);
+    }
+
+    gte_ldv0(&ptr->field_134[24]);
+    gte_rtps();
+    gte_stsxy(&ptr->field_278[24]);
+    gte_stsz(&ptr->field_214[24]);
+
+    for (i = 0; i < 4; i++)
+    {
+        for (j = 0; j < 4; j++)
+        {
+            temp_a1_3 = ((i * 4) + i) + j;
+
+            if (ABS(ptr->field_278[temp_a1_3].vx) > 200)
+            {
+                continue;
+            }
+
+            if (ABS(ptr->field_278[temp_a1_3].vy) > 160)
+            {
+                continue;
+            }
+
+            ptr->field_20C = (ptr->field_214[temp_a1_3] + ptr->field_214[temp_a1_3 + 1] + ptr->field_214[temp_a1_3 + 5] + ptr->field_214[temp_a1_3 + 6]) >> 2;
+
+            if (ptr->field_20C <= 0 || ptr->field_20C >> 3 >= ORDERING_TABLE_SIZE)
+            {
+                continue;
+            }
+
+            setPolyFT4(*poly);
+
+            *(s32*)&(*poly)->x0 = *(s32*)&ptr->field_278[temp_a1_3];
+            *(s32*)&(*poly)->x1 = *(s32*)&ptr->field_278[temp_a1_3 + 1];
+            *(s32*)&(*poly)->x2 = *(s32*)&ptr->field_278[temp_a1_3 + 5];
+            *(s32*)&(*poly)->x3 = *(s32*)&ptr->field_278[temp_a1_3 + 6];
+
+            temp_s2             = (j * 8) + (i << 11) + ptr->field_210;
+            *(s32*)&(*poly)->u0 = (((g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_1 << 6) | 0x13) << 16) + temp_s2;
+            *(s32*)&(*poly)->u1 = temp_s2 + 0x4B0007;
+
+            setSemiTrans(*poly, true);
+
+            *(s32*)&(*poly)->u2 = temp_s2 + 0x700;
+            *(s32*)&(*poly)->u3 = temp_s2 + 0x707;
+
+            if (ptr->field_208 > Q12(5.0f))
+            {
+                temp_v1_6 = 160 - ((ptr->field_208 - Q12(5.0f)) >> 10);
+                if (temp_v1_6 >= 32)
+                {
+                    temp_s2 = temp_v1_6;
+                }
+                else
+                {
+                    temp_s2 = 32;
+                }
+            }
+            else
+            {
+                temp_s2 = 160;
+            }
+
+            if (!(g_SysWork.field_2388.field_154.effectsInfo_0.field_0.field_0 & 3))
+            {
+                func_80055A90(&ptr->field_12C, &ptr->field_130, temp_s2, ptr->field_20C * 0x10);
+
+#ifdef SH_PC_PORT
+                /* Layered cloud: 1 ADDITIVE (tpage 43) + 2 SUBTRACTIVE (0x4B from
+                 * the 0x4B0007 u1 word above), red over any background. Safe now
+                 * that the setaddr macro parenthesizes its addr arg (PsyCross) —
+                 * the missing parens were what corrupted multi-prim emits.
+                 * poly[0] color = field_12C (func_80055A90 above). */
+                *(u16*)&(*poly)->r0 = ptr->field_12C.r + (ptr->field_12C.g << 8);
+                (*poly)->b0         = ptr->field_12C.b;
+
+                *(*poly + 2) = *(*poly + 1) = **poly;
+
+                (*poly)->tpage          = 43;
+                (*poly)->clut           = (*poly + 2)->clut = 147;
+                *(u16*)&(*poly + 1)->r0 = ptr->field_130.r + (ptr->field_130.g << 8);
+                (*poly + 1)->b0         = ptr->field_130.b;
+#ifdef SH_PC_PORT
+                PC_BLOOD_FOG_FADE(*poly + 1, ptr->field_20C);
+                /* Same unfaded-clone fault as the spray: poly+2 kept poly0's
+                 * raw fog-glow colours and is SUBTRACTIVE. */
+                PC_BLOOD_FOG_FADE(*poly + 2, ptr->field_20C);
+#endif
+
+                /* Cap the ADDITIVE layer color (poly[0]) so a bright per-map
+                 * fog-tint can't blow the soft edge to white (see BLOOD_ADD_MAX). */
+                if ((*poly)->r0 > BLOOD_ADD_MAX) (*poly)->r0 = BLOOD_ADD_MAX;
+                if ((*poly)->g0 > BLOOD_ADD_MAX) (*poly)->g0 = BLOOD_ADD_MAX;
+                if ((*poly)->b0 > BLOOD_ADD_MAX) (*poly)->b0 = BLOOD_ADD_MAX;
+
+                /* fade the additive layer with world fog (see Pc_BloodFogKeep) so distant
+                 * cloud blood disappears into the fog instead of staying vivid. */
+                {
+                    int _keep = Pc_BloodFogKeep(ptr->field_20C);
+                    (*poly)->r0 = ((*poly)->r0 * _keep) >> 8;
+                    (*poly)->g0 = ((*poly)->g0 * _keep) >> 8;
+                    (*poly)->b0 = ((*poly)->b0 * _keep) >> 8;
+                }
+
+                {
+                    s32 _bucketC = (ptr->field_20C + var_s7) >> 3;
+                    if (_bucketC < 0) _bucketC = 0;
+                    if (_bucketC >= ORDERING_TABLE_SIZE) _bucketC = ORDERING_TABLE_SIZE - 1;
+                    addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[_bucketC], *poly);
+                    addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[_bucketC], *poly + 1);
+                    addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[_bucketC], *poly + 2);
+                }
+                *poly = *poly + 3;
+#else
+                *(u16*)&(*poly)->r0 = ptr->field_12C.r + (ptr->field_12C.g << 8);
+                (*poly)->b0         = ptr->field_12C.b;
+
+                *(*poly + 2) = *(*poly + 1) = **poly;
+
+                (*poly)->tpage = 43;
+                (*poly)->clut = (*poly + 2)->clut = 147;
+                *(u16*)&(*poly + 1)->r0           = ptr->field_130.r + (ptr->field_130.g << 8);
+                (*poly + 1)->b0                   = ptr->field_130.b;
+
+                addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[(ptr->field_20C + var_s7) >> 3], *poly);
+                addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[(ptr->field_20C + var_s7) >> 3], *poly + 1);
+                addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[(ptr->field_20C + var_s7) >> 3], *poly + 2);
+
+                *poly = *poly + 3;
+#endif
+            }
+            else
+            {
+                *(u16*)&(*poly)->r0 = temp_s2 + (temp_s2 << 8);
+                (*poly)->b0         = temp_s2;
+
+#ifdef SH_PC_PORT
+                {
+                    s32 _bucket2 = (ptr->field_20C + var_s7) >> 3;
+                    if (_bucket2 < 0) _bucket2 = 0;
+                    if (_bucket2 >= ORDERING_TABLE_SIZE) _bucket2 = ORDERING_TABLE_SIZE - 1;
+                    addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[_bucket2], *poly);
+                }
+#else
+                addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[(ptr->field_20C + var_s7) >> 3], *poly);
+#endif
+
+                *poly = *poly + 1;
+            }
+        }
+    }
+
+    return true;
+}
+
+void func_8006342C(s32 weaponAttack, q3_12 rotY, q3_12 rotX, GsCOORDINATE2* coord) // 0x8006342C
+{
+    s32              i;
+    s_func_8006342C* ptr;
+
+    ptr = PSX_SCRATCH;
+
+#ifdef SH_PC_PORT
+    /* PC: re-enabled — paired with func_8005F6B0 re-enable. Underlying
+     * bug fixed: gte_stsz3c was using a halfword stride instead of
+     * word stride, leaving field_160 in the particle scratchpad as
+     * stale data → OOB OT bucket → bad-nextPtr crashes. See
+     * pc_port/include/inline_no_dmpsx.h (commit e4afc3e18). */
+#endif
+
+    // TODO: Use `Math_SetSVectorFast`.
+    switch (weaponAttack)
+    {
+        case WEAPON_ATTACK(EquippedWeaponId_Handgun, AttackInputType_Tap):
+            D_800C440C               = coord;
+            Math_SetSVectorFast(&ptr->field_20, 2, -15, 71);
+            break;
+
+        case WEAPON_ATTACK(EquippedWeaponId_Shotgun, AttackInputType_Tap):
+            D_800C440C               = coord;
+            Math_SetSVectorFast(&ptr->field_20, 3, -18, 109);
+            break;
+
+        case WEAPON_ATTACK(EquippedWeaponId_HuntingRifle, AttackInputType_Tap):
+            D_800C440C               = coord;
+            Math_SetSVectorFast(&ptr->field_20, -2, -35, 221);
+            break;
+
+        case 70: // TODO: `WEAPON_ATTACK`
+            D_800C4410               = coord;
+            Math_SetSVectorFast(&ptr->field_20, 3, -24, 91);
+            break;
+
+        case 63: // TODO: `WEAPON_ATTACK`
+            D_800C4410               = coord;
+            Math_SetSVectorFast(&ptr->field_20, 2, -13, 67);
+            break;
+
+        case WEAPON_ATTACK(EquippedWeaponId_Chainsaw, AttackInputType_Tap):
+            D_800C440C = coord;
+            Math_SetSVectorFast(&ptr->field_20, 2, 20, 57);
+            break;
+
+        case WEAPON_ATTACK(EquippedWeaponId_RockDrill, AttackInputType_Tap):
+            D_800C440C = coord;
+            Math_SetSVectorFast(&ptr->field_20, 2, 24, 67);
+            break;
+
+        default:
+            return;
+    }
+
+    Vw_CoordHierarchyMatrixCompute(&coord[10], &ptr->field_0);
+
+    gte_SetRotMatrix(&ptr->field_0);
+    gte_SetTransMatrix(&ptr->field_0);
+    gte_ldv0(&ptr->field_20);
+    gte_rt();
+    gte_stlvnl(&ptr->field_28);
+
+    switch (weaponAttack)
+    {
+        case WEAPON_ATTACK(EquippedWeaponId_Handgun, AttackInputType_Tap):
+            ptr->field_38 = func_8005E7E0(15);
+            ptr->field_50 = 3;
+
+            for (i = 0; i < 3; i++)
+            {
+                ptr->field_3C[i] = func_8005E7E0(20);
+            }
+            break;
+
+        case WEAPON_ATTACK(EquippedWeaponId_Shotgun, AttackInputType_Tap):
+            ptr->field_38 = func_8005E7E0(16);
+            ptr->field_50 = 5;
+
+            for (i = 0; i < 5; i++)
+            {
+                ptr->field_3C[i] = func_8005E7E0(21);
+            }
+            break;
+
+        case WEAPON_ATTACK(EquippedWeaponId_HuntingRifle, AttackInputType_Tap):
+            ptr->field_38 = func_8005E7E0(17);
+            ptr->field_50 = 3;
+
+            for (i = 0; i < 3; i++)
+            {
+                ptr->field_3C[i] = func_8005E7E0(22);
+            }
+            break;
+
+        // TODO: What weapon attack?
+        case 70:
+            ptr->field_38 = func_8005E7E0(18);
+            ptr->field_50 = 3;
+
+            for (i = 0; i < 3; i++)
+            {
+                ptr->field_3C[i] = func_8005E7E0(20);
+            }
+            break;
+
+        // TODO: What weapon attack?
+        case 63:
+            ptr->field_38 = func_8005E7E0(19);
+            ptr->field_50 = 3;
+
+            for (i = 0; i < 3; i++)
+            {
+                ptr->field_3C[i] = func_8005E7E0(20);
+            }
+            break;
+
+        case WEAPON_ATTACK(EquippedWeaponId_RockDrill, AttackInputType_Tap):
+        case WEAPON_ATTACK(EquippedWeaponId_Chainsaw,  AttackInputType_Tap):
+            ptr->field_50 = 3;
+
+            for (i = 0; i < 3; i++)
+            {
+                ptr->field_3C[i] = func_8005E7E0(20);
+            }
+            break;
+    }
+
+    if (weaponAttack != WEAPON_ATTACK(EquippedWeaponId_Chainsaw,  AttackInputType_Tap) &&
+        weaponAttack != WEAPON_ATTACK(EquippedWeaponId_RockDrill, AttackInputType_Tap))
+    {
+        if (ptr->field_38 != NO_VALUE)
+        {
+            // TODO: Demagic this.
+            if (weaponAttack == 70)
+            {
+                g_MapOverlayHdr.unkTable1_4C[ptr->field_38].field_C.s_0.field_0 = Q12_ANGLE(-90.0f);
+                g_MapOverlayHdr.unkTable1_4C[ptr->field_38].field_C.s_0.field_2 = Q12_ANGLE(90.0f);
+            }
+            else
+            {
+                g_MapOverlayHdr.unkTable1_4C[ptr->field_38].field_C.s_0.field_0 = rotY;
+                g_MapOverlayHdr.unkTable1_4C[ptr->field_38].field_C.s_0.field_2 = rotX;
+            }
+
+            g_MapOverlayHdr.unkTable1_4C[ptr->field_38].field_B              = Rng_GenerateUInt(0, 1);
+            g_MapOverlayHdr.unkTable1_4C[ptr->field_38].field_10.s_0.field_0 = Rng_GenerateUInt(0, 1023);
+            g_MapOverlayHdr.unkTable1_4C[ptr->field_38].field_10.s_0.field_2 = Q12_ANGLE(0.0f);
+        }
+        else
+        {
+            return;
+        }
+    }
+
+    for (i = 0; i < ptr->field_50; i++)
+    {
+        if (ptr->field_3C[i] == NO_VALUE)
+        {
+            break;
+        }
+
+        g_MapOverlayHdr.unkTable1_4C[ptr->field_3C[i]].field_0.vx_0 = Rng_AddGeneratedUInt(Q4_TO_Q8(ptr->field_28.vx), -128, 127);
+        g_MapOverlayHdr.unkTable1_4C[ptr->field_3C[i]].vy_8         = Rng_AddGeneratedUInt(Q4_TO_Q8(ptr->field_28.vy), -128, 127);
+        g_MapOverlayHdr.unkTable1_4C[ptr->field_3C[i]].field_4.vz_4 = Rng_AddGeneratedUInt(Q4_TO_Q8(ptr->field_28.vz), -128, 127);
+
+        if (i < 3)
+        {
+            g_MapOverlayHdr.unkTable1_4C[ptr->field_3C[i]].field_B = i;
+        }
+        else
+        {
+            g_MapOverlayHdr.unkTable1_4C[ptr->field_3C[i]].field_B = Rng_GenerateInt(0, 2);
+        }
+
+        g_MapOverlayHdr.unkTable1_4C[ptr->field_3C[i]].field_C.s_0.field_0  = Rng_GenerateUInt(0, 4095);
+        g_MapOverlayHdr.unkTable1_4C[ptr->field_3C[i]].field_C.s_0.field_2  = 0;
+        g_MapOverlayHdr.unkTable1_4C[ptr->field_3C[i]].field_10.s_0.field_0 = 0;
+    }
+}
+
+bool func_80063A50(POLY_FT4** poly, s32 idx) // 0x80063A50
+{
+    s_func_80063A50* ptr;
+
+    ptr = PSX_SCRATCH;
+
+    switch (g_MapOverlayHdr.unkTable1_4C[idx].field_A)
+    {
+        case 15:
+            ptr->field_1DC         = 0xCC;
+            ptr->field_1E0         = 0x333;
+            ptr->field_1E4         = 0xA3;
+            ptr->field_1E8         = Q12(1.0f / 16.0f);
+            Math_SetSVectorFast(&ptr->field_164, 2, 0xFFF1, 0x47);
+
+            Vw_CoordHierarchyMatrixCompute(&D_800C440C[10], &ptr->field_12C);
+            break;
+
+        default:
+            return false;
+
+        case 16:
+            ptr->field_1DC         = 0xCC;
+            ptr->field_1E0         = 0x28F;
+            ptr->field_1E4         = 0xCC;
+            ptr->field_1E8         = 0x180;
+            Math_SetSVectorFast(&ptr->field_164, 3, 0xFFEE, 0x6D);
+
+            Vw_CoordHierarchyMatrixCompute(&D_800C440C[10], &ptr->field_12C);
+            break;
+
+        case 17:
+            ptr->field_1DC         = 0xA3;
+            ptr->field_1E0         = 0x2E1;
+            ptr->field_1E4         = 0x51;
+            ptr->field_1E8         = 0xC0;
+            Math_SetSVectorFast(&ptr->field_164, 0xFFFE, 0xFFDD, 0xDD);
+
+            Vw_CoordHierarchyMatrixCompute(&D_800C440C[10], &ptr->field_12C);
+            break;
+
+        case 18:
+            ptr->field_1DC         = 0x7A;
+            ptr->field_1E0         = 0x333;
+            ptr->field_1E4         = 0xA3;
+            ptr->field_1E8         = 0x100;
+            Math_SetSVectorFast(&ptr->field_164, 3, 0xFFE8, 0x5B);
+
+            Vw_CoordHierarchyMatrixCompute(&D_800C4410[10], &ptr->field_12C);
+            break;
+
+        case 19:
+            ptr->field_1DC         = 0xCC;
+            ptr->field_1E0         = 0x333;
+            ptr->field_1E4         = 0xA3;
+            ptr->field_1E8         = 0x100;
+            Math_SetSVectorFast(&ptr->field_164, 2, 0xFFF3, 0x43);
+
+            Vw_CoordHierarchyMatrixCompute(&D_800C4410[10], &ptr->field_12C);
+            break;
+    }
+
+    if (g_MapOverlayHdr.unkTable1_4C[idx].field_10.s_0.field_2 == 0)
+    {
+        func_8003EDA8();
+    }
+    else if (ptr->field_1DC < g_MapOverlayHdr.unkTable1_4C[idx].field_10.s_0.field_2)
+    {
+        g_MapOverlayHdr.unkTable1_4C[idx].field_A = 0;
+        return false;
+    }
+
+    g_MapOverlayHdr.unkTable1_4C[idx].field_10.s_0.field_2 += g_DeltaTime;
+
+    gte_SetRotMatrix(&ptr->field_12C);
+    gte_SetTransMatrix(&ptr->field_12C);
+    gte_ldv0(&ptr->field_164);
+    gte_rt();
+    gte_stlvnl(&ptr->field_1AC);
+
+    g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0 = Q4_TO_Q8(ptr->field_1AC.vx);
+    g_MapOverlayHdr.unkTable1_4C[idx].vy_8 = Q4_TO_Q8((u16)ptr->field_1AC.vy);
+    g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4 = Q4_TO_Q8(ptr->field_1AC.vz);
+
+    for (ptr->field_1D4 = 0; ptr->field_1D4 < 6; ptr->field_1D4++)
+    {
+        ptr->field_1D0 = g_MapOverlayHdr.unkTable1_4C[idx].field_10.field_0 + (Q12(ptr->field_1D4) / 6);
+
+        Math_SetSVectorFastSum(&ptr->field_14C[0],
+                               ((u16)g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_0.field_0 + Q12_MULT(ptr->field_1E8, Math_Cos(ptr->field_1D0))) - Q12_ANGLE(90.0f),
+                               g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_0.field_2 + Q12_MULT(ptr->field_1E8, Math_Sin(ptr->field_1D0)),
+                               ptr->field_1D0);
+        Math_RotMatrixZxyNegGte(&ptr->field_14C, &ptr->field_12C);
+
+        // `Q8(0.0f)`?
+        ptr->field_16C[0].vx = 0;
+        ptr->field_16C[0].vy = 0;
+        ptr->field_16C[0].vz = 0;
+
+        TransMatrix(&ptr->field_12C, &ptr->field_16C[0]);
+
+        gte_SetRotMatrix(&ptr->field_12C);
+        gte_SetTransMatrix(&ptr->field_12C);
+
+        for (ptr->field_1D8 = 0; ptr->field_1D8 < 4; ptr->field_1D8++)
+        {
+            *(u32*)&ptr->field_14C[0].vx = (ptr->field_1D8 & 1) ? (u16)ptr->field_1E4 :
+                                                                 -((u16)ptr->field_1E4) & 0xFFFF;
+
+            ptr->field_14C[0].vz = (ptr->field_1D8 < 2) ? ptr->field_1E0 : 0;
+
+            gte_ldv0(&ptr->field_14C);
+            gte_rt();
+            gte_stlvnl(&ptr->field_16C[ptr->field_1D8]);
+        }
+
+        gte_SetRotMatrix(&ptr->field_0.field_C);
+        gte_SetTransMatrix(&ptr->field_0.field_C);
+
+        for (ptr->field_1D8 = 0; ptr->field_1D8 < 3; ptr->field_1D8++)
+        {
+            Math_SetSVectorFastSum(&ptr->field_14C[ptr->field_1D8],
+                                   Q8_TO_Q4(g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0 + ptr->field_16C[ptr->field_1D8].vx) - (u16)ptr->field_0.field_0.vx,
+                                   Q8_TO_Q4(g_MapOverlayHdr.unkTable1_4C[idx].vy_8 + ptr->field_16C[ptr->field_1D8].vy) - ptr->field_0.field_0.vy,
+                                   Q8_TO_Q4(g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4 + ptr->field_16C[ptr->field_1D8].vz) - ptr->field_0.field_0.vz);
+        }
+
+        gte_ldv3c(&ptr->field_14C);
+        gte_rtpt();
+        gte_stsxy3_g3(*poly);
+        gte_stsz3c(&ptr->field_1BC);
+
+        Math_SetSVectorFastSum(&ptr->field_14C[0],
+                               (Q12_TO_Q8(g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0 + ptr->field_19C.vx)) - (u16)ptr->field_0.field_0.vx,
+                               (Q12_TO_Q8(g_MapOverlayHdr.unkTable1_4C[idx].vy_8 + ptr->field_19C.vy)) - ptr->field_0.field_0.vy,
+                               (Q12_TO_Q8(g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4 + ptr->field_19C.vz)) - ptr->field_0.field_0.vz);
+
+        gte_ldv0(&ptr->field_14C);
+        gte_rtps();
+        gte_stsxy(&ptr->field_1CC);
+        gte_stsz(&ptr->field_1C8);
+
+        ptr->field_1BC = (ptr->field_1BC + ptr->field_1C0 + ptr->field_1C4 + ptr->field_1C8) >> 2;
+
+        if (ptr->field_1BC <= 0 || (ptr->field_1BC >> 3) >= ORDERING_TABLE_SIZE ||
+            ABS(ptr->field_1CC.vx) > 200 ||
+            ABS(ptr->field_1CC.vy) > 160)
+        {
+            return false;
+        }
+
+        *(s32*)&(*poly)->x3 = *(s32*)&ptr->field_1CC;
+
+        if (!(g_SysWork.field_2388.field_154.effectsInfo_0.field_0.field_0 & 3))
+        {
+            *(s32*)&(*poly)->r0 = 0x2E103030;
+        }
+        else
+        {
+            *(s32*)&(*poly)->r0 = 0x2E406060;
+        }
+
+        *(s32*)&(*poly)->u0 = g_MapOverlayHdr.unkTable1_4C[idx].field_B ? 0xD380FF : 0xD380E0;
+        *(s32*)&(*poly)->u1 = (g_MapOverlayHdr.unkTable1_4C[idx].field_B ? 0xFF : 0xE0) +
+                              (g_MapOverlayHdr.unkTable1_4C[idx].field_B ? 0x2B7FE1 : 0x2B801F);
+        *(u16*)&(*poly)->u2 = g_MapOverlayHdr.unkTable1_4C[idx].field_B ? 0x9FFF : 0x9FE0;
+        *(u16*)&(*poly)->u3 = (g_MapOverlayHdr.unkTable1_4C[idx].field_B ? 0xFF : 0xE0) -
+                              (g_MapOverlayHdr.unkTable1_4C[idx].field_B ? 0x611F : 0x60E1);
+
+#ifdef SH_PC_PORT
+        /* PC: PsyCross's prim dispatcher crashes on unknown code bytes
+         * (PSX GPU was tolerant — the GP0 register decoded the cmd word
+         * directly so an uninitialized code byte just produced garbage
+         * rendering, not a crash). `addPrimFast` only sets `len`; we
+         * never set `code`. Explicitly install POLY_FT4 (0x2C). */
+        setPolyFT4(*poly);
+        /* setPolyFT4 writes the OPAQUE code 0x2C, clobbering the 0x2E
+         * (POLY_FT4 | ABE) the r0 writes above installed for this
+         * semi-transparent muzzle particle. Restore the ABE bit: PSX draws it
+         * blended, and — more importantly here — an opaque prim right at the
+         * muzzle next to the close flashlight is a CASTER in the shadow depth
+         * pass (opaque-only), throwing its quad silhouette on the wall for the
+         * frame it lives = the "shadow flash when firing" (func_80064334's
+         * type-20 flash is already semi-trans/excluded; this type-15 one was
+         * the straggler). */
+        setSemiTrans(*poly, true);
+        /* Defensive bucket clamp — same defense applied at all other
+         * particle emit sites in this file. Without it, an OOB bucket
+         * index from a corrupted field_1BC writes prim data INTO the
+         * OT array itself, which the OT0 sanitizer then "recovers" by
+         * dropping every mid-distance bucket → user sees geometry
+         * vanish in a radius around the dead AS body. */
+        {
+            s32 _bucket = ptr->field_1BC >> 3;
+            if (_bucket < 0) _bucket = 0;
+            if (_bucket >= ORDERING_TABLE_SIZE) _bucket = ORDERING_TABLE_SIZE - 1;
+            addPrimFast(&g_OrderingTable0[g_ActiveBufferIdx].org[_bucket], (*poly), 9);
+        }
+#else
+        addPrimFast(&g_OrderingTable0[g_ActiveBufferIdx].org[ptr->field_1BC >> 3], (*poly), 9);
+#endif
+        *poly += 1;
+    }
+
+    return true;
+}
+
+bool func_80064334(POLY_FT4** poly, s32 idx) // 0x80064334
+{
+    s32              temp_s0;
+    s32              temp_s4;
+    s32              temp_v0_2;
+    s32              temp_v0_3;
+    q19_12           temp_v1_5;
+    s_func_80064334* ptr;
+    POLY_FT4*        next;
+
+    ptr = PSX_SCRATCH;
+
+    temp_s4 = Q12_MULT_PRECISE(g_DeltaTime, Rng_GenerateInt(Q12(0.8f), Q12(1.2f) - 2));
+
+    if (g_MapOverlayHdr.unkTable1_4C[idx].field_A == 20)
+    {
+        ptr->field_164 = Q12(0.05f);
+        ptr->field_168 = Q12(0.4f);
+    }
+    else if (g_MapOverlayHdr.unkTable1_4C[idx].field_A == 21)
+    {
+        ptr->field_164 = Q12(0.05f);
+        ptr->field_168 = Q12(0.4f);
+    }
+    else
+    {
+        ptr->field_164 = Q12(0.04f);
+        ptr->field_168 = Q12(0.35f);
+    }
+
+    ptr->field_15A = g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_0.field_2;
+
+    temp_v0_2 = *g_MapOverlayHdr.windSpeedX >> 6;
+    temp_v0_3 = *g_MapOverlayHdr.windSpeedZ >> 6;
+
+    g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_0.field_2 += temp_s4 + (((SquareRoot0((temp_v0_2 * temp_v0_2) + (temp_v0_3 * temp_v0_3)) << 6) * temp_s4) >> 10);
+
+    if (ptr->field_168 < (u16)g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_0.field_2)
+    {
+        g_MapOverlayHdr.unkTable1_4C[idx].field_A = 0;
+    }
+
+    ptr->field_158                                              = g_MapOverlayHdr.unkTable1_4C[idx].field_10.field_0;
+    g_MapOverlayHdr.unkTable1_4C[idx].field_10.s_0.field_0 += temp_s4;
+
+    Math_SetSVectorFastSum(&ptr->field_138,
+                           Q12_TO_Q8(g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0) - (u16)ptr->field_0.field_0.vx,
+                           Q12_TO_Q8((g_MapOverlayHdr.unkTable1_4C[idx].vy_8)) - ptr->field_0.field_0.vy,
+                           Q12_TO_Q8(g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4) - ptr->field_0.field_0.vz);
+
+    gte_ldv0(&ptr->field_138);
+    gte_rtps();
+    gte_stsxy(&ptr->field_154);
+    gte_stsz(&ptr->field_150);
+
+    if (ptr->field_150 <= 0 || (ptr->field_150 >> 3) >= ORDERING_TABLE_SIZE ||
+        ABS(ptr->field_154.vx) > 200 ||
+        ABS(ptr->field_154.vy) > 160)
+    {
+        return false;
+    }
+
+    ptr->field_160 = (((ptr->field_158 >> 6) + 16) * ptr->field_0.field_2C) / ptr->field_150;
+
+#ifdef SH_PC_PORT
+    /* Giant-blob diagnosis: size field_160 = (f158-based factor * f2C) /
+     * projected depth f150. A stale/small GTE SZ (f150) explodes the quad. */
+    {
+        static int s_flashLog = 0;
+        if (s_flashLog < 16) {
+            SH_DBG("[MUZZLE] depth150=%d size160=%d f158=%d f2C=%d xy=(%d,%d) rgb=(%d,%d,%d) fieldB=%d",
+                   (int)ptr->field_150, (int)ptr->field_160, (int)ptr->field_158,
+                   (int)ptr->field_0.field_2C, ptr->field_154.vx, ptr->field_154.vy,
+                   ptr->field_130.r, ptr->field_130.g, ptr->field_130.b,
+                   (int)g_MapOverlayHdr.unkTable1_4C[idx].field_B);
+            s_flashLog++;
+        }
+    }
+#endif
+
+#ifdef SH_PC_PORT
+    /* Zero the entire 136-byte allocation up front (2x POLY_FT4 + 2x DR_MODE).
+     * PSX gets away with stale pkt buffer data because every prim field is
+     * explicitly written below. On PC the prim header is wider (12 B vs 4 B)
+     * and the *(u16*) writes to u2/u3 (lines 2580/2581) only touch 2 of the
+     * 4 bytes those slots cover, leaving stale pad bytes from previous frames.
+     * If those stale bytes happen to look like a chain pointer in the high
+     * 32 of the addr field, the OT walker chases them.
+     *
+     * Cost: one memset per particle update, ~136 bytes. Negligible. */
+    memset(*poly, 0, sizeof(POLY_FT4) * 2 + sizeof(DR_MODE) * 2);
+#endif
+
+    setPolyFT4(*poly);
+
+    setXY0Fast(*poly, (u16)ptr->field_154.vx - (u16)ptr->field_160, ptr->field_154.vy - ptr->field_160);
+    setXY1Fast(*poly, (u16)ptr->field_154.vx + (u16)ptr->field_160, ptr->field_154.vy - ptr->field_160);
+    setXY2Fast(*poly, (u16)ptr->field_154.vx - (u16)ptr->field_160, ptr->field_154.vy + ptr->field_160);
+    setXY3Fast(*poly, (u16)ptr->field_154.vx + (u16)ptr->field_160, ptr->field_154.vy + ptr->field_160);
+
+    *(s32*)&(*poly)->u0 = (((g_MapOverlayHdr.unkTable1_4C[idx].field_B << 5) + 160) << 8) + 0x011300E0;
+    *(s32*)&(*poly)->u1 = (((g_MapOverlayHdr.unkTable1_4C[idx].field_B << 5) + 160) << 8) + 0x2B00FF;
+    *(u16*)&(*poly)->u2 = (((g_MapOverlayHdr.unkTable1_4C[idx].field_B << 5) + 191) << 8) + 0xE0;
+    *(u16*)&(*poly)->u3 = (((g_MapOverlayHdr.unkTable1_4C[idx].field_B << 5) + 191) << 8) + 0xFF;
+
+    setSemiTrans(*poly, true);
+
+    if (ptr->field_15A < (ptr->field_168 >> 3))
+    {
+        ptr->field_15C = MIN(((ptr->field_15A << 9) / ptr->field_168) + 48, 128);
+    }
+    else
+    {
+        ptr->field_15C = CLAMP_LOW(120 - (ptr->field_15A * 120) / ptr->field_168, 0);
+    }
+
+    if (!(g_SysWork.field_2388.field_154.effectsInfo_0.field_0.field_0 & 0x3))
+    {
+#ifdef SH_PC_PORT
+        /* PC simplification: skip the multi-prim layered render. Original
+         * PSX path emits 2 POLY_FT4s sandwiched between 2 DR_MODEs (a
+         * tpage-switching trick to do additive + subtractive blending on
+         * the same particle). Per-byte tracing showed the multi-prim
+         * arithmetic consistently corrupted the addr field of subsequent
+         * prims on PC (fingerprint: low32 = high32 of pkt range, high32 =
+         * `0x09` from setlen + a tpage byte from the DR_MODE payload),
+         * even with sizeof-based offsets. Stubbing this branch entirely
+         * eliminated the corruption.
+         *
+         * Replacement: emit a single POLY_FT4 (the additive flash quad
+         * only). PsyCross handles blending via per-prim setSemiTrans.
+         * Visual diff: muzzle flash particles look slightly less
+         * "layered" than PSX but are clearly visible and don't trash
+         * adjacent geometry. */
+        func_80055E90(&ptr->field_130, ptr->field_15C);
+        /* Dim the muzzle-flash RGB to ~62% so the additive-style blend
+         * looks like a fading flash rather than a fully-opaque colored
+         * quad. Without explicit DR_MODE setup the prim inherits whatever
+         * tpage is active, which on PC tends to default to ABR=0
+         * (50%/50% average blend) — that visualizes as a solid quad.
+         * Halving the source color compensates so the visible result is
+         * closer to the layered PSX appearance. */
+        {
+            u8 dr = (u8)((ptr->field_130.r * 5) >> 3);
+            u8 dg = (u8)((ptr->field_130.g * 5) >> 3);
+            u8 db = (u8)((ptr->field_130.b * 5) >> 3);
+            *(u16*)&(*poly)->r0 = dr + (dg << 8);
+            (*poly)->b0         = db;
+        }
+
+        {
+            s32 _bucket = ptr->field_150 >> 3;
+            if (_bucket < 0) _bucket = 0;
+            if (_bucket >= ORDERING_TABLE_SIZE) _bucket = ORDERING_TABLE_SIZE - 1;
+            addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[_bucket], *poly);
+        }
+
+        *poly = *poly + 1;
+#else
+        func_80055A90(&ptr->field_134, &ptr->field_130, ptr->field_15C, ptr->field_150 * 16);
+
+        next  = *poly + 1;
+        *next = **poly;
+
+        (*poly + 1)->clut = 0x93;
+
+        *(u16*)&(*poly)->r0 = ptr->field_130.r + (ptr->field_130.g << 8);
+        (*poly)->b0         = ptr->field_130.b;
+
+        *(u16*)&(*poly + 1)->r0 = ptr->field_134.r + (ptr->field_134.g << 8);
+        (*poly + 1)->b0         = ptr->field_134.b;
+#ifdef SH_PC_PORT
+        PC_BLOOD_FOG_FADE(*poly, ptr->field_150);
+        PC_BLOOD_FOG_FADE(*poly + 1, ptr->field_150);
+#endif
+
+        ptr->field_12C = (PACKET*)(*poly) + 0x50;
+
+        SetPriority(ptr->field_12C, 0, 0);
+        SetPriority(ptr->field_12C + 12, 1, 1);
+
+        addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[ptr->field_150 >> 3], *poly);
+        addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[ptr->field_150 >> 3], ptr->field_12C);
+        addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[ptr->field_150 >> 3], *poly + 1);
+        addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[ptr->field_150 >> 3], ptr->field_12C + 12);
+
+        *poly = ptr->field_12C + 24;
+#endif
+    }
+    else
+    {
+        func_80055E90(&ptr->field_130, ptr->field_15C);
+        *(u16*)&(*poly)->r0 = ptr->field_130.r + (ptr->field_130.g << 8);
+        (*poly)->b0         = ptr->field_130.b;
+
+#ifdef SH_PC_PORT
+        /* The far branch of this drawer -- a single cheap poly where the near
+         * branch draws the faded two-layer pair. It was the ONE remaining blood
+         * emit with no fog fade, which is why one pool per pair of corpses
+         * stayed at full strength however thick the fog: the floating pitch
+         * black blob in the distance, hanging where its fully-fogged corpse is
+         * no longer even visible. Same fade, same depth field as its sibling
+         * branch. */
+        PC_BLOOD_FOG_FADE(*poly, ptr->field_150);
+#endif
+
+        {
+            s32 _bucket = ptr->field_150 >> 3;
+            if (_bucket < 0) _bucket = 0;
+            if (_bucket >= ORDERING_TABLE_SIZE) _bucket = ORDERING_TABLE_SIZE - 1;
+            addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[_bucket], *poly);
+        }
+
+        *poly = *poly + 1;
+    }
+
+    if (ptr->field_164 < ptr->field_158)
+    {
+        temp_v1_5 = Math_Sin(g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_0.field_0);
+        temp_s0   = Q12_MULT_PRECISE(temp_s4, Q12(0.1f));
+
+        g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0 += Q12_MULT(temp_s0, temp_v1_5);
+        g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4 += Q12_MULT(temp_s0, Math_Cos(g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_0.field_0));
+
+        if (*g_MapOverlayHdr.data_190 != 0)
+        {
+            g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0 += TIMESTEP_SCALE_30_FPS(temp_s4, *g_MapOverlayHdr.windSpeedX) >> 2;
+            g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4 += TIMESTEP_SCALE_30_FPS(temp_s4, *g_MapOverlayHdr.windSpeedZ) >> 2;
+        }
+        else if (*g_MapOverlayHdr.data_18C != 0)
+        {
+            g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0 += TIMESTEP_SCALE_30_FPS(temp_s4, *g_MapOverlayHdr.windSpeedX) >> 1;
+            g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4 += TIMESTEP_SCALE_30_FPS(temp_s4, *g_MapOverlayHdr.windSpeedZ) >> 1;
+        }
+        else
+        {
+            g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0 += (TIMESTEP_SCALE_30_FPS(temp_s4, *g_MapOverlayHdr.windSpeedX) * 2) / 3;
+            g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4 += (TIMESTEP_SCALE_30_FPS(temp_s4, *g_MapOverlayHdr.windSpeedZ) * 2) / 3;
+        }
+    }
+
+    return true;
+}
+
+void func_80064F04(VECTOR3* arg0, s8 arg1, s16 arg2) // 0x80064F04
+{
+    s32 idx;
+
+    idx = func_8005E7E0(31);
+    if (idx != NO_VALUE)
+    {
+        g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0        = Q12_TO_Q8(arg0->vx);
+        g_MapOverlayHdr.unkTable1_4C[idx].vy_8                = Q12_TO_Q8(arg0->vy);
+        g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4        = Q12_TO_Q8(arg0->vz);
+        g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_1.field_0 = arg1;
+        g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_0.field_2 = arg2;
+    }
+}
+
+bool func_80064FC0(POLY_FT4** polys, s32 idx) // 0x80064FC0
+{
+    s_func_80064FC0* ptr;
+    s16              temp;
+
+    ptr = PSX_SCRATCH;
+
+    g_MapOverlayHdr.unkTable1_4C[idx].field_A = 0;
+    temp                                         = g_MapOverlayHdr.unkTable1_4C[idx].field_0.vx_0 - ptr->field_0.field_0.vx;
+    Math_SetSVectorFastSum(&ptr->field_12C,
+                           temp,
+                           g_MapOverlayHdr.unkTable1_4C[idx].vy_8 - ptr->field_0.field_0.vy,
+                           g_MapOverlayHdr.unkTable1_4C[idx].field_4.vz_4 - ptr->field_0.field_0.vz);
+
+    gte_ldv0(&ptr->field_12C);
+    gte_rtps();
+    gte_stsxy(&ptr->field_13C);
+    gte_stsz(&ptr->field_140);
+
+    if (ABS(ptr->field_13C.vx) > 200 || ABS(ptr->field_13C.vy) > 160)
+    {
+        return false;
+    }
+
+#ifdef SH_PC_PORT
+    /* Drain-valve crash class: SZ saturates to 0 on/behind the camera
+     * plane and x86 idiv faults where MIPS returned garbage. Skip the
+     * quad — it was a garbage quad on PSX anyway. */
+    if (ptr->field_140 == 0)
+    {
+        return false;
+    }
+#endif
+
+    ptr->field_144 = ((g_MapOverlayHdr.unkTable1_4C[idx].field_C.s_0.field_2 * ptr->field_0.field_2C) / ptr->field_140) >> 4;
+    setPolyFT4(*polys);
+    setXY0Fast(*polys, (u16)ptr->field_13C.vx - (u16)ptr->field_144, ptr->field_13C.vy + ptr->field_144);
+    setXY1Fast(*polys, (u16)ptr->field_13C.vx + (u16)ptr->field_144, ptr->field_13C.vy + ptr->field_144);
+    setXY2Fast(*polys, (u16)ptr->field_13C.vx - (u16)ptr->field_144, ptr->field_13C.vy - ptr->field_144);
+    setXY3Fast(*polys, (u16)ptr->field_13C.vx + (u16)ptr->field_144, ptr->field_13C.vy - ptr->field_144);
+    *(u16*)&(*polys)->r0 = 0x1020;
+    (*polys)->b0         = 0x10;
+
+    setSemiTrans((*polys), true);
+
+    *(u32*)&(*polys)->u0 = 0x018C0000;
+    *(u32*)&(*polys)->u1 = 0x2C003F;
+    *(u16*)&(*polys)->u2 = 0x3F00;
+    *(u16*)&(*polys)->u3 = 0x3F3F;
+
+#ifdef SH_PC_PORT
+    /* Bounds-clamp OT bucket. func_80064FC0 (case 31, spark/glow) only
+     * has screen-space ABS guards earlier — no Z guard. Negative Z (e.g.
+     * particle very close to camera, behind near plane) → unsigned wrap
+     * to astronomical OOB index. Same OOB class as the other particle
+     * functions; clamp to valid OT bucket range. */
+    {
+        s32 _bucket = (ptr->field_140 - 0x20) >> 3;
+        if (_bucket < 0) _bucket = 0;
+        if (_bucket >= ORDERING_TABLE_SIZE) _bucket = ORDERING_TABLE_SIZE - 1;
+        addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[_bucket], (*polys));
+    }
+#else
+    addPrim(&g_OrderingTable0[g_ActiveBufferIdx].org[(ptr->field_140 - 0x20) >> 3], (*polys));
+#endif
+
+    *polys += 1;
+    return true;
+}

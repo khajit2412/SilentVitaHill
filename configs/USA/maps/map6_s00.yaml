@@ -1,0 +1,85 @@
+name: The MAP6_S00 map overlay (MAP6_S00)
+sha1: 06b4148323a97420b31363625ea5cb83c56a6b5a
+options:
+  basename: MAP6_S00.BIN
+  target_path: assets/USA/VIN/MAP6_S00.BIN
+  base_path: ../../..
+  platform: psx
+  compiler: GCC
+
+  asm_path: asm/USA/maps/map6_s00
+  src_path: src/maps/map6_s00
+  build_path: build/USA
+
+  ld_script_path: linkers/USA/maps/map6_s00.ld
+
+  find_file_boundaries: false
+  gp_value: 0x80022BB0
+  global_vram_start: 0x80010000
+  global_vram_end: 0x80200000
+
+  o_as_suffix: false
+  use_legacy_include_asm: false
+
+  asm_function_macro: glabel
+  asm_jtbl_label_macro: jlabel
+  asm_data_macro: dlabel
+  generate_asm_macros_files: False # Disabled as our include_asm.h is customized to work with different game versions.
+
+  section_order: [".rodata", ".text", ".data", ".bss"]
+
+  symbol_addrs_path:
+    - configs/USA/sym.main.txt
+    - configs/USA/sym.bodyprog.txt
+    - configs/USA/maps/sym.map6_s00.txt
+  reloc_addrs_path:
+    - configs/USA/maps/rel.map6_s00.txt
+
+  undefined_funcs_auto_path: linkers/USA/maps/undefined_funcs_auto.map6_s00.txt
+  undefined_syms_auto_path: linkers/USA/maps/undefined_syms_auto.map6_s00.txt
+
+  extensions_path: tools/splat_ext
+
+  subalign: 4
+
+  string_encoding: ASCII
+  data_string_encoding: ASCII
+  rodata_string_guesser_level: 2
+  data_string_guesser_level: 2
+segments:
+  - name: map6_s00
+    type: code
+    start: 0
+    vram: 0x800C9578
+    align: 4
+    subalign: 4
+    subsegments:
+      # .rodata section
+      - [0x0, rodata]
+      - [0x4, .rodata, map6_s00_header]
+      - [0x1050, .rodata, particle]
+      - [0x12DC, rodata]
+      - [0x12E0, .rodata, Chara_AirScreamer]
+      - [0x2D5C, rodata]
+      - [0x2D60, .rodata, Chara_Groaner]
+      - [0x2EC8, .rodata, map6_s00]
+
+      - [0x35B8, c, map6_s00_header]
+      - [0x35B8, c, map6_s00_events_data]
+      - [0x35B8, c, map6_s00_anim_info]
+
+      # .text section
+      - [0x35B8, c, particle]
+      - [0x6D74, c, player]
+      - [0x8384, c, Chara_AirScreamer]
+      - [0x193BC, c, Chara_Groaner]
+      - [0x1D994, c, map6_s00]
+
+      # .data section
+      - [0x23D54, .data, map6_s00_anim_info]
+      - [0x24004, data]
+      - [0x267e8, .data, map6_s00_header]
+      - [0x26934, .data, map6_s00]
+      - [0x269A0, .data, map6_s00_events_data]
+      - [0x26AC0, data]
+  - [0x2AC00]

@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    android:installLocation="auto">
+
+    <!-- PsyX_render.h picks RENDERER_OGLES / OGLES_VERSION 3 on __ANDROID__, so
+         ES 3.0 is a hard requirement, not a preference. The Arcade1Up target
+         (MT8163 / Mali-T720 MP2) reports ES 3.1. -->
+    <uses-feature android:glEsVersion="0x00030000" android:required="true" />
+
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+    <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
+
+    <!-- The game's own data lives in the app's external files/media dirs, which
+         need no permission. These are only so SetupActivity can FIND a disc
+         image the user already downloaded (Downloads holds a .bin, a non-media
+         file, so from API 30 nothing short of all-files access can read it by
+         path). Declining is fine: the file picker needs no permission at all. -->
+    <!-- RetroAchievements is the only thing here that touches the network: the
+         sign-in exchanges a password for a token, and the client then talks to
+         retroachievements.org. Without this every HttpURLConnection throws
+         SecurityException the moment it connects, which reads in game as a
+         sign-in that silently does nothing. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+
+    <application
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false"
+        android:theme="@style/AppTheme"
+        android:hardwareAccelerated="true"
+        android:requestLegacyExternalStorage="true"
+        android:extractNativeLibs="true">
+
+        <activity
+            android:name=".SetupActivity"
+            android:label="@string/app_name"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".SilentHillActivity"
+            android:label="@string/app_name"
+            android:alwaysRetainTaskState="true"
+            android:launchMode="singleInstance"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="layoutDirection|locale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
+            android:preferMinimalPostProcessing="true"
+            android:exported="true">
+            <!-- Launched by SetupActivity once a disc image is in place, so no
+                 LAUNCHER filter here: starting the game with no disc only ever
+                 produced an error dialog and an exit. -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

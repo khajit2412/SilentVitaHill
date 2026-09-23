@@ -1,0 +1,112 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+#ifndef PC_MOUSE_CURSOR_H
+#define PC_MOUSE_CURSOR_H
+
+/* PC port: mouse control for cursor-driven puzzles + a clickable main menu.
+ *
+ * QoL enhancement (not 1:1 with the PSX original). Gated by config
+ * `mouse_cursor` (default on) and only active when the OS cursor is free —
+ * i.e. relative mouse mode is OFF, which is true in menus, puzzles and the
+ * classic camera, but NOT in TPS/OTS/FPS where the pointer is captured for
+ * look. See control_style.c for the capture logic.
+ *
+ * Puzzles: every free-cursor puzzle (piano, plate, door panels, alert door,
+ * map pan) integrates the left analog stick, draws through Gfx_CursorDraw, and
+ * confirms with the `enter` bind. We detect one is on screen via Gfx_CursorDraw
+ * and inject mouse motion into the stick + a click into the controller, so the
+ * puzzle's own cursor follows the mouse with no per-puzzle code.
+ *
+ * Menu: the title menu is discrete row-selection, so we hit-test the mouse
+ * against the row bands, drive the selection on hover, and confirm on click. */
+
+/* Once per frame from MainLoop, after the controller is built and after
+ * Pc_ControlStyleUpdate. Polls the mouse; if a cursor puzzle is on screen,
+ * injects its motion + click into g_Controller0. */
+void Pc_MouseCursor_FrameUpdate(void);
+
+/* Called from Gfx_CursorDraw: a cursor-driven puzzle drew its cursor this frame
+ * at (curX, curY) in framebuffer centre-origin pixels. Arms the puzzle mouse
+ * servo for the next few frames and records the cursor position so the servo can
+ * steer it to the mouse pointer. */
+void Pc_MouseCursor_NoteCursorDrawn(int curX, int curY);
+
+/* Hit-test a vertical list of menu rows drawn at y = baseY + i*stepY (top-left
+ * 320x240 coords, as Gfx_StringSetPosition uses). Returns the hovered row index
+ * (0..count-1) or -1. visibleFlags gates selectable rows (bit i); pass ~0u when
+ * every row is selectable. *outClicked is set to 1 when the left button was
+ * pressed this frame while hovering a valid row. */
+int Pc_MouseCursor_MenuRowHover(int baseY, int stepY, int count, unsigned int visibleFlags, int* outClicked);
+
+/* 1 if the mouse moved this frame — use to avoid an idle mouse fighting the
+ * keyboard/pad for the menu selection. */
+int Pc_MouseCursor_Moved(void);
+
+/* Raw pointer position in the text-authoring space (the coordinates
+ * Gfx_StringSetPosition takes). Returns 0 (outputs untouched) when the cursor
+ * is disabled/captured/outside the viewport — menus with non-uniform layouts
+ * (two panes, scrolling lists, buttons) hit-test with this instead of
+ * Pc_MouseCursor_MenuRowHover. */
+int Pc_MouseCursor_UiPos(int* outX, int* outY);
+
+/* Normalized 0..1 position inside the presented picture. For overlays that draw
+ * in the post-capture GL hook and think in viewport pixels rather than in the
+ * game's (mode-dependent) text-authoring space. */
+int Pc_MouseCursor_ViewportPos(float* outX, float* outY);
+
+/* Left-button press edge / held state / right-button press edge this frame
+ * (0 while disabled or outside the viewport). */
+int Pc_MouseCursor_LeftClicked(void);
+int Pc_MouseCursor_LeftHeld(void);
+int Pc_MouseCursor_RightClicked(void);
+
+/* Touch as a pointer, read from the finger itself rather than from the mouse
+ * SDL synthesises out of it. That synthetic mouse moves and clicks in the same
+ * frame, so a screen that reads Left* from it confirms on the very tap meant to
+ * pick something. A screen that wants phone rules -- tap to highlight, tap the
+ * highlighted thing to act, drag to scroll -- reads these while
+ * Pc_MouseCursor_TouchDriving() is 1 and ignores the Left* calls. Positions are
+ * in the same space as Pc_MouseCursor_UiPos.
+ *
+ * TouchDriving: a finger is down, or was within the last few seconds.
+ * TouchDown:    1 while a finger is down, with its position.
+ * TouchPressed: the finger came down this frame.
+ * TouchReleased: the finger lifted this frame; the position is where it was
+ *               last seen. */
+int Pc_MouseCursor_TouchDriving(void);
+int Pc_MouseCursor_TouchDown(int* outX, int* outY);
+int Pc_MouseCursor_TouchPressed(void);
+int Pc_MouseCursor_TouchReleased(int* outX, int* outY);
+/* The finger in Pc_MouseCursor_ViewportPos's space (0..1 of the presented
+ * picture), for GL overlays; valid while down and on the release frame. */
+int Pc_MouseCursor_TouchViewportPos(float* outX, float* outY);
+
+/* +1/-1 on a new wheel notch this frame (0 otherwise) — menus use it to
+ * adjust the hovered value row / scroll lists. */
+int Pc_MouseCursor_WheelStep(void);
+
+/* The pad bits (ControllerFlag_*) the mouse is producing right now through
+ * mouse binds (key_cross = Mouse1 and the like), d-pad bits mirrored onto the
+ * left-stick ones. Panels that handle the mouse themselves drop these from the
+ * pad flags they read, or one click acts twice. */
+unsigned int Pc_MouseCursor_BoundPadBits(void);
+
+/* 1 while a free-cursor puzzle is on screen. control_style.c releases the TPS/OTS
+ * mouse capture when this is set, so a cursor puzzle always gets the pointer
+ * regardless of the active camera. */
+int Pc_MouseCursor_PuzzleActive(void);
+
+/* Draw the mouse cursor sprite at the current pointer position. Call during a
+ * menu's render (needs the 2D packet buffer + ordering table set up). */
+void Pc_MouseCursor_Draw(void);
+
+/* The arrow sprite as 32x32 RGBA (alpha 0 where the PSX texel is transparent),
+ * decoded from VRAM. For overlays that composite ABOVE the PSX frame and so must
+ * draw the cursor themselves. Returns 0 if BG_ETC is not in VRAM yet. */
+int  Pc_MouseCursor_SpriteRgba(unsigned char* outRgba32x32);
+
+/* Where that sprite goes for a GL overlay: the cursor rect in viewport pixels
+ * (origin bottom-left, y up) for a viewport of vpW x vpH, sized to match the
+ * PSX-drawn cursor. Returns 0 when the cursor is hidden / off-picture. */
+int  Pc_MouseCursor_GlRect(float vpW, float vpH, float* outX, float* outY, float* outW, float* outH);
+
+#endif /* PC_MOUSE_CURSOR_H */

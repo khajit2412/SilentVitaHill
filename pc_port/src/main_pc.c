@@ -1,0 +1,1956 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/*
+ * main_pc.c - Silent Hill PC Port entry point
+ *
+ * This replaces the PSX main() with a PC-compatible version that:
+ * 1. Initializes SDL2 + OpenGL via PsyCross
+ * 2. Sets up the file system to read game data from disk
+ * 3. Calls into the original game code
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <dirent.h>
+#include <time.h>
+
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+/* Normally supplied by the build (pc_port/CMakeLists.txt defines it for IOS);
+ * derived here as well so this file is correct on its own. */
+#if defined(__APPLE__) && TARGET_OS_IPHONE && !defined(SH_IOS)
+#define SH_IOS 1
+#endif
+
+/* The two mobile targets are where SDL must own the entry point. On Android
+ * there is no process main() to reach at all: SDLActivity's Java shim
+ * dlopen()s libmain.so and calls SDL_main inside it. On iOS there is a real
+ * entry point, but it has to be UIApplicationMain — SDL's UIKit backend
+ * supplies that and calls the game's main() from inside the app delegate.
+ * SDL_main.h only redirects main -> SDL_main while SDL_MAIN_HANDLED is absent.
+ * Everywhere else the port keeps the real C entry (the MinGW link relies on it
+ * — see -emainCRTStartup in CMakeLists). */
+#if !defined(__ANDROID__) && !defined(SH_IOS)
+#define SDL_MAIN_HANDLED
+#endif
+#include <SDL.h>
+#include <SDL_main.h>
+#if defined(__ANDROID__) || defined(SH_IOS)
+#include <SDL_system.h>   /* SDL_AndroidGetExternalStoragePath */
+#include <sys/stat.h>    /* mkdir */
+#include <errno.h>
+#include <unistd.h>       /* chdir */
+#endif
+#ifdef SH_IOS
+/* ios_paths.m — Documents is the one directory Files.app exposes, so it is
+ * where the user's disc image arrives and where saves have to live.
+ * ios_bootstrap.m — copies the port's own shipped assets out of the read-only
+ * bundle on first run, the counterpart of the Android activity's asset staging. */
+const char* Ios_DocumentsPath(void);
+void        Ios_StageBundledAssets(void);
+void        Ios_EnsureMemoryCard(void);
+void        Ios_EnsureModFolders(void);
+#endif
+
+#include "common.h"
+#include "game.h"
+#include "gpu.h"
+#include "sh_log.h"
+#include "psx_memory.h"
+#include "pc_config.h"
+#include "hires_override.h" /* HiresOverride_ClampBudgetToVram */
+#include "pc_audio_config.h"
+#include "pc_discord.h"
+#include "map_registry.h"
+#include "main/fsqueue.h"
+#include "main/fileinfo.h"
+#include "bodyprog/bodyprog.h"
+#include "maps/shared/SysWork_StateStepIncrementAfterTime.h"
+
+#include <libgpu.h>
+#include <libgte.h>
+#include <libetc.h>
+#include <libspu.h>
+#include <libcd.h>
+
+/* PsyCross public API */
+#include <PsyX/PsyX_public.h>
+#include <PsyX/PsyX_backend.h>
+#include <PsyX/common/glad.h>
+
+/* Null device differs by platform: NUL on Windows, /dev/null on POSIX. */
+#ifdef _WIN32
+#define SH_NULL_DEVICE "NUL"
+#else
+#define SH_NULL_DEVICE "/dev/null"
+#endif
+
+/* Forward declarations from game code */
+extern void MainLoop(void);
+extern void Fs_QueueInitialize(void);
+extern void PcPort_InitCharaAnimInfo(void);
+
+/* Overlay pointers from main.c - need runtime init on PC */
+extern void* g_OvlDynamic;
+extern void* g_OvlBodyprog;
+
+/* PC port: master gate for dev/cheat keys (config: allow_debug_controls).
+ * Read by DebugCamera_Update + the few stragglers. Off by default. */
+int g_PcAllowDebugControls = 0;
+
+/* PC port: unlimited-enemies mode (config: unlimited_enemies, console: unlimited).
+ * When on, the per-room concurrent-NPC cap is raised to NPC_COUNT_MAX so natural
+ * spawns can fill every slot. Read in npc_main.c. Off by default. */
+int g_PcUnlimitedEnemies = 0;
+
+/* "Mouse1".."Mouse5" -> SDL mouse button number (Mouse1=left, Mouse2=right,
+ * Mouse3=middle, Mouse4=X1, Mouse5=X2). "MouseWheelUp"/"MouseWheelDown" -> the
+ * two pseudo-slots 6/7 consumed by PsyX_Pad_BuildMouseWord (the wheel is
+ * event-based, latched there). Returns 0 if not a mouse name. */
+static int Pc_ParseMouseName(const char* v)
+{
+    if (!v) return 0;
+    if (SDL_strcasecmp(v, "MouseWheelUp")   == 0) return 6;
+    if (SDL_strcasecmp(v, "MouseWheelDown") == 0) return 7;
+    if ((v[0] == 'M' || v[0] == 'm') && (v[1] == 'o' || v[1] == 'O') &&
+        (v[2] == 'u' || v[2] == 'U') && (v[3] == 's' || v[3] == 'S') &&
+        (v[4] == 'e' || v[4] == 'E'))
+    {
+        switch (atoi(v + 5))
+        {
+            case 1: return SDL_BUTTON_LEFT;
+            case 2: return SDL_BUTTON_RIGHT;
+            case 3: return SDL_BUTTON_MIDDLE;
+            case 4: return SDL_BUTTON_X1;
+            case 5: return SDL_BUTTON_X2;
+        }
+    }
+    return 0;
+}
+
+/* Apply a "key or mouse" bind value to a PSX-button slot: an SDL key name goes
+ * into *kc (scancode); a "MouseN" value adds the PSX bit to the mouse mask and
+ * leaves *kc unbound; "NONE"/empty = unbound. Used for BOTH the primary and the
+ * secondary keyboard binds so the mouse can be a PRIMARY bind (e.g. modern
+ * Fire = Left Mouse). The caller clears the mouse mask once before applying. */
+static void Pc_ApplyKeyOrMouse(const char* v, unsigned short bit, int* kc)
+{
+    int mb;
+    if (!v || !v[0] || strcmp(v, "NONE") == 0) { *kc = SDL_SCANCODE_UNKNOWN; return; }
+    mb = Pc_ParseMouseName(v);
+    if (mb > 0) { g_cfg_mouseButtonMask[mb] |= bit; *kc = SDL_SCANCODE_UNKNOWN; }
+    else        { *kc = PsyX_LookupKeyboardMapping(v, SDL_SCANCODE_UNKNOWN); }
+}
+
+/* Apply ONE control scheme (classic or altcam) onto the PsyCross input mapping.
+ * Rebuilds all four mappings from scratch each call (primary keyboard, secondary
+ * keyboard, primary controller, secondary controller) + the mouse mask, so a
+ * runtime scheme swap is just "re-run with the other scheme". Unbound = "NONE"
+ * -> SDL_SCANCODE_UNKNOWN / BUTTON_INVALID; nothing falls back to a built-in
+ * default, so the config is fully respected. Call via Pc_ApplyActiveControlScheme. */
+static void Pc_ApplyControlConfig(const ControlScheme* s)
+{
+    extern int g_cfg_controllerMovement;
+    int i;
+
+    /* Reset the keyboard layers' mouse contribution; rebuilt from primary + secondary. */
+    for (i = 0; i < 8; i++) g_cfg_mouseButtonMask[i] = 0;
+
+    /* Primary keyboard (key OR mouse button). */
+    Pc_ApplyKeyOrMouse(s->keyUp,       0x10,   &g_cfg_keyboardMapping.kc_dpad_up);
+    Pc_ApplyKeyOrMouse(s->keyDown,     0x40,   &g_cfg_keyboardMapping.kc_dpad_down);
+    Pc_ApplyKeyOrMouse(s->keyLeft,     0x80,   &g_cfg_keyboardMapping.kc_dpad_left);
+    Pc_ApplyKeyOrMouse(s->keyRight,    0x20,   &g_cfg_keyboardMapping.kc_dpad_right);
+    Pc_ApplyKeyOrMouse(s->keyCross,    0x4000, &g_cfg_keyboardMapping.kc_cross);
+    Pc_ApplyKeyOrMouse(s->keyCircle,   0x2000, &g_cfg_keyboardMapping.kc_circle);
+    Pc_ApplyKeyOrMouse(s->keyTriangle, 0x1000, &g_cfg_keyboardMapping.kc_triangle);
+    Pc_ApplyKeyOrMouse(s->keySquare,   0x8000, &g_cfg_keyboardMapping.kc_square);
+    Pc_ApplyKeyOrMouse(s->keyL1,       0x400,  &g_cfg_keyboardMapping.kc_l1);
+    Pc_ApplyKeyOrMouse(s->keyR1,       0x800,  &g_cfg_keyboardMapping.kc_r1);
+    Pc_ApplyKeyOrMouse(s->keyL2,       0x100,  &g_cfg_keyboardMapping.kc_l2);
+    Pc_ApplyKeyOrMouse(s->keyR2,       0x200,  &g_cfg_keyboardMapping.kc_r2);
+    Pc_ApplyKeyOrMouse(s->keyL3,       0x2,    &g_cfg_keyboardMapping.kc_l3);
+    Pc_ApplyKeyOrMouse(s->keyR3,       0x4,    &g_cfg_keyboardMapping.kc_r3);
+    Pc_ApplyKeyOrMouse(s->keyStart,    0x8,    &g_cfg_keyboardMapping.kc_start);
+    Pc_ApplyKeyOrMouse(s->keySelect,   0x1,    &g_cfg_keyboardMapping.kc_select);
+
+    /* Secondary keyboard (second key/mouse per action; AND-combined per frame). */
+    Pc_ApplyKeyOrMouse(s->keyUp2,       0x10,   &g_cfg_keyboardMapping2.kc_dpad_up);
+    Pc_ApplyKeyOrMouse(s->keyDown2,     0x40,   &g_cfg_keyboardMapping2.kc_dpad_down);
+    Pc_ApplyKeyOrMouse(s->keyLeft2,     0x80,   &g_cfg_keyboardMapping2.kc_dpad_left);
+    Pc_ApplyKeyOrMouse(s->keyRight2,    0x20,   &g_cfg_keyboardMapping2.kc_dpad_right);
+    Pc_ApplyKeyOrMouse(s->keyCross2,    0x4000, &g_cfg_keyboardMapping2.kc_cross);
+    Pc_ApplyKeyOrMouse(s->keyCircle2,   0x2000, &g_cfg_keyboardMapping2.kc_circle);
+    Pc_ApplyKeyOrMouse(s->keyTriangle2, 0x1000, &g_cfg_keyboardMapping2.kc_triangle);
+    Pc_ApplyKeyOrMouse(s->keySquare2,   0x8000, &g_cfg_keyboardMapping2.kc_square);
+    Pc_ApplyKeyOrMouse(s->keyL12,       0x400,  &g_cfg_keyboardMapping2.kc_l1);
+    Pc_ApplyKeyOrMouse(s->keyR12,       0x800,  &g_cfg_keyboardMapping2.kc_r1);
+    Pc_ApplyKeyOrMouse(s->keyL22,       0x100,  &g_cfg_keyboardMapping2.kc_l2);
+    Pc_ApplyKeyOrMouse(s->keyR22,       0x200,  &g_cfg_keyboardMapping2.kc_r2);
+    Pc_ApplyKeyOrMouse(s->keyL32,       0x2,    &g_cfg_keyboardMapping2.kc_l3);
+    Pc_ApplyKeyOrMouse(s->keyR32,       0x4,    &g_cfg_keyboardMapping2.kc_r3);
+    Pc_ApplyKeyOrMouse(s->keyStart2,    0x8,    &g_cfg_keyboardMapping2.kc_start);
+    Pc_ApplyKeyOrMouse(s->keySelect2,   0x1,    &g_cfg_keyboardMapping2.kc_select);
+
+    /* Primary controller. */
+    g_cfg_controllerMapping.gc_cross    = PsyX_LookupGameControllerMapping(s->padCross,    SDL_CONTROLLER_BUTTON_INVALID);
+    g_cfg_controllerMapping.gc_circle   = PsyX_LookupGameControllerMapping(s->padCircle,   SDL_CONTROLLER_BUTTON_INVALID);
+    g_cfg_controllerMapping.gc_triangle = PsyX_LookupGameControllerMapping(s->padTriangle, SDL_CONTROLLER_BUTTON_INVALID);
+    g_cfg_controllerMapping.gc_square   = PsyX_LookupGameControllerMapping(s->padSquare,   SDL_CONTROLLER_BUTTON_INVALID);
+    g_cfg_controllerMapping.gc_l1       = PsyX_LookupGameControllerMapping(s->padL1,       SDL_CONTROLLER_BUTTON_INVALID);
+    g_cfg_controllerMapping.gc_r1       = PsyX_LookupGameControllerMapping(s->padR1,       SDL_CONTROLLER_BUTTON_INVALID);
+    g_cfg_controllerMapping.gc_l2       = PsyX_LookupGameControllerMapping(s->padL2,       SDL_CONTROLLER_BUTTON_INVALID);
+    g_cfg_controllerMapping.gc_r2       = PsyX_LookupGameControllerMapping(s->padR2,       SDL_CONTROLLER_BUTTON_INVALID);
+    g_cfg_controllerMapping.gc_l3       = PsyX_LookupGameControllerMapping(s->padL3,       SDL_CONTROLLER_BUTTON_INVALID);
+    g_cfg_controllerMapping.gc_r3       = PsyX_LookupGameControllerMapping(s->padR3,       SDL_CONTROLLER_BUTTON_INVALID);
+    g_cfg_controllerMapping.gc_start    = PsyX_LookupGameControllerMapping(s->padStart,    SDL_CONTROLLER_BUTTON_INVALID);
+    g_cfg_controllerMapping.gc_select   = PsyX_LookupGameControllerMapping(s->padSelect,   SDL_CONTROLLER_BUTTON_INVALID);
+
+    /* Secondary controller (second button per action; AND-combined per frame).
+     * dpad/axes of mapping2 stay BUTTON_INVALID (set once in PsyX init). */
+    g_cfg_controllerMapping2.gc_cross    = PsyX_LookupGameControllerMapping(s->padCross2,    SDL_CONTROLLER_BUTTON_INVALID);
+    g_cfg_controllerMapping2.gc_circle   = PsyX_LookupGameControllerMapping(s->padCircle2,   SDL_CONTROLLER_BUTTON_INVALID);
+    g_cfg_controllerMapping2.gc_triangle = PsyX_LookupGameControllerMapping(s->padTriangle2, SDL_CONTROLLER_BUTTON_INVALID);
+    g_cfg_controllerMapping2.gc_square   = PsyX_LookupGameControllerMapping(s->padSquare2,   SDL_CONTROLLER_BUTTON_INVALID);
+    g_cfg_controllerMapping2.gc_l1       = PsyX_LookupGameControllerMapping(s->padL12,       SDL_CONTROLLER_BUTTON_INVALID);
+    g_cfg_controllerMapping2.gc_r1       = PsyX_LookupGameControllerMapping(s->padR12,       SDL_CONTROLLER_BUTTON_INVALID);
+    g_cfg_controllerMapping2.gc_l2       = PsyX_LookupGameControllerMapping(s->padL22,       SDL_CONTROLLER_BUTTON_INVALID);
+    g_cfg_controllerMapping2.gc_r2       = PsyX_LookupGameControllerMapping(s->padR22,       SDL_CONTROLLER_BUTTON_INVALID);
+    g_cfg_controllerMapping2.gc_l3       = PsyX_LookupGameControllerMapping(s->padL32,       SDL_CONTROLLER_BUTTON_INVALID);
+    g_cfg_controllerMapping2.gc_r3       = PsyX_LookupGameControllerMapping(s->padR32,       SDL_CONTROLLER_BUTTON_INVALID);
+    g_cfg_controllerMapping2.gc_start    = PsyX_LookupGameControllerMapping(s->padStart2,    SDL_CONTROLLER_BUTTON_INVALID);
+    g_cfg_controllerMapping2.gc_select   = PsyX_LookupGameControllerMapping(s->padSelect2,   SDL_CONTROLLER_BUTTON_INVALID);
+
+    g_PcAllowDebugControls   = g_PcConfig.allowDebugControls;
+    g_PcUnlimitedEnemies     = g_PcConfig.unlimitedEnemies;
+    g_cfg_controllerMovement = g_PcConfig.controllerMovement;
+    g_cfg_allowMouseSecondary = 1; /* mouse + secondary binds always active */
+}
+
+/* Select + apply the control scheme matching the active camera mode: altcam for
+ * any alternate/modern camera (g_DebugThirdPersonCam != 0), classic otherwise.
+ * Called at boot and whenever the control style (camera) changes. */
+void Pc_ApplyActiveControlScheme(void)
+{
+    extern int g_DebugThirdPersonCam;
+    Pc_ApplyControlConfig(g_DebugThirdPersonCam ? &g_PcConfig.altcam : &g_PcConfig.classic);
+}
+
+/* Force the classic (default) control scheme regardless of the active camera.
+ * Menus always navigate with the default binds, so an alternate camera's binds
+ * (mouse-look / remapped buttons) don't leak into menu navigation. Restored to
+ * the camera-matched scheme via Pc_ApplyActiveControlScheme on return to
+ * gameplay (driven by Pc_ControlStyleUpdate). */
+void Pc_ApplyClassicControlScheme(void)
+{
+    Pc_ApplyControlConfig(&g_PcConfig.classic);
+}
+
+/* Demo play file buffer pointer - default PSX address needs runtime init */
+typedef struct s_DemoFrameData s_DemoFrameData;
+extern s_DemoFrameData* g_Demo_PlayFileBufferPtr;
+
+/* Unified debug log — writes to a fopen'd SilentHill.log handle that
+ * doesn't depend on stdout being redirected.  Lets us keep SH_DBG going
+ * to the file even when show_console=1 leaves stdout pointed at the
+ * visible console window.  Set g_ShDebugEchoStdout from main() after
+ * config is parsed. */
+FILE* g_ShDebugLog = NULL;
+int   g_ShDebugEchoStdout = 0;
+void (*g_ShOverlayPushLine)(const char* line) = NULL;
+void (*g_ShOverlayToastLine)(const char* line) = NULL;
+/* Per-run timestamped log path so a new run never overwrites the previous log.
+ * Computed once on the first call and cached, so the main log handle and the
+ * stdout/stderr freopen all target the same file for this run. */
+/* Which config file was actually loaded, for the startup announcement. */
+static char s_ConfigPathUsed[512] = {0};
+
+static int Pc_FileExists(const char* path)
+{
+    FILE* f = fopen(path, "rb");
+
+    if (f == NULL)
+        return 0;
+
+    fclose(f);
+    return 1;
+}
+
+/* Best effort: a missing source just means there is nothing to migrate. */
+static void Pc_CopyFile(const char* src, const char* dst)
+{
+    FILE*  in = fopen(src, "rb");
+    FILE*  out;
+    char   buf[4096];
+    size_t n;
+
+    if (in == NULL)
+        return;
+
+    out = fopen(dst, "wb");
+    if (out == NULL)
+    {
+        fclose(in);
+        return;
+    }
+
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
+        fwrite(buf, 1, n, out);
+
+    fclose(in);
+    fclose(out);
+}
+
+/* Write a documented starter config when none exists.
+ *
+ * Nothing ever created one: the loader tolerates a missing file and the writer
+ * only fires when an in-game option changes. So a fresh install had no file to
+ * edit -- and on hardware whose buttons do not match the default key map, the
+ * settings that would fix that are exactly the ones you cannot reach. Values
+ * come from the live config so this always reflects the real defaults. */
+static void Pc_WriteStarterConfig(const char* path)
+{
+    FILE* f = fopen(path, "w");
+
+    if (f == NULL)
+        return;
+
+    fprintf(f, "# Silent Hill - configuration\n");
+    fprintf(f, "# Edit with any text editor. Lines starting with # are ignored.\n\n");
+    fprintf(f, "# --- diagnostics ---\n");
+    fprintf(f, "enable_debug_log = %d\n\n", g_PcConfig.enableDebugLog);
+    fprintf(f, "# --- performance ---\n");
+    fprintf(f, "# render_scale: internal resolution as a fraction of the screen.\n");
+    fprintf(f, "# The big lever on weak hardware - 0.5 renders a quarter of the pixels.\n");
+    fprintf(f, "render_scale = %.2f\n", (double)g_PcConfig.renderScale);
+    fprintf(f, "msaa = %d               # 0/2/4/8 - expensive, use 0 on weak GPUs\n", g_PcConfig.msaaSamples);
+    fprintf(f, "fps_cap = %d            # 0 = uncapped, 30 = PSX-accurate\n", g_PcConfig.fpsCap);
+    fprintf(f, "disable_culling = %d    # 1 draws everything - leave at 0\n", g_PcConfig.disableCulling);
+    fprintf(f, "use_pgxp = %d           # vertex precision; costs CPU\n", g_PcConfig.usePgxp);
+    fprintf(f, "post_process = %d\n", g_PcConfig.postProcess);
+    fprintf(f, "widescreen_mode = %d    # 0 = 4:3 pillarbox (fewest pixels), 1 = Hor+, 2 = stretch\n", g_PcConfig.widescreenMode);
+    fprintf(f, "resident_textures = %d  # costs memory; drop it on small devices\n", g_PcConfig.residentTextures);
+    fprintf(f, "preload_chunks = %d\n\n", g_PcConfig.preloadChunks);
+    fprintf(f, "# --- touch ---\n");
+    fprintf(f, "# touch_controls: 1 = automatic (stands aside for a controller),\n");
+    fprintf(f, "#   2 = always on, 0 = always off. Off still leaves the taps that skip\n");
+    fprintf(f, "#   a logo or leave a pause screen, so a phone can always reach this menu.\n");
+    fprintf(f, "touch_controls = %d\n", g_PcConfig.touchControls);
+    fprintf(f, "touch_look_sensitivity = %.2f\n\n", (double)g_PcConfig.touchLookSensitivity);
+    fprintf(f, "# --- keyboard bindings ---\n");
+    fprintf(f, "# SDL key names. The log prints every key this machine produces as\n");
+    fprintf(f, "#   [KEY] scancode N = 'Name'\n");
+    fprintf(f, "# so press a button, then copy its name here. NONE unbinds.\n");
+    fprintf(f, "key_up = %s\n", g_PcConfig.classic.keyUp);
+    fprintf(f, "key_down = %s\n", g_PcConfig.classic.keyDown);
+    fprintf(f, "key_left = %s\n", g_PcConfig.classic.keyLeft);
+    fprintf(f, "key_right = %s\n", g_PcConfig.classic.keyRight);
+    fprintf(f, "key_cross = %s\n", g_PcConfig.classic.keyCross);
+    fprintf(f, "key_circle = %s\n", g_PcConfig.classic.keyCircle);
+    fprintf(f, "key_triangle = %s\n", g_PcConfig.classic.keyTriangle);
+    fprintf(f, "key_square = %s\n", g_PcConfig.classic.keySquare);
+    fprintf(f, "key_start = %s\n", g_PcConfig.classic.keyStart);
+    fprintf(f, "key_select = %s\n", g_PcConfig.classic.keySelect);
+    fprintf(f, "key_l1 = %s\n", g_PcConfig.classic.keyL1);
+    fprintf(f, "key_r1 = %s\n", g_PcConfig.classic.keyR1);
+    fprintf(f, "key_l2 = %s\n", g_PcConfig.classic.keyL2);
+    fprintf(f, "key_r2 = %s\n", g_PcConfig.classic.keyR2);
+
+    fclose(f);
+}
+
+/* Android: the folder a file manager can actually open (Android/media/<pkg>),
+ * published by SilentHillActivity. NULL everywhere else, and NULL on Android if
+ * the activity could not create it. */
+const char* Pc_UserVisibleDir(void)
+{
+#if defined(__ANDROID__)
+    const char* drop = getenv("SH_DISC_DROP_DIR");
+
+    if (drop != NULL && drop[0] != '\0')
+        return drop;
+#endif
+    return NULL;
+}
+
+const char* SH_LogPath(void)
+{
+    static char s_logPath[512] = {0};
+    if (!s_logPath[0]) {
+        char        stamp[64];
+        const char* dir = Pc_UserVisibleDir();
+        time_t now = time(NULL);
+        struct tm* lt = localtime(&now);
+
+        if (!lt || strftime(stamp, sizeof(stamp), "SilentHill_%Y%m%d_%H%M%S.log", lt) == 0) {
+            snprintf(stamp, sizeof(stamp), "SilentHill.log");
+        }
+
+        /* Put logs where the user can reach them. The working directory is
+         * inside Android/data, which no file manager can open from Android 11
+         * on -- so "send me the log" meant "install adb" until now. */
+        if (dir != NULL)
+            snprintf(s_logPath, sizeof(s_logPath), "%s/%s", dir, stamp);
+        else
+            snprintf(s_logPath, sizeof(s_logPath), "%s", stamp);
+    }
+    return s_logPath;
+}
+
+void SH_DebugLogInit(void)
+{
+    if (!g_ShDebugLog) {
+        g_ShDebugLog = fopen(SH_LogPath(), "w");
+        if (!g_ShDebugLog) {
+            /* Last resort — fall back to stdout so we don't crash on the
+             * first SH_DBG. Caller (main) normally pre-opens this. */
+            g_ShDebugLog = stdout;
+        } else {
+            /* Full buffering (64KB). MSVCRT ignores _IOLBF (treats it as
+             * _IOFBF), so request _IOFBF explicitly — flushes on buffer-full
+             * and on clean exit. Unbuffered (_IONBF) was used for crash
+             * diagnosis but it flushes every SH_DBG to disk, which halves
+             * framerate under heavy per-frame logging (combat + map churn). */
+            static char s_logBuf[64 * 1024];
+            setvbuf(g_ShDebugLog, s_logBuf, _IOFBF, sizeof(s_logBuf));
+        }
+    }
+}
+
+/* Final-flush hook: ensure the log is flushed before the process exits
+ * (normal or crash). Stdio also runs this via atexit but registering
+ * explicitly makes the intent obvious. */
+static void Sh_LogAtExitFlush(void) {
+    if (g_ShDebugLog && g_ShDebugLog != stdout) fflush(g_ShDebugLog);
+}
+
+/* Bounded tail loss for crash reports. The 64KB buffer only self-flushes when
+ * full, so a quiet stretch (exploration, menus) can hold minutes of log that a
+ * crash then discards — and a crash that bypasses our SetUnhandledExceptionFilter
+ * (heap corruption fast-fails straight to the kernel) never gets the handler's
+ * flush either. One flush per wall-clock second caps the loss without
+ * reintroducing the per-SH_DBG flush that halved framerate. */
+void Sh_LogPeriodicFlush(void)
+{
+    static time_t s_lastFlush = 0;
+    time_t now;
+
+    if (!g_ShDebugLog || g_ShDebugLog == stdout) return;
+
+    now = time(NULL);
+    if (now == s_lastFlush) return;
+    s_lastFlush = now;
+    fflush(g_ShDebugLog);
+}
+
+/* Crash telemetry lives in pc_crash.c (windows.h conflicts with the decomp
+ * `byte` typedef, so it can't be included here). */
+extern void Sh_InstallCrashFilter(void);
+
+
+/* Game data path - where the extracted game files are located */
+static char g_GameDataPath[512] = "./gamedata";
+
+/* Public accessor — used by xa_player.c (and anything else that needs to
+ * locate the disc image at runtime) so we don't sprinkle search-path arrays
+ * across the codebase. Always returns a NUL-terminated path. */
+const char* PcPort_GetGameDataPath(void)
+{
+    return g_GameDataPath;
+}
+
+/* Region-remapped file-table sector for C++ callers (fmv_player.cpp) —
+ * fileinfo.h has no extern "C" guards, so g_FileTable isn't reachable there. */
+unsigned int PcPort_FileTableStartSector(int fileIdx)
+{
+    return g_FileTable[fileIdx].startSector;
+}
+
+/* Resolved disc image path (cached) and its region. The PC port is a single
+ * executable that supports multiple disc regions; the active file table / XA
+ * offsets are chosen here from whichever disc is present. */
+static char g_GameDiscPath[1024] = { 0 };
+static int  g_DiscResolved       = 0;
+
+/* Read the boot executable name (SLUS/SLES/SLPM prefix) from a BIN's ISO9660
+ * root directory to identify the region. Returns a Region_* value or -1. */
+static int Pc_DetectRegionFromBin(const char* path)
+{
+    FILE*         f = fopen(path, "rb");
+    unsigned char sec[2048];
+    unsigned int  rlba;
+    unsigned int  exeLba = 0;
+    unsigned      o;
+    int           region = -1;
+
+    if (!f)
+        return -1;
+
+    /* PVD at LBA 16 (raw 2352-byte sectors; 2048 data bytes at offset 24). */
+    fseek(f, 16 * 2352 + 24, SEEK_SET);
+    if (fread(sec, 1, 2048, f) != 2048) { fclose(f); return -1; }
+    rlba = sec[156 + 2] | (sec[156 + 3] << 8) | (sec[156 + 4] << 16) | ((unsigned)sec[156 + 5] << 24);
+
+    fseek(f, (long)rlba * 2352 + 24, SEEK_SET);
+    if (fread(sec, 1, 2048, f) != 2048) { fclose(f); return -1; }
+
+    for (o = 0; o + 33 < 2048; )
+    {
+        unsigned L  = sec[o];
+        unsigned nl = sec[o + 32];
+        if (L == 0)
+            break;
+        if (o + 33 + nl <= 2048 && nl >= 4)
+        {
+            if (memcmp(&sec[o + 33], "SLUS", 4) == 0) region = Region_USA;
+            else if (memcmp(&sec[o + 33], "SLES", 4) == 0) region = Region_EUR;
+            else if (memcmp(&sec[o + 33], "SLPM", 4) == 0 ||
+                     memcmp(&sec[o + 33], "SLPS", 4) == 0 ||
+                     memcmp(&sec[o + 33], "SIPS", 4) == 0)
+            {
+                region = Region_JPN;
+                exeLba = sec[o + 2] | (sec[o + 3] << 8) | (sec[o + 4] << 16) | ((unsigned)sec[o + 5] << 24);
+            }
+        }
+        o += L;
+    }
+
+    /* NTSC-J: the region tables in this build are for the Rev 1/Rev 2 exe
+     * (SLPM-86192 99-06-02, PS-X EXE t_size 0x13800). The first print shifts
+     * the containers and file table slightly — flag it rather than misload. */
+    if (region == Region_JPN && exeLba != 0)
+    {
+        unsigned int tSize = 0;
+        fseek(f, (long)exeLba * 2352 + 24, SEEK_SET);
+        if (fread(sec, 1, 2048, f) == 2048 && memcmp(sec, "PS-X EXE", 8) == 0)
+            tSize = sec[0x1C] | (sec[0x1D] << 8) | (sec[0x1E] << 16) | ((unsigned)sec[0x1F] << 24);
+        if (tSize != 0x13800)
+            SH_WARN("NTSC-J disc looks like the FIRST PRINT (exe t_size %#x, expected 0x13800 for Rev 1/2) — "
+                    "using Rev 1/2 tables; some files may misload", tSize);
+    }
+
+    fclose(f);
+    return region;
+}
+
+/* Read the disc's boot executable (SLUS/SLES/SLPM) into a malloc'd buffer via
+ * the ISO9660 root directory. Returns 1 and fills *outBuf (caller frees) / *outSize
+ * on success. Raw MODE2/2352 sectors: 2048 user bytes at sector*2352 + 24. */
+static int Pc_ReadDiscExe(const char* path, unsigned char** outBuf, unsigned* outSize)
+{
+    FILE*         f = fopen(path, "rb");
+    unsigned char sec[2048];
+    unsigned int  rlba;
+    unsigned int  exeLba  = 0;
+    unsigned int  exeSize = 0;
+    unsigned      o;
+
+    if (!f)
+        return 0;
+
+    fseek(f, 16 * 2352 + 24, SEEK_SET);
+    if (fread(sec, 1, 2048, f) != 2048) { fclose(f); return 0; }
+    rlba = sec[156 + 2] | (sec[156 + 3] << 8) | (sec[156 + 4] << 16) | ((unsigned)sec[156 + 5] << 24);
+
+    fseek(f, (long)rlba * 2352 + 24, SEEK_SET);
+    if (fread(sec, 1, 2048, f) != 2048) { fclose(f); return 0; }
+
+    for (o = 0; o + 33 < 2048; )
+    {
+        unsigned L  = sec[o];
+        unsigned nl = sec[o + 32];
+        if (L == 0)
+            break;
+        if (o + 33 + nl <= 2048 && nl >= 4 &&
+            (memcmp(&sec[o + 33], "SLUS", 4) == 0 || memcmp(&sec[o + 33], "SLES", 4) == 0 ||
+             memcmp(&sec[o + 33], "SLPM", 4) == 0 || memcmp(&sec[o + 33], "SLPS", 4) == 0))
+        {
+            exeLba  = sec[o + 2]  | (sec[o + 3]  << 8) | (sec[o + 4]  << 16) | ((unsigned)sec[o + 5]  << 24);
+            exeSize = sec[o + 10] | (sec[o + 11] << 8) | (sec[o + 12] << 16) | ((unsigned)sec[o + 13] << 24);
+            break;
+        }
+        o += L;
+    }
+
+    if (exeLba == 0 || exeSize == 0 || exeSize > 4u * 1024 * 1024) { fclose(f); return 0; }
+
+    {
+        unsigned       nsec = (exeSize + 2047) / 2048;
+        unsigned       i;
+        unsigned char* buf  = (unsigned char*)malloc((size_t)nsec * 2048);
+        if (!buf) { fclose(f); return 0; }
+        for (i = 0; i < nsec; i++)
+        {
+            fseek(f, (long)(exeLba + i) * 2352 + 24, SEEK_SET);
+            if (fread(buf + (size_t)i * 2048, 1, 2048, f) != 2048) { free(buf); fclose(f); return 0; }
+        }
+        fclose(f);
+        *outBuf  = buf;
+        *outSize = exeSize;
+        return 1;
+    }
+}
+
+/* Correct g_FileTable for a rearranged fan disc, any region. Reads the disc's own
+ * file table out of its boot exe and remaps every sector by name (Fs_RemapFromDiscTable).
+ * The table sits at a build-specific offset in the exe (a rebuilt disc shifts it),
+ * so locate it by anchoring on the baked table's first four file names — data we
+ * already hold, so no filename is hardcoded (the USA/EUR/JAP tables all open with
+ * the same four 1ST files). A no-op on a stock or in-place-patched disc of any
+ * region (its table equals ours). Any failure leaves the baked table intact. */
+static void Pc_RemapFileTableFromDisc(const char* discPath)
+{
+    unsigned char* exe     = NULL;
+    unsigned       exeSize = 0;
+    unsigned       off;
+    unsigned       tableOff = 0;
+    unsigned       a0n0, a0n4, a1n0, a1n4, a2n0, a2n4, a3n0, a3n4;
+
+    if (!Pc_ReadDiscExe(discPath, &exe, &exeSize))
+    {
+        SH_WARN("fan-disc remap: could not read boot exe from %s (keeping baked sectors)", discPath);
+        return;
+    }
+
+    a0n0 = g_FileTable[0].name0123; a0n4 = g_FileTable[0].name4567;
+    a1n0 = g_FileTable[1].name0123; a1n4 = g_FileTable[1].name4567;
+    a2n0 = g_FileTable[2].name0123; a2n4 = g_FileTable[2].name4567;
+    a3n0 = g_FileTable[3].name0123; a3n4 = g_FileTable[3].name4567;
+
+    for (off = 0x800; off + 4 * 12 <= exeSize; off += 4)
+    {
+        const s_FileInfo* e = (const s_FileInfo*)(exe + off);
+        if (e[0].name0123 == a0n0 && e[0].name4567 == a0n4 &&
+            e[1].name0123 == a1n0 && e[1].name4567 == a1n4 &&
+            e[2].name0123 == a2n0 && e[2].name4567 == a2n4 &&
+            e[3].name0123 == a3n0 && e[3].name4567 == a3n4)
+        {
+            tableOff = off;
+            break;
+        }
+    }
+
+    if (tableOff == 0)
+    {
+        SH_WARN("fan-disc remap: file table not found in boot exe (keeping baked sectors)");
+        free(exe);
+        return;
+    }
+
+    {
+        /* Cap covers the largest real table (EUR is 2310 entries, USA/JAP 2074)
+         * plus slack for a fan disc that appended files; the tail past a shorter
+         * table is unrelated .data, but a false hit needs a 56-bit name/type/path
+         * collision and real entries come first and win. */
+        unsigned avail   = (exeSize - tableOff) / 12;
+        s32      count   = (s32)(avail < 2400u ? avail : 2400u);
+        s32      changed = Fs_RemapFromDiscTable((const s_FileInfo*)(exe + tableOff), count);
+        if (changed > 0)
+            SH_LOG("Fan disc detected: remapped %d file sectors from disc's own table", changed);
+    }
+
+    free(exe);
+}
+
+/* Select region tables for a resolved disc, then correct sectors from the disc
+ * itself for fan re-translations that rearranged the CD (no-op otherwise).
+ * Runs for every region: PAL and NTSC-J fan patches rebuild the CD the same way
+ * a USA one does, and Fs_RemapFromDiscTable matches through the region's own
+ * name/path shape, so a stock disc of any region still changes nothing. */
+static void Pc_ApplyDiscRegion(const char* discPath, e_GameRegion region)
+{
+    Fs_InitFileTableForRegion(region);
+    if (discPath && discPath[0])
+        Pc_RemapFileTableFromDisc(discPath);
+    /* Also to the log file: the "Disc:" SH_LOG line only reaches stdout/the
+     * in-game console, so a launcher run leaves no record of the applied
+     * region in SilentHill.log. */
+    SH_DBG("[REGION] applied region=%d (%s) disc=%s", (int)region,
+           region == Region_EUR ? "EUR/PAL" : region == Region_JPN ? "NTSC-J" : "USA",
+           (discPath && discPath[0]) ? discPath : "(none)");
+}
+
+static const struct { const char* name; int region; } s_knownDiscs[] = {
+    { "Silent Hill (USA).bin",                        Region_USA },
+    { "Silent Hill (PAL).bin",                        Region_EUR },
+    { "Silent Hill (Europe) (En,Fr,De,Es,It).bin",    Region_EUR },
+    { "Silent Hill (Japan).bin",                      Region_JPN },
+};
+
+#define DISC_ROOT_MAX 4
+
+/* Directories searched for a disc image, highest priority first.
+ *
+ * gamedata/ beside the game is the canonical spot on every platform. Android
+ * adds the drop dir published by SilentHillActivity (Android/media/<pkg>):
+ * from Android 11 on, Android/data — where gamedata/ lives — is unreachable to
+ * file-manager apps, so a user without adb or a built-in Files app has no way
+ * to deliver their disc at all. Android/media carries no such restriction and
+ * needs no permission. Both the drop dir itself and a gamedata/ inside it are
+ * accepted, because both are things a user will reasonably try. */
+static int BuildDiscSearchRoots(char roots[][1024], int maxRoots)
+{
+    int n = 0;
+
+    if (n < maxRoots)
+        snprintf(roots[n++], 1024, "%s", g_GameDataPath);
+
+#if defined(__ANDROID__)
+    {
+        const char* drop = getenv("SH_DISC_DROP_DIR");
+
+        if (drop != NULL && drop[0] != '\0')
+        {
+            if (n < maxRoots) snprintf(roots[n++], 1024, "%s", drop);
+            if (n < maxRoots) snprintf(roots[n++], 1024, "%s/gamedata", drop);
+        }
+    }
+#endif
+
+#if defined(SH_IOS)
+    /* iOS has no equivalent of Android's unreachable-data-dir problem: the
+     * working directory IS Documents, and UIFileSharingEnabled publishes it to
+     * Files.app directly. What it does have is the same user mistake the drop
+     * dir accounts for — Files.app shows this app as a single "Silent Hill"
+     * folder, so dropping the .bin straight into it rather than into gamedata/
+     * is the obvious thing to try. Accept both. */
+    if (n < maxRoots)
+        snprintf(roots[n++], 1024, ".");
+#endif
+
+    return n;
+}
+
+/* Apply the name rules then the autodetect rule within a single root. `want`
+ * is a required region, or -1 for any; `byPreference` only colors the log
+ * line. Returns 1 having resolved g_GameDiscPath and the region. */
+static int FindDiscInRoot(const char* root, int want, int byPreference)
+{
+    char path[1024];
+    int  i;
+    DIR* dir;
+
+    for (i = 0; i < (int)(sizeof(s_knownDiscs) / sizeof(s_knownDiscs[0])); i++)
+    {
+        FILE* f;
+        snprintf(path, sizeof(path), "%s/%s", root, s_knownDiscs[i].name);
+        f = fopen(path, "rb");
+        if (f)
+        {
+            /* Trust the boot serial over the filename — a renamed disc
+             * must select the region its data actually has (and the
+             * launcher's serial-based display then always agrees).
+             * The name's region is only the fallback for odd rips. */
+            int probed = Pc_DetectRegionFromBin(path);
+
+            fclose(f);
+            if (probed < 0)
+                probed = s_knownDiscs[i].region;
+            if (want >= 0 && probed != want)
+                continue;
+
+            snprintf(g_GameDiscPath, sizeof(g_GameDiscPath), "%s", path);
+            Pc_ApplyDiscRegion(g_GameDiscPath, (e_GameRegion)probed);
+            SH_LOG("Disc: %s (region %s%s)", path,
+                   probed == Region_EUR ? "EUR/PAL"
+                 : probed == Region_JPN ? "NTSC-J"  : "USA",
+                   byPreference ? ", by config preference" : "");
+            return 1;
+        }
+    }
+
+    /* Autodetect any other .bin by its ISO boot serial. */
+    dir = opendir(root);
+    if (dir)
+    {
+        struct dirent* ent;
+        /* One found-path bucket per region (Region_USA/EUR/JPN). */
+        char regionPath[3][1024] = { { 0 }, { 0 }, { 0 } };
+        int  use;
+
+        while ((ent = readdir(dir)) != NULL)
+        {
+            const char* nm = ent->d_name;
+            size_t      l  = strlen(nm);
+            if (l > 4 && (strcmp(nm + l - 4, ".bin") == 0 || strcmp(nm + l - 4, ".BIN") == 0))
+            {
+                int r;
+                snprintf(path, sizeof(path), "%s/%s", root, nm);
+                r = Pc_DetectRegionFromBin(path);
+                if (r >= Region_USA && r <= Region_JPN && !regionPath[r][0])
+                    snprintf(regionPath[r], sizeof(regionPath[r]), "%s", path);
+            }
+        }
+        closedir(dir);
+
+        if (want >= 0 && !regionPath[want][0])
+            return 0; /* preferred region absent here — caller tries the next root */
+
+        /* Auto priority: USA, then PAL, then NTSC-J. */
+        use = (want >= 0)               ? want
+            : regionPath[Region_USA][0] ? Region_USA
+            : regionPath[Region_EUR][0] ? Region_EUR
+            : regionPath[Region_JPN][0] ? Region_JPN
+                                        : -1;
+        if (use >= 0)
+        {
+            snprintf(g_GameDiscPath, sizeof(g_GameDiscPath), "%s", regionPath[use]);
+            Pc_ApplyDiscRegion(g_GameDiscPath, (e_GameRegion)use);
+            SH_LOG("Disc autodetected: %s (region %s%s)", g_GameDiscPath,
+                   use == Region_EUR ? "EUR/PAL"
+                 : use == Region_JPN ? "NTSC-J"  : "USA",
+                   byPreference ? ", by config preference" : "");
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+/* Locate the disc image and select the matching region tables. Priority:
+ * USA, then PAL, then the long European name (US wins if several exist). If
+ * none of those names match but some .bin is present, autodetect by region.
+ * Every rule is applied across all search roots before the next rule. */
+const char* PcPort_GetGameDiscPath(void)
+{
+    char roots[DISC_ROOT_MAX][1024];
+    char path[1024];
+    int  nroots;
+    int  r;
+
+    if (g_DiscResolved)
+        return g_GameDiscPath;
+    g_DiscResolved = 1;
+
+    nroots = BuildDiscSearchRoots(roots, DISC_ROOT_MAX);
+
+    /* Config `disc_image` (launcher Disc dropdown): an exact filename beats
+     * every auto rule — this is how fan-translated / modified images get
+     * selected over the vanilla name-priority order. Region still comes from
+     * the disc's own boot serial. Missing file falls through to auto. */
+    for (r = 0; g_PcConfig.discImage[0] != '\0' && r < nroots; r++)
+    {
+        FILE* f;
+
+        snprintf(path, sizeof(path), "%s/%s", roots[r], g_PcConfig.discImage);
+        f = fopen(path, "rb");
+        if (f)
+        {
+            int probed = Pc_DetectRegionFromBin(path);
+
+            fclose(f);
+            if (probed >= Region_USA && probed <= Region_JPN)
+            {
+                snprintf(g_GameDiscPath, sizeof(g_GameDiscPath), "%s", path);
+                Pc_ApplyDiscRegion(g_GameDiscPath, (e_GameRegion)probed);
+                SH_LOG("Disc: %s (region %s, by config disc_image)", g_PcConfig.discImage,
+                       probed == Region_EUR ? "EUR/PAL"
+                     : probed == Region_JPN ? "NTSC-J"  : "USA");
+                return g_GameDiscPath;
+            }
+            SH_WARN("disc_image %s: no PSX boot serial found — falling back to auto disc pick",
+                    g_PcConfig.discImage);
+        }
+        else if (r == nroots - 1)
+        {
+            SH_WARN("disc_image %s not found in any search root — falling back to auto disc pick",
+                    g_PcConfig.discImage);
+        }
+    }
+
+    /* Config `region` (launcher Region dropdown): when several discs are in
+     * gamedata/, prefer the chosen one instead of the fixed USA-first rule.
+     * -1 = auto (the old behavior). Falls back to auto when the preferred
+     * region has no disc. */
+    {
+        int prefer = (g_PcConfig.region == 1) ? Region_USA
+                   : (g_PcConfig.region == 2) ? Region_EUR
+                   : (g_PcConfig.region == 3) ? Region_JPN
+                                              : -1;
+        int pass;
+
+        for (pass = 0; pass < 2; pass++)
+        {
+            /* Pass 0 honors the preference; pass 1 is the auto fallback. */
+            int want = (pass == 0) ? prefer : -1;
+
+            if (pass == 0 && prefer < 0)
+                continue;
+
+            for (r = 0; r < nroots; r++)
+            {
+                if (FindDiscInRoot(roots[r], want, pass == 0))
+                    return g_GameDiscPath;
+            }
+        }
+    }
+
+    Fs_InitFileTableForRegion(Region_USA); /* keep g_FileTable populated even with no disc */
+    g_GameDiscPath[0] = '\0';
+    for (r = 0; r < nroots; r++)
+        SH_WARN("No Silent Hill disc image (.bin) found in %s", roots[r]);
+
+    return g_GameDiscPath;
+}
+
+static void PrintBanner(void)
+{
+    printf("==============================================\n");
+    printf("  Silent Hill - PC Port\n");
+    printf("  https://github.com/SlickAmogus/silent-hill-decomp/\n");
+    printf("  Based on the Silent Hill Decompilation\n");
+    printf("==============================================\n");
+    printf("\n");
+}
+
+static int s_SkipToGameArg = 0;
+
+static void ParseArgs(int argc, char* argv[])
+{
+    for (int i = 1; i < argc; i++)
+    {
+        if (strcmp(argv[i], "-data") == 0 && i + 1 < argc)
+        {
+            strncpy(g_GameDataPath, argv[i + 1], sizeof(g_GameDataPath) - 1);
+            g_GameDataPath[sizeof(g_GameDataPath) - 1] = '\0';
+            i++;
+        }
+        else if (strcmp(argv[i], "-skiptogame") == 0)
+        {
+            /* The flag existed and was honoured after the config load, but nothing
+             * ever SET it, so the option silently did nothing. */
+            s_SkipToGameArg = 1;
+        }
+        else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0)
+        {
+            printf("Usage: SilentHillPC [options]\n");
+            printf("Options:\n");
+            printf("  -data <path>    Path to game data directory or CD image\n");
+            printf("  -h, --help      Show this help\n");
+            exit(0);
+        }
+    }
+}
+
+#if defined(__ANDROID__)
+/* The same job as Ios_EnsureModFolders, in C because nothing here needs the
+ * platform: the data root is already the working directory by this point, so
+ * every relative path the loose-file loader uses resolves under it.
+ *
+ * The gap it fills is discoverability. A file manager shows what exists, so a
+ * folder nobody created is a folder nobody finds, and a phone player has no
+ * launcher and nothing on the device telling them the names to type.
+ *
+ * Only the two roots and a note. The layout underneath mirrors the disc's own
+ * folder names, which is what the note explains; guessing a full tree would
+ * just leave empty folders for channels most players never touch.
+ *
+ * Never overwrites: mods already in place stay, and an edited note stays
+ * edited. */
+static void Pc_EnsureModFolders(void)
+{
+    static const char* const kDirs[] = { "gamedata", "gamedata/load", "gamedata/texturemods" };
+    const char* note = "gamedata/load/README.txt";
+    unsigned    i;
+    FILE*       f;
+
+    for (i = 0; i < sizeof(kDirs) / sizeof(kDirs[0]); i++)
+    {
+        if (mkdir(kDirs[i], 0775) != 0 && errno != EEXIST)
+            SH_DBG("[MODS] could not create %s (errno %d)", kDirs[i], errno);
+    }
+
+    f = fopen(note, "rb");
+    if (f != NULL)
+    {
+        fclose(f);
+        return;
+    }
+
+    f = fopen(note, "wb");
+    if (f == NULL)
+    {
+        SH_DBG("[MODS] could not write the mod note");
+        return;
+    }
+
+    fputs("Manually installed mods go here.\n"
+          "\n"
+          "Mods are on by default. Options > Graphics > Load Mods turns\n"
+          "them off. Restart the game after adding or removing files.\n"
+          "\n"
+          "gamedata/load/<FOLDER>/<NAME>\n"
+          "  <FOLDER> and <NAME> are the disc's own folder and file names,\n"
+          "  so a replacement sits at the path the original came from,\n"
+          "  e.g. gamedata/load/CHARA/HERO.TIM. Case does not matter.\n"
+          "\n"
+          "Textures:  <NAME>.png or <NAME>.dds beside it (HERO.TIM.png or\n"
+          "           HERO.png), or a replacement .TIM with the same name\n"
+          "Models:    replacement .TMD / .ILM / .IPD; .glb for items\n"
+          "Sounds:    SND/<BANK>.VAB, or one sound as SND/<BANK>.001.wav\n"
+          "Voices:    XA/xa_0001.wav, or XA/msg_<KEY>.wav for a text box\n"
+          "Text:      text_overrides.txt, or text_overrides/<name>.txt\n"
+          "\n"
+          "gamedata/texturemods/ takes DuckStation-format texture packs,\n"
+          "as a folder or a .zip. Always on, no switch needed.\n",
+          f);
+    fclose(f);
+}
+#endif
+
+int main(int argc, char* argv[])
+{
+#ifdef __ANDROID__
+    /* An APK's process starts with the working directory at "/", which is not
+     * writable and holds none of the game data, so every relative path the port
+     * uses (config.cfg, gamedata/, the disc image, SilentHill.log) would miss.
+     * SDLActivity has already set up the JNI by the time it calls SDL_main, so
+     * the app's external files dir is resolvable here — that is the one
+     * location readable and writable at every API level with no storage
+     * permission and no scoped-storage handling. Anchoring the CWD there once
+     * keeps all of the existing path code unchanged.
+     *     /sdcard/Android/data/com.silenthill.port/files/ */
+    /* SDL calls setRequestedOrientation itself when it creates the window and
+     * derives the choice from that window's proportions, which overrides
+     * android:screenOrientation in the manifest. A 4:3 window on a device whose
+     * rotation is locked to portrait ends up portrait, letterboxed top and
+     * bottom. The game is landscape, so say so explicitly before SDL_Init. */
+    /* screen_orientation: 0 = lock landscape (default, and what the port has
+     * always done), 1 = follow the sensor, 2 = lock portrait. Stated rather
+     * than inferred for the reason above -- SDL picks from the window's
+     * proportions otherwise, and a device held in portrait letterboxes the
+     * game into a strip. */
+    if (g_PcConfig.screenOrientation == 2)
+        SDL_SetHint(SDL_HINT_ORIENTATIONS, "Portrait PortraitUpsideDown");
+    else if (g_PcConfig.screenOrientation == 1)
+        SDL_SetHint(SDL_HINT_ORIENTATIONS,
+                    "LandscapeLeft LandscapeRight Portrait PortraitUpsideDown");
+    else
+        SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+
+    /* A handheld's pad keeps talking while the app is briefly unfocused (the
+     * notification shade, the recents overlay); without this SDL drops those
+     * events and the stick reads as centred when focus returns. */
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+
+    {
+        /* SH_DATA_ROOT is the volume the player chose (SilentHillActivity /
+         * StorageLocations) -- an SD card by default where one is present. The
+         * SDL path below is Android/data/<pkg>/files, which from Android 11 no
+         * file manager can open: it is still a working directory, but a player
+         * cannot put a disc into it or take a save out of it, so it is the
+         * fallback rather than the answer. */
+        const char* dataDir = getenv("SH_DATA_ROOT");
+
+        if (dataDir == NULL || dataDir[0] == '\0')
+            dataDir = SDL_AndroidGetExternalStoragePath();
+
+        if (dataDir == NULL || chdir(dataDir) != 0)
+        {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "Could not enter the game data directory (%s) - the disc image "
+                         "and config.cfg cannot be found.",
+                         dataDir ? dataDir : "unavailable");
+            return 1;
+        }
+    }
+#endif
+
+#ifdef SH_IOS
+    /* Same problem as Android, different directory. An iOS app starts with the
+     * working directory at the bundle root, which is read-only and signed, so
+     * config.cfg, saves and SilentHill.log all fail to write there. Documents is
+     * the only place that is writable AND visible to the user: with
+     * UIFileSharingEnabled and LSSupportsOpeningDocumentsInPlace set (see
+     * ios_port/Resources/Info.plist.in) it appears in Files.app, which is how
+     * the user's disc image gets onto the device in the first place. Anchoring
+     * the CWD there keeps every relative path in the port working unchanged.
+     *
+     * The container survives re-signing as long as the bundle ID does not
+     * change, which matters on a free provisioning profile — the app is
+     * re-signed weekly and a ~700 MB disc image should not have to come back
+     * across each time. */
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+
+    /* SDL exposes the iOS accelerometer as a joystick by default, and it shows
+     * up as device 0 ("iOS Accelerometer", isGameController=0). Left on, tilting
+     * the phone feeds analog axes into the pad — and device 0 is exactly the
+     * slot the touch controls inject into. Nothing here wants tilt input. */
+    SDL_SetHint(SDL_HINT_ACCELEROMETER_AS_JOYSTICK, "0");
+
+    /* 2 = hidden outright rather than dimmed-until-idle. The home bar sits over
+     * the bottom of the picture otherwise, and the game already draws its own
+     * touch controls down there. */
+    SDL_SetHint(SDL_HINT_IOS_HIDE_HOME_INDICATOR, "2");
+
+    {
+        const char* dataDir = Ios_DocumentsPath();
+        if (dataDir == NULL || chdir(dataDir) != 0)
+        {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "Could not enter the game data directory (%s) - the disc image "
+                         "and config.cfg cannot be found.",
+                         dataDir ? dataDir : "unavailable");
+            return 1;
+        }
+    }
+
+    /* After the chdir, before the config is read: config.cfg is one of the
+     * files staged, and it is only written when absent. */
+    Ios_StageBundledAssets();
+    /* Before any save screen can ask whether a card is present. */
+    Ios_EnsureMemoryCard();
+    /* So Files.app has somewhere to show the player before they own a mod. */
+    Ios_EnsureModFolders();
+#endif
+
+
+    /* Log file is NOT opened until after config load. SH_DBG calls before
+     * that point are silently no-ops (the macro short-circuits on a NULL
+     * handle). Avoids creating SilentHill.log when enable_debug_log=0. */
+    atexit(Sh_LogAtExitFlush);
+    Sh_InstallCrashFilter();
+
+    PrintBanner();
+    ParseArgs(argc, argv);
+
+    /* Load config file.
+     *
+     * On Android prefer a config in the user-visible folder, and seed it from
+     * the private one on first run. The working directory lives under
+     * Android/data, which a file manager cannot open from Android 11 on, so a
+     * config only kept there is one the player can never edit -- and editing it
+     * is exactly what a low-powered device needs (resolution, MSAA, effects).
+     * PcConfig_Load remembers the path it used, so in-game option changes are
+     * written back to the same file. */
+    {
+        const char* dir = Pc_UserVisibleDir();
+        char        cfgPath[512];
+        const char* chosen = "config.cfg";
+
+        if (dir != NULL)
+        {
+            snprintf(cfgPath, sizeof(cfgPath), "%s/config.cfg", dir);
+
+            if (!Pc_FileExists(cfgPath))
+                Pc_CopyFile("config.cfg", cfgPath); /* migrate, best effort */
+
+            /* Target the visible path even when nothing is there yet -- the
+             * starter file below is about to create it. Requiring it to exist
+             * first was a chicken-and-egg: a fresh install could never get a
+             * config anywhere the player could see, so the file was written
+             * into the app's private folder and might as well not exist. */
+            chosen = cfgPath;
+        }
+
+        PcConfig_Load(chosen);
+        PcAudioConfig_Load(chosen);
+
+        /* First run anywhere: leave the player a file to edit. If the visible
+         * location refuses the write, fall back to the private one rather than
+         * running with no config file at all. */
+        if (!Pc_FileExists(chosen))
+        {
+            Pc_WriteStarterConfig(chosen);
+
+            if (!Pc_FileExists(chosen))
+            {
+                chosen = "config.cfg";
+                Pc_WriteStarterConfig(chosen);
+            }
+        }
+
+        snprintf(s_ConfigPathUsed, sizeof(s_ConfigPathUsed), "%s", chosen);
+    }
+
+    /* After the config load, or the parsed skip_intros would clobber it.
+     * map0_s00 is the compiled-in default, so a config still naming it counts as
+     * "no level picked" and gets the bus level, which has a save point. */
+    if (s_SkipToGameArg)
+    {
+        g_PcConfig.skipIntros = 2;
+
+        if (strcmp(g_PcConfig.mapName, "map0_s00") == 0)
+        {
+            strncpy(g_PcConfig.mapName, "map0_s02", sizeof(g_PcConfig.mapName) - 1);
+            g_PcConfig.mapName[sizeof(g_PcConfig.mapName) - 1] = '\0';
+        }
+    }
+
+    /* Now that we know whether logging is enabled, open the log file (or
+     * leave g_ShDebugLog NULL so SH_DBG stays a no-op). */
+    if (g_PcConfig.enableDebugLog) {
+        SH_DebugLogInit();
+        SH_DBG("[SH] main() entered (log opened post-config)");
+        {
+            /* Build identification — first thing to check in user logs.
+             * Generated fresh each build by cmake/gen_build_info.cmake. */
+            #include "sh_build_info.h"
+            SH_DBG("[SH] build " SH_BUILD_GIT_HASH " (" SH_BUILD_STAMP ")");
+        }
+        /* Say WHERE this log and the config actually are. The log is the one
+         * thing a remote user is asked to find, and when it silently lands in a
+         * private folder (no media dir on the device) the answer is invisible
+         * from both sides -- which is exactly what happened on an arcade
+         * cabinet. Now the file names its own location. */
+        SH_DBG("[SH] log:    %s", SH_LogPath());
+        SH_DBG("[SH] config: %s", s_ConfigPathUsed[0] ? s_ConfigPathUsed : "config.cfg");
+        {
+            const char* drop = Pc_UserVisibleDir();
+            SH_DBG("[SH] user-visible dir: %s", (drop != NULL) ? drop : "(none - using the app's private files dir)");
+        }
+        /* The user's actual settings, verbatim. Costs one pass over a small
+         * file at boot and removes the guesswork from every bug report. */
+        PcConfig_LogEffective("config.cfg");
+        /* One-line render-config fingerprint: these are the axes every remote
+         * corruption report gets bisected on — stop having to ask for the cfg. */
+        SH_DBG("[CONFIG] flashlight_mode=%d use_pgxp=%d resident_textures=%d global_chara_pool=%d",
+               g_PcConfig.flashlightMode, g_PcConfig.usePgxp,
+               g_PcConfig.residentTextures, g_PcConfig.globalCharaPool);
+    }
+
+#if defined(__ANDROID__)
+    /* After the config load so a failure has somewhere to be logged, and
+     * well before the first file request reaches the loose-file loader. */
+    Pc_EnsureModFolders();
+#endif
+
+    /* Scale the texture-pack memory budgets to the machine's RAM. The defaults
+     * (texpack_cache_mb 2 GB compose cache + texpack_budget_mb 6 GB of GL
+     * textures) were sized for a discrete-GPU desktop; on a shared-memory AMD
+     * APU (integrated Radeon, no dedicated VRAM) both come out of the same
+     * system RAM as the game and the driver, so a big pack pushes total usage
+     * past physical RAM and the process is killed by an OOM the SEH handler
+     * can't catch (pc_crash.c logs nothing — matches the reporter's texture-pack
+     * crashes). Cap the compose cache to 1/8 of RAM always; cap the GL budget to
+     * 1/4 of RAM only on low-memory machines (<=8 GB, the APU/laptop range) so
+     * high-RAM desktops with discrete VRAM keep the full budget. Only ever
+     * lowers a value; logged so it's visible in the config fingerprint. */
+    {
+        int ramMb = SDL_GetSystemRAM(); /* physical RAM in MB (0 if unknown) */
+        if (ramMb > 0)
+        {
+            int cacheCap = ramMb / 8;
+            if (cacheCap < 128) cacheCap = 128;
+            if (g_PcConfig.texpackCacheMb > cacheCap)
+            {
+                SH_DBG("[TEXPACK] compose cache capped %d -> %d MB (1/8 of %d MB RAM)",
+                       g_PcConfig.texpackCacheMb, cacheCap, ramMb);
+                g_PcConfig.texpackCacheMb = cacheCap;
+            }
+            if (ramMb <= 8192)
+            {
+                int budgetCap = ramMb / 4;
+                if (budgetCap < 256) budgetCap = 256;
+                /* Published, not just applied: HiresOverride_ClampBudgetToVram runs
+                 * later with a live GL context and may RAISE an unset budget to the
+                 * GPU's reported VRAM. On a shared-memory APU that figure is the same
+                 * RAM this clamp is protecting, so it must not be allowed past here. */
+                g_PcConfig.texpackBudgetCeilingMb = budgetCap;
+                if (g_PcConfig.texpackBudgetMb > budgetCap)
+                {
+                    SH_DBG("[TEXPACK] GL texture budget capped %d -> %d MB (low-RAM %d MB machine)",
+                           g_PcConfig.texpackBudgetMb, budgetCap, ramMb);
+                    g_PcConfig.texpackBudgetMb = budgetCap;
+                }
+            }
+        }
+    }
+
+    /* PsyCross horizontal pixel-aspect compensation. The 15/14 previously baked
+     * here assumed the 320x224 picture fills 4:3 — it does not. The console scans
+     * the frame inside the 350x240 NTSC visible area (DuckStation reports exactly
+     * "1x native = 350x240" for this game, with real black bars around the
+     * picture), so a 320-mode dot's height/width = (350/240)/(4/3) = 35/32 =
+     * 1.09375 and the visible picture is ~1.306:1, slightly narrower than 4:3.
+     * Confirmed empirically 2026-08-25: DuckStation's game content measures
+     * 465x357 => (357/224)/(465/320) = 1.097 ~= 35/32. This is also the original
+     * PSX_NTSC_PIXEL_ASPECT PsyCross shipped (9c502de) and the constant the
+     * vw_calc.c cull comments still quote. Read only by display_aspect = raw;
+     * config key pixel_aspect, console `par`, View & Aspect quick-options row.
+     * hfov/vfov (world_hscale/world_vscale) come from the same page. */
+    {
+        extern float g_PsxPixelAspect;
+        extern float g_PsxWorldHScale;
+        extern float g_PsxWorldVScale;
+        extern float g_PsxWorldVShift;
+        extern float g_PsxCutsceneVShift;
+        g_PsxPixelAspect = g_PcConfig.pixelAspect;
+        g_PsxWorldHScale = g_PcConfig.worldHScale;
+        g_PsxWorldVScale = g_PcConfig.worldVScale;
+        g_PsxWorldVShift = g_PcConfig.worldVShift;
+        g_PsxCutsceneVShift = g_PcConfig.cutsceneVShift;
+    }
+
+    /* Seed the FPS eye baseline from config so a player's saved head position
+     * (View & Aspect quick-options page, or the numpad debug keys baked via the
+     * config) survives a restart. g_PcFpsOffset stays the live value the camera
+     * reads and the numpad edits; the menu writes both it and the config keys. */
+    {
+        extern VECTOR3 g_PcFpsOffset;
+        g_PcFpsOffset.vx = g_PcConfig.fpsHeadX;
+        g_PcFpsOffset.vy = g_PcConfig.fpsHeadY;
+        g_PcFpsOffset.vz = g_PcConfig.fpsHeadZ;
+    }
+
+    /* Apply widescreen mode to PsyCross. */
+    {
+        extern int g_PcWidescreenMode;
+        extern int g_PcMenuPillarbox;
+        g_PcWidescreenMode = g_PcConfig.widescreenMode;
+        g_PcMenuPillarbox  = g_PcConfig.menuPillarbox;
+    }
+
+    /* show_console now only controls the EXTERNAL console window (1 or 3 =
+     * create it; other values = none). The INGAME console is no longer
+     * config-gated: `~` opens/closes it at runtime (dbg_overlay.c), always. */
+    {
+        int show = g_PcConfig.showConsole;
+        if (show == 1 || show == 3) {
+#ifdef _WIN32
+            /* GUI-subsystem app: no console exists at launch, so create one for
+             * external mode and point stdout/stderr at it. */
+            extern __declspec(dllimport) int __stdcall AllocConsole(void);
+            AllocConsole();
+            freopen("CONOUT$", "w", stdout);
+            freopen("CONOUT$", "w", stderr);
+#endif
+            /* On Linux/macOS the process is launched from a terminal, so
+             * stdout/stderr already point at a console — just echo to them. */
+            g_ShDebugEchoStdout = 1;
+            setvbuf(stdout, NULL, _IONBF, 0);
+            setvbuf(stderr, NULL, _IONBF, 0);
+        } else {
+            /* No console — route stdout/stderr to the log file (or the null
+             * device) so stray printf doesn't hit an invalid handle. */
+            if (g_PcConfig.enableDebugLog) {
+                freopen(SH_LogPath(), "a", stdout);
+                freopen(SH_LogPath(), "a", stderr);
+                setvbuf(stdout, NULL, _IONBF, 0);
+                setvbuf(stderr, NULL, _IONBF, 0);
+            } else {
+                freopen(SH_NULL_DEVICE, "w", stdout);
+                freopen(SH_NULL_DEVICE, "w", stderr);
+            }
+        }
+        /* Always capture log lines into the overlay ring buffer so the in-game
+         * console (opened with `~` at runtime) immediately shows recent output. */
+        {
+            extern void DbgOverlay_PushLine(const char* line);
+            extern void DbgOverlay_ToastLine(const char* line);
+            g_ShOverlayPushLine  = DbgOverlay_PushLine;
+            g_ShOverlayToastLine = DbgOverlay_ToastLine;
+        }
+        /* Draw the dev console AFTER the freeze-frame is captured (inside PsyX_EndScene),
+         * so it's never baked into a frozen pause / "no map" image — fixes the console
+         * ghosting/doubling when it was already open before pausing. */
+        {
+            extern void DbgOverlay_Render(void);
+            extern void (*g_PsyX_PostCaptureHook)(void);
+            g_PsyX_PostCaptureHook = DbgOverlay_Render;
+        }
+    }
+    int windowWidth = g_PcConfig.windowWidth;
+    int windowHeight = g_PcConfig.windowHeight;
+
+    SH_LOG("Game data path: %s", g_GameDataPath);
+
+    /* Initialize PSX memory emulation */
+    SH_LOG("Initializing PSX memory emulation...");
+    PsxMemory_Init();
+    SH_LOG("PSX RAM base: %p", (void*)g_PsxRam);
+    SH_LOG("TEMP_MEMORY_ADDR -> %p (offset 0x1A2600)", (void*)TEMP_MEMORY_ADDR);
+
+    /* Initialize runtime data that depends on PSX memory addresses */
+    PcPort_InitCharaAnimInfo();
+    extern void PcPort_InitSdBuffers(void);
+    PcPort_InitSdBuffers();
+
+    /* Translate the Air Screamer per-keyframe AI rodata from PSX layout
+     * (16-byte s_AnimInfo, 4-byte ptrs) to PC layout (32-byte s_AnimInfo,
+     * 8-byte ptrs). Without this, every read past animInfo_0[] in
+     * sharedData_800CAA98_0_s01 returns garbage from a wrong offset and
+     * the AS AI breaks (or the earlier band-aids force a degraded
+     * fallback). See pc_port/src/as_rodata_reformat.c. */
+    extern void AsRodata_Reformat(void);
+    AsRodata_Reformat();
+
+    /* Populate GROANER_ANIM_INFOS — its playbackFunc fields point to
+     * Anim_BlendLinear / Anim_PlaybackOnce / Anim_PlaybackLoop, which
+     * MinGW won't accept in a static initializer (treats function
+     * symbols from another TU as non-constant). Built at runtime. */
+    extern void GroanerAnimInfos_Init(void);
+    GroanerAnimInfos_Init();
+
+    extern void BloodsuckerAnimInfos_Init(void);
+    BloodsuckerAnimInfos_Init();
+    extern void BloodyLisaAnimInfos_Init(void);
+    BloodyLisaAnimInfos_Init();
+    extern void AlessaAnimInfos_Init(void);
+    AlessaAnimInfos_Init();
+    extern void GhostChildAlessaAnimInfos_Init(void);
+    GhostChildAlessaAnimInfos_Init();
+    extern void LisaAnimInfos_Init(void);
+    LisaAnimInfos_Init();
+    extern void KaufmannAnimInfos_Init(void);
+    KaufmannAnimInfos_Init();
+    extern void DahliaAnimInfos_Init(void);
+    DahliaAnimInfos_Init();
+    extern void CatAnimInfos_Init(void);
+    CatAnimInfos_Init();
+    extern void PuppetNurseData_Init(void);
+    PuppetNurseData_Init();
+    extern void LarvalStalkerAnimInfos_Init(void);
+    LarvalStalkerAnimInfos_Init();
+    extern void HangedScratcherAnimInfos_Init(void);
+    HangedScratcherAnimInfos_Init();
+    extern void CreeperAnimInfos_Init(void);
+    CreeperAnimInfos_Init();
+    extern void SplitHeadAnimInfos_Init(void);
+    SplitHeadAnimInfos_Init();
+    extern void RomperAnimInfos_Init(void);
+    RomperAnimInfos_Init();
+
+    /* Binary-extracted batch (2026-06-10): bosses + late-game cast that were
+     * still zero-stubs. Generated by pc_port/tools/extract_anim_infos.py. */
+    extern void LockerDeadBodyAnimInfos_Init(void);
+    LockerDeadBodyAnimInfos_Init();
+    extern void TwinfeelerAnimInfos_Init(void);
+    TwinfeelerAnimInfos_Init();
+    extern void FloatstingerAnimInfos_Init(void);
+    FloatstingerAnimInfos_Init();
+    extern void MonsterCybilAnimInfos_Init(void);
+    MonsterCybilAnimInfos_Init();
+    extern void FlaurosAnimInfos_Init(void);
+    FlaurosAnimInfos_Init();
+    extern void ParasiteAnimInfos_Init(void);
+    ParasiteAnimInfos_Init();
+    extern void GhostDoctorAnimInfos_Init(void);
+    GhostDoctorAnimInfos_Init();
+    extern void BloodyIncubatorAnimInfos_Init(void);
+    BloodyIncubatorAnimInfos_Init();
+    extern void IncubatorAnimInfos_Init(void);
+    IncubatorAnimInfos_Init();
+    extern void LittleIncubusAnimInfos_Init(void);
+    LittleIncubusAnimInfos_Init();
+    extern void IncubusAnimInfos_Init(void);
+    IncubusAnimInfos_Init();
+    extern void Unkkown23AnimInfos_Init(void);
+    Unkkown23AnimInfos_Init();
+
+    extern void Map6S04ExtraAnimInfos_Init(void);
+    Map6S04ExtraAnimInfos_Init();
+
+    /* map7_s03 ending DMS phase pointers: D_800ED230[phase] selects which FS
+     * buffer holds the active cutscene's reformatted DMS header. Was a zero-stub
+     * (NULL) which forced the DMS redirect onto the single latest g_DmsHeapHeader,
+     * desyncing the multi-phase ending. FS_BUFFER_* are g_PsxRam-relative so this
+     * must run after PsxMemory_Init (above). */
+    {
+        extern void* D_800ED230[2];
+        D_800ED230[0] = FS_BUFFER_20;
+        D_800ED230[1] = FS_BUFFER_18;
+    }
+
+    /* Initialize overlay pointers to emulated PSX RAM */
+#if VERSION_IS(JAP0)
+    g_OvlDynamic  = PSX_ADDR(0x000CBAA8);
+#else
+    g_OvlDynamic  = PSX_ADDR(0x000C9578);
+#endif
+    g_OvlBodyprog = PSX_ADDR(0x00024B60);
+    g_Demo_PlayFileBufferPtr = (s_DemoFrameData*)PSX_ADDR(0x000F5E00);
+
+    /* Keyboard mapping is set by PsyCross defaults in PsyX_Initialise:
+     * Cross=C, Circle=V, Triangle=Z, Square=X, Start=Enter, Select=Space
+     * DPad=Arrow keys, L1=LShift, R1=RShift, L2=LCtrl, R2=RCtrl */
+
+    /* Route PsyCross logging into our SilentHill.log handle (or silence it
+     * when enable_debug_log=0) BEFORE PsyX_Initialise, so PsyCross never
+     * creates its own "Silent Hill.log" and never fcloses our handle at
+     * shutdown (it used to, leaving g_ShDebugLog dangling for any logging
+     * after PsyX_Shutdown). */
+    PsyX_Log_SetStream(g_PcConfig.enableDebugLog ? g_ShDebugLog : NULL);
+
+    /* MSAA must be set BEFORE PsyX_Initialise — it drives the SDL multisample
+     * GL attributes chosen at context-creation time (inside GR_InitialiseRender).
+     * If the driver can't honor it, PsyCross retries without MSAA and clears
+     * g_cfg_msaaSamples back to 0. */
+    g_cfg_msaaSamples = g_PcConfig.msaaSamples;
+    {
+        /* Seeded before the window exists so the very first frame already
+         * renders at the requested size. */
+        extern float g_cfg_renderScale;
+        extern int   g_cfg_lowEnd;
+        g_cfg_renderScale = g_PcConfig.renderScale;
+        g_cfg_lowEnd      = g_PcConfig.lowEndMode;
+    }
+    SH_LOG("MSAA: %dx", g_cfg_msaaSamples);
+
+    /* Same rule as MSAA: the backend decides whether SDL builds a WGL or an EGL
+     * window, so it has to be set before PsyX_Initialise. Unknown names resolve
+     * to native GL rather than failing, and a translated backend with no ANGLE
+     * present falls back inside PsyCross — this cannot block startup. */
+    g_cfg_renderBackend = PsyX_Backend_FromName(g_PcConfig.renderer);
+    SH_LOG("Renderer: %s -> %s", g_PcConfig.renderer, PsyX_Backend_GetDescription(g_cfg_renderBackend));
+    if (PsyX_Backend_IsTranslated(g_cfg_renderBackend) && !PsyX_Backend_AngleAvailable())
+        SH_LOG("Renderer: ANGLE (libEGL.dll + libGLESv2.dll) not found next to the exe — falling back to native OpenGL");
+
+    /* Before PsyX_Initialise: the window is confined as soon as it is created. */
+    g_cfg_confineCursor = g_PcConfig.confineCursor;
+
+    /* Initialize PsyCross (creates SDL2 window + OpenGL context) */
+    SH_LOG("Initializing PsyCross (SDL2 + OpenGL)...");
+    PsyX_Initialise("Silent Hill", windowWidth, windowHeight, g_PcConfig.fullscreen);
+
+    SH_LOG("PsyCross initialized. Window: %dx%d", windowWidth, windowHeight);
+
+#if defined(__ANDROID__) || defined(SH_IOS)
+    /* On desktop the config IS the window size, so the five per-poly visibility
+     * bounds that divide by g_PcConfig.windowWidth/Height agree with what is on
+     * screen. Neither mobile target has any say in it — the surface size comes
+     * from the device — so those bounds were still being computed from the
+     * 640x480 defaults:
+     *
+     *   224 * 640 / (2*480)  * 1.09375 ~= 163   (bound actually used)
+     *   224 * 2340 / (2*1080)* 1.09375 ~= 265   (bound 2340x1080 needs)
+     *
+     * a window far narrower than the frame, which culls real geometry at the
+     * left and right edges. Publish the surface PsyCross actually got so the
+     * cull maths, the Hor+ ortho and the config all describe the same screen. */
+    {
+        extern int g_windowWidth, g_windowHeight;
+        if (g_windowWidth > 0 && g_windowHeight > 0 &&
+            (g_windowWidth != g_PcConfig.windowWidth ||
+             g_windowHeight != g_PcConfig.windowHeight))
+        {
+            SH_LOG("Window size from device surface: %dx%d (config had %dx%d)",
+                   g_windowWidth, g_windowHeight,
+                   g_PcConfig.windowWidth, g_PcConfig.windowHeight);
+            g_PcConfig.windowWidth  = g_windowWidth;
+            g_PcConfig.windowHeight = g_windowHeight;
+        }
+    }
+#endif
+
+    /* Needs the GL context, so it runs here rather than beside the system-RAM
+     * clamp above. Same rule as that one: only ever lowers. */
+    HiresOverride_ClampBudgetToVram();
+
+    {
+        const char* gl_renderer = (const char*)glGetString(GL_RENDERER);
+        const char* gl_vendor   = (const char*)glGetString(GL_VENDOR);
+        const char* gl_version  = (const char*)glGetString(GL_VERSION);
+        SH_LOG("GL Renderer: %s", gl_renderer ? gl_renderer : "(null)");
+        SH_LOG("GL Vendor:   %s", gl_vendor   ? gl_vendor   : "(null)");
+        SH_LOG("GL Version:  %s", gl_version  ? gl_version  : "(null)");
+
+        /* AMD used to get resident_textures forced OFF here, from a 2026-07-21
+         * report of undefined-texture-read corruption in the pool path. That
+         * silently split the user base across two render paths, so an AMD bug
+         * report described a build nobody else was running and the path never
+         * got the exposure it needed to be fixed. Everyone is on the resident
+         * pool now; AMD-specific corruption gets root-caused rather than
+         * routed around. Anyone hitting it can still set resident_textures=0. */
+    }
+
+    /* Apply keyboard/controller bindings + movement/debug options from config
+     * (overrides the PsyCross defaults set inside PsyX_Initialise). Applies the
+     * classic scheme here; Pc_ControlStyleInit re-applies the matching scheme
+     * once the saved camera style is known. */
+    Pc_ApplyActiveControlScheme();
+
+    /* Apply the saved control style + publish the style registry to config.cfg
+     * so the launcher's Control Style dropdown reflects this build. */
+    {
+        extern void Pc_ControlStyleInit(void);
+        Pc_ControlStyleInit();
+    }
+
+    /* Bring the game window to the foreground on launch. SilentHillPC.exe is a
+     * console-subsystem app, so Windows spawns a console window at startup that
+     * grabs focus before this SDL window exists (and, with console off, is then
+     * FreeConsole'd). The launcher's SetForegroundWindow targets the process'
+     * MainWindowHandle, which resolves to that console (or zero), so the game
+     * window never reliably gets focus. Raise our own window here — the
+     * launcher's AllowSetForegroundWindow grant lets this take the foreground. */
+    {
+        extern SDL_Window* g_window;
+        if (g_window)
+        {
+            SDL_RaiseWindow(g_window);
+        }
+    }
+
+    /* Apply refresh rate and vsync from config.
+     * PsyCross defaults to vsync=off; we override via SDL directly.
+     * Exclusive fullscreen only — borderless (fullscreen==2) runs at the
+     * desktop mode, where SDL_SetWindowDisplayMode has no effect. */
+    if (g_PcConfig.refreshRate > 0 && g_PcConfig.fullscreen == 1)
+    {
+        extern SDL_Window* g_window;
+        SDL_DisplayMode mode;
+        if (SDL_GetWindowDisplayMode(g_window, &mode) == 0)
+        {
+            mode.refresh_rate = g_PcConfig.refreshRate;
+            if (SDL_SetWindowDisplayMode(g_window, &mode) == 0)
+                SH_LOG("Display mode set to %d hz", g_PcConfig.refreshRate);
+            else
+                SH_LOG("Failed to set %d hz display mode: %s", g_PcConfig.refreshRate, SDL_GetError());
+        }
+    }
+    /* A direct SDL_GL_SetSwapInterval here is overwritten every frame by
+     * PsyX_BeginScene (which derives the interval from g_cfg_swapInterval), so
+     * apply vsync through that gate instead — same path the in-game PC Options
+     * menu uses, so boot and runtime stay consistent. */
+    PsyX_ApplyVsync(g_PcConfig.vsync);
+    SH_LOG("VSync: %s", g_PcConfig.vsync != 0 ? "on" : "off");
+
+    /* Apply texture-filtering mode from config: 0 = neither, 1 = PSX
+     * dither, 2 = bilinear. Mutually exclusive — bilinear softens
+     * everything while dither keeps the original look but masks the
+     * texture-page seam artifacts and adds the authentic PSX noise. */
+    { extern int g_cfg_textureFilter, g_cfg_anisoLevel; }
+    switch (g_PcConfig.psxDither) {
+    case 1:  g_cfg_psxDither = 1; g_cfg_textureFilter = 0; break;
+    case 2:  g_cfg_psxDither = 0; g_cfg_textureFilter = 1; break;
+    case 3:  g_cfg_psxDither = 0; g_cfg_textureFilter = 2; break;
+    /* 4..7 = anisotropic 2x/4x/8x/16x: one value carries mode AND strength. */
+    case 4:  g_cfg_psxDither = 0; g_cfg_textureFilter = 3; g_cfg_anisoLevel = 2;  break;
+    case 5:  g_cfg_psxDither = 0; g_cfg_textureFilter = 3; g_cfg_anisoLevel = 4;  break;
+    case 6:  g_cfg_psxDither = 0; g_cfg_textureFilter = 3; g_cfg_anisoLevel = 8;  break;
+    case 7:  g_cfg_psxDither = 0; g_cfg_textureFilter = 3; g_cfg_anisoLevel = 16; break;
+    default: g_cfg_psxDither = 0; g_cfg_textureFilter = 0; break;
+    }
+    g_cfg_bilinearFiltering = (g_cfg_textureFilter > 0);
+    /* Menus / 2D-only frames (g_PsxDitherSuppressed) get bilinear if enabled,
+     * independent of the 3D psx_dither mode above. */
+    g_cfg_menuFilter = g_PcConfig.menuFilter ? 1 : 0;
+    g_cfg_disableDpadMovement = 0; /* driven per-frame by gameplay state (game_main.c) so the D-pad still navigates menus */
+    SH_LOG("Filtering: %s%s",
+           g_cfg_psxDither     ? "PSX dither" :
+           g_cfg_textureFilter == 1 ? "bilinear" :
+           g_cfg_textureFilter == 2 ? "trilinear" :
+           g_cfg_textureFilter == 3 ? "anisotropic" : "off",
+           g_cfg_textureFilter >= 3 ? " (see aniso taps in the mode)" : "");
+
+    /* PGXP master gate: PsyCross is compiled with USE_PGXP=1, but the
+     * runtime path is opt-in via config.cfg use_pgxp. When 0, prim emit
+     * writes a_zw=0 and the vertex shader takes the 2D-ortho branch
+     * (PSX-affine look). When 1, GTE captures FP twins and shader does
+     * perspective-correct projection via Projection3D + cache lookups.
+     * (declared in PsyX/PsyX_public.h, defined in PsyX_render.cpp) */
+    g_PsxUsePgxp = g_PcConfig.usePgxp ? 1 : 0;
+    SH_LOG("PGXP: %s", g_PsxUsePgxp ? "ON (perspective-correct, WIP)" : "off (affine)");
+
+    /* [ITEMDEPTH] one-shot item-model depth probe. Diagnostic only — the probe
+     * reads state and never writes rendering state. */
+    {
+        extern int g_PsyX_ItemDepthProbe;
+        g_PsyX_ItemDepthProbe = g_PcConfig.itemDepthProbe ? 1 : 0;
+        if (g_PsyX_ItemDepthProbe)
+            SH_LOG("Item depth probe: ON ([ITEMDEPTH] one-shot dump per item-screen entry)");
+    }
+
+    /* [CHARAPRIM] one-shot character-part submission probe. Diagnostic only —
+     * counts rejects the draw chain already performs, changes none of them. */
+    {
+        extern int g_PcCharaPrimProbe;
+        g_PcCharaPrimProbe = g_PcConfig.charaPrimProbe;
+        if (g_PcCharaPrimProbe)
+            SH_LOG("Chara prim probe: ON for charaId=%d ([CHARAPRIM] one-shot per-model dump)", g_PcCharaPrimProbe);
+    }
+
+    /* PSX GPU parity: reject triangles whose screen bbox exceeds 1023x511
+     * (hardware never rasterized them; PsyX drawing them is the wedge-poly
+     * corruption when the camera sits inside geometry). Console `polysizecull`. */
+    {
+        extern int g_PsxPolySizeCull;
+        g_PsxPolySizeCull = g_PcConfig.psxPolySizeCull ? 1 : 0;
+        SH_LOG("PSX oversize-poly cull: %s", g_PsxPolySizeCull ? "on" : "OFF (wedge polys possible)");
+    }
+
+    /* Full-screen post-process look (color grade / CRT / scanlines / vignette /
+     * grain / sharpen / PSX downsample / cinematic). Runtime-settable; F2 cycles
+     * it in-game (dbg_overlay.c). */
+    g_cfg_postProcess = g_PcConfig.postProcess;
+    SH_LOG("Post-process: mode %d", g_cfg_postProcess);
+
+    /* Tone-map operator on the final image (0=off,1=Reinhard,2=ACES,3=Filmic).
+     * Runtime-settable; F3 cycles it in-game (dbg_overlay.c). */
+    {
+        extern int g_cfg_tonemap;
+        g_cfg_tonemap = g_PcConfig.tonemap;
+        SH_LOG("Tone mapping: mode %d", g_cfg_tonemap);
+    }
+
+    /* Flashlight mode: Classic (PSX per-vertex) / Classic + Shadows (per-pixel,
+     * PSX-calibrated style) / Modern (per-pixel stylized spotlight) / Modern +
+     * Shadows. F4 cycles it; PC Options "Flashlight" row; console `flmode`.
+     * The apply helper derives the per-pixel/style/shadow PsyX globals and the
+     * per-style intensity/size defaults. */
+    {
+        Pc_FlashlightModeApply(g_PcConfig.flashlightMode, 0);
+        SH_LOG("Flashlight mode: %s", Pc_FlashlightModeLabel(g_PcConfig.flashlightMode));
+    }
+
+    /* Select the backend before applying backend-specific controls. */
+    {
+        extern void PsyX_SPUAL_ConfigureOutput(int backend, int mode, int rate, int bitPerfect);
+        extern int PsyX_SPUAL_ConfigureRenderer(int renderer, int highPrecisionClip,
+                                                int modernClip, int modernDither);
+        if (PcAudioConfig_UsesSoftwareSpu())
+            PsyX_SPUAL_ConfigureOutput(g_PcAudioConfig.backend, g_PcAudioConfig.mode,
+                                       g_PcAudioConfig.rate, g_PcAudioConfig.bitPerfect);
+
+        if (!PsyX_SPUAL_ConfigureRenderer(g_PcAudioConfig.renderer,
+                                         g_PcAudioConfig.highPrecisionClip,
+                                         g_PcAudioConfig.modernClip,
+                                         g_PcAudioConfig.modernDither))
+            SH_ERR("Invalid SPU renderer configuration; audio startup will fail");
+
+    {
+        /* A television scans the framebuffer out to 4:3 whatever its line
+         * count, which is the picture these games were composed on. raw
+         * keeps the framebuffer at the `par` pixel aspect instead. */
+        extern int g_PsxAspectRaw;
+        g_PsxAspectRaw = g_PcConfig.aspectRaw ? 1 : 0;
+        {
+            /* Unset (0) means no trim, not a zero-width picture. */
+            extern float g_PsxCrtAspectTrim;
+            if (g_PcConfig.crtAspectTrim > 0.0f)
+                g_PsxCrtAspectTrim = g_PcConfig.crtAspectTrim;
+        }
+        SH_LOG("Display aspect: %s (trim %.3f, hfov %.3f, vfov %.3f, par %.4f)",
+               g_PsxAspectRaw ? "raw (framebuffer par)" : "crt (stretched to 4:3)",
+               g_PcConfig.crtAspectTrim, g_PcConfig.worldHScale,
+               g_PcConfig.worldVScale, g_PcConfig.pixelAspect);
+    }
+
+        {
+            /* Spatial output: the software SPU keeps its exact synthesis and
+             * reverb, but its per-voice taps are placed by OpenAL instead of
+             * being downmixed to stereo, so surround layouts finally get the
+             * accurate reverb. Ignored by the legacy backend. */
+            extern void PsyX_SPUAL_ConfigureSpatial(int enable, int speakers);
+            PsyX_SPUAL_ConfigureSpatial(
+                (PcAudioConfig_UsesSoftwareSpu() && g_PcAudioConfig.spatial) ? 1 : 0,
+                g_PcConfig.audioOutput);
+        }
+        if (PcAudioConfig_UsesSoftwareSpu()) {
+            SH_LOG("Software SPU output: renderer=%d backend=%d mode=%d rate=%d bit-perfect=%d spatial=%d",
+                   g_PcAudioConfig.renderer, g_PcAudioConfig.backend, g_PcAudioConfig.mode,
+                   g_PcAudioConfig.rate, g_PcAudioConfig.bitPerfect, g_PcAudioConfig.spatial);
+        } else {
+            extern void PsyX_SPUAL_SetAdsrEnabled(int on);
+            extern void PsyX_SPUAL_SetReverbDepthScale(float scale);
+            extern void PsyX_SPUAL_SetOutputMode(int mode);
+            static const char* const kSpeakerNames[] = { "auto", "stereo", "quad", "5.1", "7.1", "hrtf" };
+            PsyX_SPUAL_SetAdsrEnabled(g_PcConfig.adsr ? 1 : 0);
+            if (g_PcConfig.reverbScale > 0.0f)
+                PsyX_SPUAL_SetReverbDepthScale(g_PcConfig.reverbScale);
+            PsyX_SPUAL_SetOutputMode(g_PcConfig.audioOutput);
+            SH_LOG("Legacy OpenAL SPU: ADSR %s, reverb scale %.2f, speakers %s",
+                   g_PcConfig.adsr ? "ON" : "off", g_PcConfig.reverbScale,
+                   kSpeakerNames[g_PcConfig.audioOutput]);
+        }
+    }
+
+    /* Effect intensities (in-game [ lowers / ] raises, \ switches which enabled
+     * effect; console flintensity / postintensity / tmintensity). */
+    {
+        extern float g_PsyX_FlashlightIntensity, g_cfg_postProcessIntensity, g_cfg_tonemapIntensity;
+        extern float g_PsyX_FlashlightSize;
+        extern float g_PsyX_FlashlightIntensityFps, g_PsyX_FlashlightSizeFps;
+        g_PsyX_FlashlightIntensity = g_PcConfig.flashlightIntensity;
+        g_cfg_postProcessIntensity = g_PcConfig.postProcessIntensity;
+        g_cfg_tonemapIntensity     = g_PcConfig.tonemapIntensity;
+        /* Without this fog_strength only took effect once the options slider was
+         * touched, because the slider writes g_PsyX_FogStrength directly and
+         * nothing pushed the parsed config value at boot. */
+        {
+            extern float g_PsyX_FogStrength;
+            g_PsyX_FogStrength = g_PcConfig.fogStrength;
+        }
+        {
+            extern float g_cfg_brightness, g_cfg_contrast, g_cfg_saturation;
+            g_cfg_brightness = g_PcConfig.brightness;
+            g_cfg_contrast   = g_PcConfig.contrast;
+            g_cfg_saturation = g_PcConfig.saturation;
+        }
+        g_PsyX_FlashlightSize      = g_PcConfig.flashlightSize;
+        {
+            /* Shadow-map resolution. GR_EnsureShadowTarget clamps and rebuilds
+             * the target, so this is safe to set before any GL work. */
+            extern int g_PsyX_ShadowMapSize;
+            g_PsyX_ShadowMapSize = g_PcConfig.shadowMapSize;
+        }
+        g_PsyX_FlashlightIntensityFps = g_PcConfig.flashlightIntensityFps;
+        g_PsyX_FlashlightSizeFps      = g_PcConfig.flashlightSizeFps;
+        SH_LOG("Effect intensity: flashlight %.2f, post %.2f, tonemap %.2f; flashlight size %.2f",
+               g_PsyX_FlashlightIntensity, g_cfg_postProcessIntensity, g_cfg_tonemapIntensity, g_PsyX_FlashlightSize);
+    }
+
+    /* FMV/voice (XA) master volume (options-menu slider + `xavolume` console).
+     * Set the global the XA player multiplies into the OpenAL source gain. */
+    {
+        extern float g_PcXaVolume;
+        extern float g_PcFmvVolume;
+        extern int   g_PcFmvPsxVolume;
+        g_PcXaVolume = g_PcConfig.xaVolume;
+        g_PcFmvVolume = g_PcConfig.fmvVolume;
+        g_PcFmvPsxVolume = g_PcConfig.fmvPsxVolume;
+        SH_LOG("XA voice volume: %.2f, FMV movie volume: %.2f (psx_vol=%d)", g_PcXaVolume, g_PcFmvVolume, g_PcFmvPsxVolume);
+    }
+
+    /* Initialize PSY-Q subsystems via PsyCross */
+    SH_LOG("Initializing PSY-Q subsystems...");
+    ResetCallback();
+    SpuInit();
+
+    /* Initialize CD filesystem - try loading from image or directory */
+    SH_LOG("Initializing CD filesystem...");
+    {
+        /* Resolve the disc (US/PAL), select the region's file table, and open it. */
+        const char* cdImagePath = PcPort_GetGameDiscPath();
+
+        if (cdImagePath[0]) {
+            SH_LOG("CD image found, initializing CDFS...");
+            PsyX_CDFS_Init(cdImagePath, 0, 0);
+        } else {
+            /* Every asset read from here on fails, and the first one takes the
+             * process down. On Windows the crash handler at least pops a box;
+             * on Linux/macOS it died silently with nothing on screen and the
+             * reason only in a log the user has no reason to look at (PR #80).
+             * SDL's message box is the one dialog that works the same on all
+             * three, and SDL is already up by now. Say it, then leave
+             * cleanly rather than crashing further in. */
+            char msg[768];
+            SH_WARN("Game will not be able to load assets without a disc image.");
+#if defined(__ANDROID__)
+            /* Name the drop dir first: it is the only one of the two a file
+             * manager can still open from Android 11 on. */
+            {
+                const char* drop = getenv("SH_DISC_DROP_DIR");
+
+                snprintf(msg, sizeof(msg),
+                         "No Silent Hill disc image was found.\n\n"
+                         "Copy your own disc rip (a .bin file) into:\n  %s\n\n"
+                         "USA, PAL and NTSC-J discs all work, and the file can keep\n"
+                         "whatever name it has. No .cue file is needed.\n\n"
+                         "That folder is reachable from any file manager. This also\n"
+                         "works if you can reach it:\n  %s",
+                         (drop != NULL && drop[0] != '\0') ? drop : PcPort_GetGameDataPath(),
+                         PcPort_GetGameDataPath());
+            }
+#elif defined(SH_IOS)
+            /* Name it the way the user sees it in Files.app, not as a
+             * filesystem path — the container path is a UUID they cannot type
+             * and would never recognise. */
+            snprintf(msg, sizeof(msg),
+                     "No Silent Hill disc image was found.\n\n"
+                     "Open the Files app and go to:\n"
+                     "  On My iPhone > Silent Hill\n\n"
+                     "Copy your own disc rip (a .bin file) into the gamedata\n"
+                     "folder there, or just drop it in that folder directly.\n\n"
+                     "USA, PAL and NTSC-J discs all work, and the file can keep\n"
+                     "whatever name it has. No .cue file is needed.");
+#else
+            snprintf(msg, sizeof(msg),
+                     "No Silent Hill disc image was found.\n\n"
+                     "Put one in:\n  %s\n\n"
+                     "for example \"Silent Hill (USA).bin\". USA, PAL and NTSC-J\n"
+                     "discs all work. A .bin/.cue rip of your own disc is what\n"
+                     "this expects; the launcher can extract its contents for you.",
+                     PcPort_GetGameDataPath());
+#endif
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
+                                     "Silent Hill - no disc image found", msg, NULL);
+            PsyX_Shutdown();
+            return 1;
+        }
+    }
+
+    /* Region-specific data tweaks now that g_GameRegion is known (e.g. PAL's
+     * Grey-Child -> Mumbler model swap, PAL font layout/VRAM home). */
+    { extern void CharaData_ApplyRegionPatches(void); CharaData_ApplyRegionPatches(); }
+    { extern void Font_ApplyRegionPatches(void); Font_ApplyRegionPatches(); }
+    { extern void Pc_LangInit(void); Pc_LangInit(); }
+
+    /* Play-as character (config player_character): retargets Harry's
+     * CHARA_FILE_INFOS row before the boot-time WorldGfx_HarryCharaLoad. */
+    { extern void Pc_PlayAs_Init(void); Pc_PlayAs_Init(); }
+
+    CdInit();
+
+    /* Initialize GPU */
+    SH_LOG("Initializing GPU...");
+    ResetGraph(0);
+    SetGraphDebug(0);
+
+    /* Initialize file system queue */
+    SH_LOG("Initializing filesystem queue...");
+    Fs_QueueInitialize();
+
+    /* Randomizer: forces the start map (map2_s04) and turns the global chara pool
+     * on, so it must run before MapRegistry_Init reads g_PcConfig.mapName AND
+     * before Pc_CharaGlobal_Open, which early-outs on globalCharaPool == 0. */
+    {
+        extern void Pc_Rando_Init(void);
+        Pc_Rando_Init();
+    }
+
+    /* Global chara pool: open chara_global.dll (AI update funcs for every
+     * portable monster) before the first MapRegistry_Load so its backfill
+     * hook can use it. Asset loading happens later, on map load. */
+    {
+        extern void Pc_CharaGlobal_Open(void);
+        Pc_CharaGlobal_Open();
+    }
+
+    /* Initialize map registry — sets g_pMapOverlayHeader based on config.cfg.
+     * Must happen after PcPort_InitCharaAnimInfo (anim stubs) but before MainLoop. */
+    SH_LOG("Initializing map registry...");
+    MapRegistry_Init();
+    SH_LOG("Active map: %s", g_PcConfig.mapName);
+
+    /* Discord Rich Presence: opens the Discord IPC pipe lazily on the first
+     * per-frame update (Pc_Discord_Update, pumped from DbgOverlay_Render), so
+     * this only captures the session-start time + resolves the app id. */
+    Pc_Discord_Init();
+
+    /* RetroAchievements: logs in with the launcher-stored token, hashes the
+     * disc the port is actually running, and requests that game's set. Inert
+     * unless enabled and signed in. */
+    { extern void Pc_Ra_Init(void); Pc_Ra_Init(); }
+
+    /* Gameplay plugins (plugins/*.dll). Self-gated on config enable_plugins,
+     * which defaults OFF -- the scan never runs unless the user opted in. */
+    { extern void Pc_Plugins_Init(void); Pc_Plugins_Init(); }
+
+    SH_LOG("All subsystems initialized. Entering MainLoop...");
+
+    /* The graphic-content warning ("There are violent and disturbing
+     * images in this game") used to fire here, but it ran before
+     * MainLoop's GsInitVcount/InitGeom/SD_Init so subsequent boot
+     * states (Konami, KCET) saw a noticeable load gap. Moved into
+     * MainLoop's startup phase right before the game-state loop —
+     * see src/bodyprog/sys/game_main.c near the SD_Init block. */
+
+    /*
+     * On PSX, main() loads BODYPROG.BIN and B_KONAMI.BIN overlays,
+     * then calls MainLoop() which is in BODYPROG.
+     *
+     * On PC, everything is statically linked, so we call MainLoop() directly.
+     */
+    MainLoop();
+
+    /* Cleanup */
+    SH_DBG("[SH] MainLoop exited normally. Shutting down...");
+    { extern void Pc_Ra_Shutdown(void); Pc_Ra_Shutdown(); }
+    { extern void Pc_Plugins_Shutdown(void); Pc_Plugins_Shutdown(); }
+    Pc_Discord_Shutdown();
+    PsyX_Shutdown();
+
+    return 0;
+}

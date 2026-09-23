@@ -1,0 +1,102 @@
+#include "bodyprog/bodyprog.h"
+#include "bodyprog/math/math.h"
+#include "main/rng.h"
+#include "maps/characters/cat.h"
+#ifdef SH_PC_PORT
+#include "sh_log.h"
+#endif
+
+#define catProps cat->properties.cat
+
+void Cat_Update(s_SubCharacter* cat, s_AnmHeader* anmHdr, GsCOORDINATE2* boneCoords) // 0x800D6D40
+{
+    s_AnimInfo* animInfo;
+    bool        cond;
+
+    if (cat->model.controlState == CatControl_None)
+    {
+        cat->model.controlState     = CatControl_1;
+        cat->model.anim.status      = ANIM_STATUS(CatAnim_IdleToJump, true);
+        cat->model.anim.time        = Q12(7.0f);
+        cat->model.anim.alpha       = Q12(0.0f);
+        cat->model.stateStep        = 0;
+        cat->model.anim.keyframeIdx = 7;
+        cat->position.vy            = Q12(0.0f);
+        catProps.field_E8           = 0;
+    }
+
+    if (cat->model.stateStep == 0)
+    {
+        if (cat->model.controlState == CatControl_2)
+        {
+            cat->model.anim.status      = ANIM_STATUS(CatAnim_Jump, true);
+            cat->model.anim.time        = Q12(7.0f);
+            cat->model.anim.keyframeIdx = 7;
+        }
+        else if (cat->model.controlState == CatControl_3)
+        {
+            cat->model.anim.status      = ANIM_STATUS(CatAnim_Run, true);
+            cat->model.anim.time        = Q12(23.0f);
+            cat->model.anim.keyframeIdx = 23;
+        }
+
+        cat->model.stateStep++;
+    }
+
+    Math_MatrixTransform(&cat->position, &cat->rotation, boneCoords);
+
+    animInfo = &CAT_ANIM_INFOS[cat->model.anim.status];
+#ifdef SH_PC_PORT
+    /* Invisible-cat diagnosis: one line per state/anim change names which
+     * link fails — update not called (no lines at all), anim not advancing
+     * (kf frozen), or position wrong (pos far from the locker room). */
+    {
+        static s32 s_prevCs = -1, s_prevSs = -1, s_prevSt = -1, s_prevKf = -1;
+        if ((s32)cat->model.controlState != s_prevCs || (s32)cat->model.stateStep != s_prevSs ||
+            (s32)cat->model.anim.status != s_prevSt || (s32)cat->model.anim.keyframeIdx != s_prevKf)
+        {
+            s_prevCs = cat->model.controlState;
+            s_prevSs = cat->model.stateStep;
+            s_prevSt = cat->model.anim.status;
+            s_prevKf = cat->model.anim.keyframeIdx;
+            SH_DBG("[CAT] cs=%d ss=%d anim=%d kf=%d time=%d pos=(%d,%d,%d) fn=%p",
+                   s_prevCs, s_prevSs, s_prevSt, s_prevKf, (int)cat->model.anim.time,
+                   (int)cat->position.vx, (int)cat->position.vy, (int)cat->position.vz,
+                   (void*)animInfo->playbackFunc);
+        }
+    }
+#endif
+#ifdef SH_PC_PORT
+    /* Guard NULL playbackFunc -- some CAT_ANIM_INFOS entries have unmerged PSX
+     * function pointers on PC (same as CHERYL_ANIM_INFOS, cheryl.c). The merge
+     * added the cat AI without this guard, so calling through a NULL pointer
+     * crashed the cat at the school (map1_s01). */
+    if (animInfo->playbackFunc != NULL)
+#endif
+    animInfo->playbackFunc(&cat->model, anmHdr, boneCoords, animInfo);
+
+    cond = false;
+    if (cat->model.anim.status == ANIM_STATUS(1, true))
+    {
+        // TODO: Change `N - X < Yu` into range checks.
+        if ((catProps.field_E8 == 0 && (FP_FROM(cat->model.anim.time, Q12_SHIFT) - 20) < 3u) ||
+            (catProps.field_E8 != 0 && (FP_FROM(cat->model.anim.time, Q12_SHIFT) - 25) < 3u))
+        {
+            cond = true;
+        }
+    }
+    else
+    {
+        if ((catProps.field_E8 == 0 && (FP_FROM(cat->model.anim.time, Q12_SHIFT) - 29) < 3u) ||
+            (catProps.field_E8 != 0 && (FP_FROM(cat->model.anim.time, Q12_SHIFT) - 36) < 3u))
+        {
+            cond = true;
+        }
+    }
+
+    if (cond)
+    {
+        Sfx_WithPitchPlay(Sfx_CatMeow, &cat->position, Q8(0.5f), Rng_GenerateUInt(-7, 8));
+        catProps.field_E8 ^= 1;
+    }
+}

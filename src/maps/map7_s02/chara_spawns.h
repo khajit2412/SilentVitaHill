@@ -1,0 +1,20 @@
+    // Chara_Stalker
+    {
+      { Q12(178.3f), Chara_None, Q8_ANGLE(270.0f), 3, GameDifficulty_Easy, Q12(-20.0f) },
+      { Q12(-60.8f), Chara_None, Q8_ANGLE(180.0f), 3, GameDifficulty_Easy, Q12(-97.8f) },
+      { Q12(-58.9f), Chara_None, Q8_ANGLE(270.0f), 3, GameDifficulty_Easy, Q12(-100.2f) },
+      { Q12(-59.8f), Chara_None, Q8_ANGLE(180.0f), 0, GameDifficulty_Easy, Q12(-22.6f) },
+      { Q12(-100.5f), Chara_None, Q8_ANGLE(180.0f), 0, GameDifficulty_Easy, Q12(-145.5f) },
+      { Q12(-102.9f), Chara_None, Q8_ANGLE(180.0f), 0, GameDifficulty_Easy, Q12(-135.9f) },
+      { Q12(-181.0f), Chara_None, Q8_ANGLE(270.0f), 3, GameDifficulty_Easy, Q12(-57.7f) },
+      { Q12(-179.3f), Chara_None, Q8_ANGLE(45.0f), 3, GameDifficulty_Easy, Q12(-62.4f) },
+      { Q12(-177.2f), Chara_None, Q8_ANGLE(180.0f), 3, GameDifficulty_Easy, Q12(-58.5f) },
+      { Q12(-181.0f), Chara_None, Q8_ANGLE(180.0f), 0, GameDifficulty_Easy, Q12(-54.3f) },
+      { Q12(-61.1f), Chara_None, Q8_ANGLE(90.0f), 0, GameDifficulty_Easy, Q12(-23.6f) },
+      { Q12(-64.6f), Chara_None, Q8_ANGLE(90.0f), 0, GameDifficulty_Easy, Q12(-27.9f) },
+      { Q12(177.1f), Chara_None, Q8_ANGLE(90.0f), 0, GameDifficulty_Easy, Q12(-18.7f) },
+      { Q12(186.9f), Chara_None, Q8_ANGLE(0.0f), 0, GameDifficulty_Easy, Q12(-20.9f) },
+      { Q12(-61.3f), Chara_None, Q8_ANGLE(180.0f), 0, GameDifficulty_Easy, Q12(-91.4f) },
+    },
+    {
+    },

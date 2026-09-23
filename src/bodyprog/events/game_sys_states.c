@@ -1,0 +1,1717 @@
+#include "game.h"
+
+#ifdef SH_PC_PORT
+#include "sh_log.h"
+#ifdef SH_PC_PORT
+#include <time.h>
+/* Transition timing probe; see the [TXNTIME] log in SysState_LoadArea_Update. */
+int g_PcTxnStartMs = 0;
+int g_PcTxnFadeEndMs = 0;
+/* Door out-fade rate, 1/seconds in Q12. Q12(1.6f) ~= 0.63 s. Console TXNFADE. */
+s32 g_PcTxnFadeTimestep = Q12(1.6f);
+#endif
+#include <stdio.h>
+#endif
+
+#include <psyq/libetc.h>
+#include <psyq/libpad.h>
+#include <psyq/strings.h>
+
+#include "bodyprog/bodyprog.h"
+#ifdef SH_PC_PORT
+extern s_WorldEnvWork g_WorldEnvWork;
+#endif
+#include "bodyprog/events/bodyprog_data_800A99B4.h"
+#include "bodyprog/events/events_main.h"
+#include "bodyprog/events/npc_main.h"
+#include "bodyprog/events/radio.h"
+#include "bodyprog/demo.h"
+#include "bodyprog/gfx/map_effects.h"
+#include "bodyprog/item_screens.h"
+#include "bodyprog/math/math.h"
+#include "bodyprog/memcard.h"
+#include "bodyprog/screen/screen_data.h"
+#include "bodyprog/screen/screen_draw.h"
+#include "bodyprog/text/text_draw.h"
+#include "bodyprog/player.h"
+#include "bodyprog/view/vw_main.h"
+#include "bodyprog/ranking.h"
+#include "bodyprog/sound/sound_system.h"
+#include "main/fsqueue.h"
+#include "main/rng.h"
+#ifdef SH_PC_PORT
+#include <stdio.h>
+extern void vcGetNowCamPos(VECTOR3* cam_pos);
+extern void DebugCamera_Update(void);
+#endif
+
+#ifndef PAD_HACK_IGNORE
+    s8  __pad_bss_800BCD81[3];
+    s32 __pad_bss_800BCD88[2];
+    s32 __pad_bss_800BCD94[5];
+    s32 __pad_bss_800BCDD0;
+    s8  __pad_bss_800BCDD5[3];
+#endif
+
+// ========================================
+// STATIC VARIABLES
+// ========================================
+
+static void (*g_SysStateFuncs[])(void) = {
+    SysState_Gameplay_Update,
+    SysState_OptionsMenu_Update,
+    SysState_StatusMenu_Update,
+    SysState_MapScreen_Update,
+    SysState_Fmv_Update,
+    SysState_LoadArea_Update,
+    SysState_LoadArea_Update,
+    SysState_ReadMessage_Update,
+    SysState_SaveMenu_Update,
+    SysState_SaveMenu_Update,
+    SysState_EventCallback_Update,
+    SysState_EventSetFlag_Update,
+    SysState_EventPlaySound_Update,
+    SysState_GameOver_Update,
+    SysState_GamePaused_Update
+};
+
+/** Used to store the previous delta time state of the delta timer. There are some instances where 2D backgrounds
+ * are drawn using `g_DeltaTimeRaw` while `g_DeltaTime` is stopped.
+ */
+static s32 g_DeltaTimeCpy;
+
+// ========================================
+// GLOBAL VARIABLES
+// ========================================
+
+/* MUST be [5] to match g_ItemTriggerItemIds[5] and the registration loops.
+ * The previous unsized tentative definition compiled to ONE element, so
+ * registering 2+ item triggers (or the 5-slot clear loop) wrote s_EventData
+ * pointers/NULLs over the next BSS globals: D_800BCDA8 and D_800BCDB0 (the
+ * room-transition spawn point). That was both the historical "D_800BCDB0
+ * gets zeroed" mystery patched with the backup/restore hack below, and the
+ * otherworld-school item-door crash (spawn target = low half of a DLL
+ * pointer, 0xEC444444). */
+s_EventData* g_ItemTriggerEvents[5];
+s_800BCDA8   D_800BCDA8[2];
+s_MapPoint2d D_800BCDB0;
+s32          g_ItemTriggerItemIds[5];
+u8           D_800BCDD4;
+s_EventData* g_MapEventData;
+
+#ifdef SH_PC_PORT
+/* Backup of D_800BCDB0 — the original gets zeroed between SysState_LoadArea_Update
+ * and AreaLoad_UpdatePlayerPosition (unknown cause, possibly BSS overlap or bzero).
+ * We save it right after assignment and restore before use. */
+static s_MapPoint2d s_PC_D_800BCDB0_Backup;
+static int s_PC_D_800BCDB0_Saved = 0;
+#endif
+
+void GameState_InGame_Update(void) // 0x80038BD4
+{
+    s_SubCharacter* player;
+
+    Demo_DemoRandSeedBackup();
+
+    switch (g_GameWork.gameStateSteps[0])
+    {
+        case 0:
+            ScreenFade_Start(true, true, false);
+            g_ScreenFadeTimestep            = Q12(3.0f);
+            g_GameWork.gameStateSteps[0] = 1;
+
+        case 1:
+            DrawSync(SyncMode_Wait);
+            func_80037154();
+            Game_MapRoomIdxUpdate();
+            func_800892A4(1);
+
+#ifdef SH_PC_PORT
+            /* Snap Harry's Y to the actual ground height at his current position.
+             * Chara_CollisionSet (used by door triggers and spawn points) zeros Y,
+             * and Game_PlayerHeightUpdate (called in GameBoot_InGameInit/NpcInit)
+             * may run before Harry is at his final spawn position. This one-shot
+             * call ensures Y and positionY are in sync with collision data at
+             * the moment InGame actually starts, preventing the first movement tick
+             * from wrongly snapping Harry via a stale positionY=0. */
+            {
+                s_CollisionSurface snapColl;
+                s_SubCharacter* snapHp = &g_SysWork.playerWork.player;
+                Collision_SurfaceGet(&snapColl, snapHp->position.vx, snapHp->position.vz);
+                if (snapColl.groundHeight != Q12(8.0f)) {
+                    snapHp->position.vy = snapColl.groundHeight;
+                    snapHp->properties.player.groundHeight = snapColl.groundHeight;
+                } else {
+                }
+            }
+#endif
+
+            g_IntervalVBlanks = 2;
+            g_GameWork.gameStateSteps[0]++;
+            g_SysWork.bgmStatusFlags |= BgmStatusFlag_6;
+            break;
+    }
+
+    if (g_SysWork.sysState != SysState_Gameplay && g_SysWork.playerWork.player.health <= Q12(0.0f))
+    {
+        SysWork_StateSetNext(SysState_Gameplay);
+    }
+
+    if (g_DeltaTime != Q12(0.0f))
+    {
+        g_DeltaTimeCpy = g_DeltaTime;
+    }
+    else
+    {
+        g_DeltaTimeCpy = g_DeltaTimeRaw;
+    }
+
+    if (g_SysWork.sysState == SysState_Gameplay)
+    {
+        g_SysWork.isMgsStringSet = false;
+        g_SysStateFuncs[SysState_Gameplay]();
+    }
+    else
+    {
+#ifdef SH_PC_PORT
+        /* On PSX, events run at a different timing cadence where g_DeltaTime=0
+         * during EventCallFunc is compensated by how often events fire.
+         * On PC, this causes cutscene timers to never advance. Use the raw
+         * delta time so timer-based cutscene steps can progress.
+         *
+         * EXCEPT SysState_ReadMessage: examining a memo (or anything in the
+         * environment) pauses the world on PSX (see the note in
+         * SysState_ReadMessage_Update). That handler only UNFREEZES -- restoring
+         * g_DeltaTime -- when no enemy is alive, and otherwise relies on
+         * g_DeltaTime already being 0 to keep monsters frozen while an enemy lives.
+         * The blanket raw override broke that, so monsters kept moving during a
+         * memo. Hand ReadMessage 0 like PSX and let its own handler decide.
+         *
+         * Handing it 0 is not enough on its own for a player-initiated examine.
+         * SysState_ReadMessage_Update restores g_DeltaTimeCpy whenever the event
+         * carries EventParamUnkState_0 (101 of the 513 ReadMessage map events do,
+         * inconsistently -- in map0_s01 the pinball machine has it clear and the
+         * radio has it set) or when no enemy is alive, so most flavor-text
+         * objects never held the frame. Retail holds a frozen frame behind every
+         * examine, so neutralise the restore at its source rather than editing
+         * the PSX handler. Safe to clobber: g_DeltaTimeCpy is file-static, its
+         * only readers on a ReadMessage frame are those two restores, and it is
+         * rebuilt from the frame clock every tick a few lines above. Zero is
+         * framerate-independent by construction, and the message box runs on
+         * g_DeltaTimeRaw (map_msg_display.c), so roll-out, page timers and
+         * dismissal are unaffected.
+         *
+         * Button-activated events ONLY. map1_s04, map2_s03 and map4_s00 each
+         * carry a TriggerType_None ReadMessage (eventParam 15, flags_8_13 = 1,
+         * activationType None) with no event-flag gates, which Event_Update
+         * re-arms every frame -- those maps sit in this state permanently and are
+         * script-driven, not examines, so they must keep their PSX clock. */
+        if (g_SysWork.sysState == SysState_ReadMessage)
+        {
+            g_DeltaTime = Q12(0.0f);
+
+            if (g_MapEventData != NULL && g_MapEventData->activationType == TriggerActivationType_Button)
+            {
+                g_DeltaTimeCpy = Q12(0.0f);
+            }
+        }
+        else
+        {
+            g_DeltaTime = g_DeltaTimeRaw;
+        }
+#else
+        g_DeltaTime = Q12(0.0f);
+#endif
+#ifdef SH_PC_PORT
+        {
+            int _ss = (int)g_SysWork.sysState;
+            int _ssMax = (int)(sizeof(g_SysStateFuncs) / sizeof(g_SysStateFuncs[0]));
+            static int _ssPrev = -1;
+            if (_ss != _ssPrev) {  /* log on state change, not per-frame */
+                SH_DBG("[SYSSTATE] dispatch sysState=%d mapEventData=%p", _ss, (void*)g_MapEventData);
+                _ssPrev = _ss;
+            }
+            if (_ss < 0 || _ss >= _ssMax) {
+                SH_DBG("[SYSSTATE] OOB sysState=%d max=%d — reset to Gameplay", _ss, _ssMax);
+                g_SysWork.sysState = SysState_Gameplay;
+            } else {
+                g_SysStateFuncs[_ss]();
+            }
+        }
+#else
+        g_SysStateFuncs[g_SysWork.sysState]();
+#endif
+
+        if (g_SysWork.sysState == SysState_Gameplay)
+        {
+            Event_Update(true);
+
+            if (g_MapEventSysState != SysState_Invalid)
+            {
+#ifdef SH_PC_PORT
+                /* Second door path -- see the transition out-fade note in
+                 * SysState_Gameplay_Update. SysWork_StateSetNext sets sysState
+                 * immediately, so this site and that one are mutually exclusive
+                 * halves of the same transition, not a primary plus a fallback. */
+                if (g_MapEventSysState == SysState_LoadRoom ||
+                    g_MapEventSysState == SysState_LoadOverlay)
+                {
+                    extern int g_PsxFeedbackStoreAllowed;
+                    g_PsxFeedbackStoreAllowed = 2;
+                }
+#endif
+                SysWork_StateSetNext(g_MapEventSysState);
+            }
+        }
+    }
+    Demo_DemoRandSeedRestore();
+
+    D_800A9A0C = ScreenFade_IsFinished() && Fs_QueueChunksLoad();
+
+    if (!(g_SysWork.bgmStatusFlags & BgmStatusFlag_Pause) && g_MapOverlayHdr.updateWorldObjects != NULL)
+    {
+        g_MapOverlayHdr.updateWorldObjects();
+    }
+
+    Screen_CutsceneCameraStateUpdate();
+#ifdef SH_PC_PORT
+    { extern void Pc_CrosshairDraw(void); Pc_CrosshairDraw(); }
+#endif
+    Bgm_TrackUpdate(false);
+    Demo_DemoRandSeedRestore();
+    Demo_DemoRandSeedRestore();
+
+    if (!(g_SysWork.bgmStatusFlags & BgmStatusFlag_Pause))
+    {
+        World_NearbyPlayerCollisionTriggersGet();
+        vcMoveAndSetCamera(false, false, false, false, false, false, false, false);
+
+#ifdef SH_PC_PORT
+        /* Original camera system (vcMoveAndSetCamera above) uses camera road
+         * data from the map overlay to position fixed-angle cameras like the
+         * PSX game. The fallback third-person chase cam was a placeholder
+         * before the road system worked. Now removed — original cameras active.
+         * Debug camera (numpad *) still works independently. */
+        /* Alternate cameras (TPS/OTS/FPS, and the numpad free cam) replace the
+         * view matrix that vcMoveAndSetCamera just published, so they MUST run
+         * before any map hook that bakes screen coordinates. func_44 does exactly
+         * that: map4_s03's TV bank pulls GsWSMATRIX through
+         * Vw_WorldScreenMatrixAtPositionGet and RotTransPers's the screen quads on
+         * the spot, so with the camera applied afterwards the screens kept the
+         * classic camera's projection and stayed glued to the view while the rest
+         * of the room orbited. (Was below func_44; also the reason the free cam
+         * never moved those effects.) */
+        {
+            extern void DebugCamera_Update(void);
+            DebugCamera_Update();
+        }
+#endif
+
+        if (g_MapOverlayHdr.func_44 != NULL)
+        {
+            g_MapOverlayHdr.func_44();
+        }
+
+        Demo_DemoRandSeedRestore();
+
+        player = &g_SysWork.playerWork.player;
+        Player_Update(player, FS_BUFFER_0, g_SysWork.playerBoneCoords);
+
+        Demo_DemoRandSeedRestore();
+        Gfx_FlashlightUpdate();
+
+        if (g_SavegamePtr->mapIdx != MapIdx_MAP7_S03)
+        {
+            g_MapOverlayHdr.particlesUpdate(0, g_SavegamePtr->mapIdx, 1);
+        }
+
+        Demo_DemoRandSeedRestore();
+
+        /* NOTE: a per-frame `flags |= AnimFlag_Visible` force-set used to live
+         * here (early-port band-aid for Harry staying invisible after
+         * cutscenes; the real cause was the merge-era selector mis-mapping
+         * fixed in world_draw.c). It overrode every legitimate cutscene hide —
+         * e.g. the intro's LookAtDeadBody shot clears AnimFlag_Visible so
+         * Harry doesn't block the camera, and PC showed his face anyway. */
+
+        if (player->model.anim.flags & AnimFlag_Visible)
+        {
+#ifdef SH_PC_PORT
+            /* NOTE: a per-frame func_800453E8(skel, true) force-show used to
+             * live here (merge-era band-aid for Harry turning invisible
+             * after cutscenes). The actual root was the merge mis-mapping
+             * MODEL_BONE_IDX_0_GET -> IDX_1_GET in the world_draw.c mesh
+             * variant selectors, which killed every WorldGfx_HeldItemAttach
+             * show/hide. With that fixed, the force-show only did harm:
+             * it re-showed ALL of Harry's hidden weapon-hand variant meshes
+             * every frame (the "duplicate hands inside his hand" report). */
+
+            /* Reset bone-coord flg values so the matrix hierarchy gets
+             * fully recomputed this frame. Stale cached workm matrices
+             * cause Harry's model to alternate-frame shrink/collapse. */
+            {
+                int _bi;
+                for (_bi = 0; _bi < HarryBone_Count; _bi++) {
+                    g_SysWork.playerBoneCoords[_bi].flg = 0;
+                }
+            }
+            /* Harry now renders WITH fog, matching PSX (he previously
+             * rendered unfogged via a temporary isFogEnabled=0 wrap here).
+             * The corruption that wrap hid was the s16 per-vertex depth
+             * passing the fogRamp range test when a GTE SZ >= 32768 read
+             * back negative — fixed at the lookup itself (PC_FOG_VTX_RAMP
+             * in bodyprog_80055028.c), so the full fog+lighting pipeline
+             * is safe for characters. */
+            func_8003DA9C(Chara_Harry, g_SysWork.playerBoneCoords, 1, g_SysWork.playerWork.player.timer_C6, 0);
+#else
+            func_8003DA9C(Chara_Harry, g_SysWork.playerBoneCoords, 1, g_SysWork.playerWork.player.timer_C6, 0);
+#endif
+            Chara_Flag8Clear(&g_SysWork.playerWork.player);
+            Player_CombatUpdate(&g_SysWork.playerWork, g_SysWork.playerBoneCoords);
+            func_8008A3AC(&g_SysWork.playerWork.player);
+        }
+
+        Demo_DemoRandSeedRestore();
+        Game_NpcRoomInitSpawn(true);
+        Game_NpcUpdate();
+        func_8005E89C();
+        Ipd_CloseRangeChunksInit();
+        Gfx_InGameDraw(1);
+#ifdef SH_PC_PORT
+        /* The world is in the OT for this frame, so the fog-colored clear behind
+         * it is correct. Without the world, that clear is the whole image. */
+        { extern int g_PcWorldDrawnThisFrame; g_PcWorldDrawnThisFrame = 1; }
+        /* ...and it must be framed Hor+, decided HERE rather than in MainLoop's
+         * gate. That gate runs before this submission, so its 2D-background hold
+         * (300ms past the last 2D frame) was still set on the first frames the
+         * world came back after the inventory: the picture -- and the minimap
+         * with it -- rendered 4:3 for ~2 frames before snapping (measured from a
+         * user recording: the minimap jumps to the pillarbox x-offset for exactly
+         * frames 141-142 of the exit). Submitting the world and choosing its
+         * framing in the same place cannot lag. The non-transient gates still
+         * win: the map screen and the paper-map/pickup protect flag. */
+        {
+            extern int g_PcHorPlusEnabled, g_PcMapScreenActive, g_PsxSkipFramebufferStore;
+            extern int g_PcWorldHorPlus;
+            /* Same exemption as MainLoop's gate: the ending raises the protect
+             * flag for its palettes while drawing a 3D cutscene. */
+            const int cutsceneLive = ((g_SysWork.sysFlags & SysFlag_CutsceneActive) ||
+                                      g_SysWork.cutsceneBorderState != CutsceneBorderState_None) ? 1 : 0;
+            if (!g_PcMapScreenActive && !(g_PsxSkipFramebufferStore && !cutsceneLive))
+                g_PcHorPlusEnabled = 1;
+            /* Record what the world is actually being drawn with, for HUD
+             * elements that lay out before this point in the frame. */
+            g_PcWorldHorPlus = g_PcHorPlusEnabled;
+        }
+#endif
+        Demo_DemoRandSeedAdvance();
+    }
+}
+
+void SysState_Gameplay_Update(void) // 0x80038BD4
+{
+    s_SubCharacter* player;
+
+    player = &g_SysWork.playerWork.player;
+
+#ifdef SH_PC_PORT
+    /* Randomizer settings panel (opened by tapping Map): while it is up, freeze
+     * the world and hand it input. Returning here skips Event_Update + every
+     * transition below, so nothing ticks and no state change fires. */
+    {
+        extern int  Pc_RandoSettings_IsOpen(void);
+        extern void Pc_RandoSettings_Update(int, int, int, int, int, int);
+        if (Pc_RandoSettings_IsOpen())
+        {
+            const s_ControllerConfig* cc = &g_GameWorkPtr->config.controllerConfig;
+            /* Same as the quick menu: the panel handles the mouse itself, so
+             * pad bits a mouse bind is producing must not act a second time. */
+            extern unsigned int Pc_MouseCursor_BoundPadBits(void);
+            const unsigned int  mouseBits = Pc_MouseCursor_BoundPadBits();
+            Pc_RandoSettings_Update(
+                (g_Controller0->pulsedBtnFlags  & ~mouseBits & ControllerFlag_LStickUp)    != 0,
+                (g_Controller0->pulsedBtnFlags  & ~mouseBits & ControllerFlag_LStickDown)  != 0,
+                (g_Controller0->pulsedBtnFlags  & ~mouseBits & ControllerFlag_LStickLeft)  != 0,
+                (g_Controller0->pulsedBtnFlags  & ~mouseBits & ControllerFlag_LStickRight) != 0,
+                (g_Controller0->clickedBtnFlags & ~mouseBits & (cc->enter | cc->action))   != 0,
+                (g_Controller0->clickedBtnFlags & ~mouseBits & (cc->cancel | cc->map))     != 0);
+            g_Controller0->clickedBtnFlags = 0;
+            g_Controller0->pulsedBtnFlags  = 0;
+            return;
+        }
+    }
+#endif
+
+    Event_Update(player->attackReceived != NO_VALUE);
+    Game_MapRoomIdxUpdate();
+
+    switch (FP_ROUND_SCALED(player->health, 10, Q12_SHIFT))
+    {
+        case 0:
+            func_800892A4(17);
+            break;
+
+        case 1:
+        case 2:
+            func_800892A4(16);
+            break;
+
+        case 3:
+            func_800892A4(15);
+            break;
+
+        case 4:
+            func_800892A4(14);
+            break;
+
+        case 5:
+            func_800892A4(13);
+            break;
+
+        case 6:
+            func_800892A4(12);
+            break;
+    }
+
+    if (g_SysWork.playerWork.player.health <= Q12(0.0f))
+    {
+        return;
+    }
+
+    if (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.light &&
+        g_SysWork.field_2388.field_154.effectsInfo_0.field_0.s_field_0.field_0 & (1 << 1))
+    {
+        Game_FlashlightToggle();
+    }
+
+#ifdef SH_PC_PORT
+    /* Randomizer: the Map button opens the settings panel on a quick TAP and the
+     * real map on a HOLD (the map screen self-gates on HAS_MAP, so "no map yet"
+     * just bounces). Poll every frame for the hold timer, then swallow the Map
+     * edge so the vanilla map branch below never also fires. */
+    {
+        extern int Pc_Rando_Active(void);
+        extern int Pc_RandoSettings_MapButtonArbiter(int, int);
+        if (Pc_Rando_Active())
+        {
+            u16 mapBtn     = g_GameWorkPtr->config.controllerConfig.map;
+            int mapClicked = (g_Controller0->clickedBtnFlags & mapBtn) != 0;
+            int mapHeld    = (g_Controller0->heldBtnFlags & mapBtn) != 0;
+            if (Pc_RandoSettings_MapButtonArbiter(mapClicked, mapHeld) == 2 /* RANDO_MAP_WANT_MAP */)
+            {
+                SysWork_StateSetNext(SysState_MapScreen);
+                g_SysWork.isMgsStringSet = false;
+            }
+            g_Controller0->clickedBtnFlags &= ~(e_ControllerFlags)mapBtn;
+        }
+    }
+#endif
+
+    if (g_MapEventSysState != SysState_Invalid)
+    {
+#ifdef SH_PC_PORT
+        SH_DBG("[GP-STATE-TXN] Gameplay -> sysState=%d (param=%d)",
+               (int)g_MapEventSysState, (int)g_MapEventParam);
+
+        /* Door/area transition out-fade. PSX left the last gameplay frame in the
+         * other framebuffer and Screen_BackgroundMotionBlur decayed THAT image
+         * for the whole load -- the slow darkening under the door-open SFX.
+         * PsyCross blanks both display-buffer rects on every present the blur is
+         * not drawing (GR_ClearAllFeedbackRects), and the blur only arms the
+         * store from its own first frame, so the transition started from an empty
+         * rect and cut straight to black. This tick is the last one that still
+         * renders the world -- SysState_LoadArea_Update sets BgmStatusFlag_Pause
+         * on the NEXT tick -- so arm the store for this frame's present. Same
+         * entry-tick idiom as the pause freeze below. */
+        if (g_MapEventSysState == SysState_LoadRoom ||
+            g_MapEventSysState == SysState_LoadOverlay)
+        {
+            extern int g_PsxFeedbackStoreAllowed;
+            g_PsxFeedbackStoreAllowed = 2;
+            g_PcTxnStartMs = (int)(clock() * 1000 / CLOCKS_PER_SEC);
+        }
+#endif
+        SysWork_StateSetNext(g_MapEventSysState);
+    }
+    else if (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.pause)
+    {
+#ifdef SH_PC_PORT
+        /* Do NOT arm the freeze here. This tick still renders the world, and
+         * PsyX_BeginScene runs at DRAW time (from DrawOTag) -- i.e. AFTER this
+         * update -- so arming now made BeginScene blit the previous capture and
+         * then draw the world over it, leaving the captured frame showing
+         * through wherever the world draws nothing: the one-frame grey sky on
+         * every pause. It also forced the flashlight shadow map off for that
+         * rendered frame.
+         *
+         * The arm was never needed for the capture: GR_CaptureLastFrame runs at
+         * EndScene on any frame that did not present, so this frame is captured
+         * either way. The flag only drives PRESENT, and the first frame that
+         * should present is the next one -- SysState_GamePaused_Update arms it
+         * itself. Clearing a pending release is still right. */
+        {
+            extern int g_PcFreezeReleasePending;
+            g_PcFreezeReleasePending = 0;
+        }
+#endif
+        SysWork_StateSetNext(SysState_GamePaused);
+    }
+    else if (Player_IsAttacking() == true)
+    {
+        return;
+    }
+    else if (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.item)
+    {
+        SysWork_StateSetNext(SysState_StatusMenu);
+    }
+    else if (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.map)
+    {
+        /* NOTE: holding g_PsxPresentLastFrame here to mask the map-open black
+         * flash was reverted — it leaked the held gameplay frame into the
+         * VRAM/sky feedback, ghosting in the sky + pillarbox bars after the map
+         * closed. The brief black flash is the lesser evil. */
+        SysWork_StateSetNext(SysState_MapScreen);
+        g_SysWork.isMgsStringSet = false;
+    }
+    else if (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.option)
+    {
+        SysWork_StateSetNext(SysState_OptionsMenu);
+    }
+
+    if (g_SysWork.sysState == SysState_OptionsMenu ||
+        g_SysWork.sysState == SysState_StatusMenu ||
+        g_SysWork.sysState == SysState_MapScreen)
+    {
+        g_SysWork.sysFlags |= SysFlag_MenuActive;
+    }
+    else if (ScreenFade_IsNone())
+    {
+        g_SysWork.sysFlags &= ~SysFlag_MenuActive;
+    }
+}
+
+void SysState_GamePaused_Update(void) // 0x800391E8
+{
+    static s32 D_800A9A68 = 0;
+
+#ifdef SH_PC_PORT
+    /* Make pause actually pause. `BgmStatusFlag_Pause` is misleadingly named:
+     * it's the flag the InGame update flow uses to gate world-objects, camera,
+     * player, NPC, particle, and character-render updates (see this file
+     * lines ~190 and ~200). MainLoop resets bgmStatusFlags to None at the
+     * top of every frame, so we have to re-set it each tick during pause.
+     * Other gameplay sub-states that should pause the world (paper-map
+     * screen, cutscene borders, various event states) already do this. */
+    g_SysWork.bgmStatusFlags |= BgmStatusFlag_Pause;
+
+    /* PC: present the captured last gameplay frame under the PAUSED text.
+     * PSX never auto-cleared the framebuffer, so pausing simply left the
+     * last InGame render on screen. The old PC approach re-rendered chunks
+     * + Harry here, which missed everything drawn from update paths —
+     * enemies, particles, effects — and rendered Harry without the
+     * gameplay path's lighting wrapper (he turned gray). PsyCross now
+     * captures every composed frame; holding g_PsxPresentLastFrame
+     * re-presents it each frame with only this state's UI on top, so the
+     * paused scene is pixel-identical to the moment of pausing. */
+    {
+        extern int g_PsxPresentLastFrame;
+        g_PsxPresentLastFrame = 1;
+    }
+#endif
+
+    D_800A9A68 += g_DeltaTimeRaw;
+    if (!((D_800A9A68 >> 11) & (1 << 0)))
+    {
+#if VERSION_REGION_IS(NTSCJ)
+        Gfx_StringSetPosition(SCREEN_POSITION_X(41.0f), SCREEN_POSITION_Y(43.5f));
+        Gfx_StringDraw("\x07PAUSE", DEFAULT_MAP_MESSAGE_LENGTH);
+#else
+        Gfx_StringSetPosition(SCREEN_POSITION_X(39.25f), SCREEN_POSITION_Y(43.5f));
+        Gfx_StringDraw("\x07PAUSED", DEFAULT_MAP_MESSAGE_LENGTH);
+#endif
+    }
+
+    func_80091380();
+#ifndef SH_PC_PORT
+    /* PSX keeps the clear-time clock running while paused; PC-port QoL: freeze it
+     * so a pause doesn't inflate the ending results time. */
+    Game_TimerUpdate();
+#endif
+
+    if (g_SysWork.sysStateSteps[0] == 0)
+    {
+        SD_Call(3);
+        g_SysWork.sysStateSteps[0]++;
+    }
+
+    // Debug button combo to bring up save screen from pause screen.
+    // DPad-Left + L2 + L1 + LS-Left + RS-Left + L3
+    if ((g_Controller0->heldBtnFlags == (ControllerFlag_L3 |
+                                       ControllerFlag_DpadLeft |
+                                       ControllerFlag_L2 |
+                                       ControllerFlag_L1 |
+                                       ControllerFlag_LStickLeft2 |
+                                       ControllerFlag_RStickLeft |
+                                       ControllerFlag_LStickLeft)) &&
+        (g_Controller0->clickedBtnFlags & ControllerFlag_L3))
+    {
+        D_800A9A68 = 0;
+        SD_Call(4);
+        g_MapEventParam = 0;
+#ifdef SH_PC_PORT
+        {
+            extern int g_PcFreezeReleasePending;
+            g_PcFreezeReleasePending = 1;
+        }
+#endif
+        SysWork_StateSetNext(SysState_SaveMenu1);
+        return;
+    }
+
+    if (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.pause)
+    {
+        D_800A9A68 = 0;
+
+        SD_Call(4);
+#ifdef SH_PC_PORT
+        /* Releasing on this tick showed one bare fog-colored frame: the world
+         * draw is still gated off by the BgmStatusFlag_Pause set above. Hand the
+         * release to MainLoop, which waits for a tick that drew. */
+        {
+            extern int g_PcFreezeReleasePending;
+            g_PcFreezeReleasePending = 1;
+        }
+#endif
+        SysWork_StateSetNext(SysState_Gameplay);
+    }
+}
+
+void SysState_OptionsMenu_Update(void) // 0x80039344
+{
+    switch (g_SysWork.sysStateSteps[0])
+    {
+        case 0:
+            ScreenFade_Start(true, false, false);
+            g_ScreenFadeTimestep        = Q12(0.0f);
+            g_SysWork.sysStateSteps[0] = 1;
+
+        case 1:
+            if (Ipd_ChunkInitCheck() != 0)
+            {
+                SD_Call(19);
+                GameFs_OptionBinLoad();
+
+                g_SysWork.sysStateSteps[0]++;
+            }
+            break;
+    }
+
+    if (D_800A9A0C != 0)
+    {
+        Game_StateSetNext(GameState_OptionScreen);
+    }
+}
+
+void func_8003943C(void) // 0x8003943C
+{
+    s32 roundedVal0;
+    s32 roundedVal1;
+    s32 val0;
+    s32 val1;
+
+    #define isRockDrillAttack (g_SysWork.playerCombat.weaponAttack == WEAPON_ATTACK(EquippedWeaponId_RockDrill, AttackInputType_Tap))
+
+    func_8008B3E4(0);
+
+    if (g_SysWork.field_275C > Q12(256.0f))
+    {
+        val0        = g_SysWork.field_275C - Q12(256.0f);
+        roundedVal0 = FP_ROUND_TO_ZERO(val0, Q12_SHIFT);
+        func_8008B438(!isRockDrillAttack, roundedVal0, 0);
+
+        if (isRockDrillAttack)
+        {
+            val1        = g_SysWork.field_2764 - Q12(256.0f);
+            roundedVal1 = FP_ROUND_TO_ZERO(val1, Q12_SHIFT);
+            func_8008B40C(roundedVal1, 0);
+        }
+    }
+    else
+    {
+        func_8008B438(!isRockDrillAttack, 0, 0);
+
+        if (isRockDrillAttack)
+        {
+            func_8008B40C(0, 0);
+        }
+    }
+
+    switch (g_SavegamePtr->mapIdx)
+    {
+        case MapIdx_MAP0_S01:
+        case MapIdx_MAP0_S02:
+        case MapIdx_MAP1_S00:
+        case MapIdx_MAP1_S01:
+        case MapIdx_MAP1_S02:
+        case MapIdx_MAP1_S03:
+        case MapIdx_MAP1_S04:
+        case MapIdx_MAP1_S05:
+        case MapIdx_MAP1_S06:
+        case MapIdx_MAP2_S00:
+        case MapIdx_MAP2_S01:
+        case MapIdx_MAP2_S02:
+        case MapIdx_MAP2_S03:
+        case MapIdx_MAP2_S04:
+        case MapIdx_MAP3_S00:
+        case MapIdx_MAP3_S01:
+        case MapIdx_MAP3_S02:
+        case MapIdx_MAP3_S04:
+        case MapIdx_MAP3_S05:
+        case MapIdx_MAP3_S06:
+        case MapIdx_MAP4_S00:
+        case MapIdx_MAP4_S01:
+        case MapIdx_MAP4_S02:
+        case MapIdx_MAP4_S03:
+        case MapIdx_MAP4_S04:
+        case MapIdx_MAP4_S05:
+        case MapIdx_MAP4_S06:
+        case MapIdx_MAP5_S00:
+        case MapIdx_MAP5_S01:
+        case MapIdx_MAP5_S02:
+        case MapIdx_MAP5_S03:
+        case MapIdx_MAP6_S00:
+        case MapIdx_MAP6_S01:
+        case MapIdx_MAP6_S02:
+        case MapIdx_MAP6_S03:
+        case MapIdx_MAP6_S04:
+        case MapIdx_MAP6_S05:
+        case MapIdx_MAP7_S00:
+        case MapIdx_MAP7_S01:
+        case MapIdx_MAP7_S02:
+            break;
+
+        case MapIdx_MAP3_S03:
+            Sd_SfxStop(Sfx_Unk1525);
+            Sd_SfxStop(Sfx_Unk1527);
+            break;
+
+        case MapIdx_MAP0_S00:
+            Sd_SfxStop(Sfx_Unk1358);
+            break;
+    }
+
+    #undef isRockDrillAttack
+}
+
+void SysState_StatusMenu_Update(void) // 0x80039568
+{
+    e_GameState gameState;
+
+#ifdef SH_PC_PORT
+    /* Cover the screen before handing over, the way SysState_MapScreen_Update
+     * does (ScreenFade_Start + a zero timestep = an instant cut, then the state
+     * switch on a later tick). Everything below runs in ONE tick, so without
+     * this the world got drawn once more with nothing over it -- and because the
+     * alternate-camera solve lives on the gameplay path, that frame came out on
+     * the classic camera. That is the one-frame snap opening the inventory on
+     * FPS/TPS/OTS. Costs one tick, already black, so nothing is visible. */
+    if (g_SysWork.sysStateSteps[0] == 0)
+    {
+        ScreenFade_Start(true, false, false);
+        g_ScreenFadeTimestep = Q12(0.0f);
+        g_SysWork.sysStateSteps[0]++;
+        return;
+    }
+#endif
+
+    gameState = g_GameWork.gameState;
+
+    g_GameWork.gameState = GameState_LoadStatusScreen;
+    g_SysWork.counters_1C[0] = 0;
+    g_SysWork.counters_1C[1] = 0;
+
+    g_GameWork.gameStateSteps[1] = 0;
+    g_GameWork.gameStateSteps[2] = 0;
+
+    SysWork_StateSetNext(SysState_Gameplay);
+
+    g_GameWork.gameStateSteps[0] = gameState;
+    g_GameWork.gameStatePrev    = gameState;
+    g_GameWork.gameStateSteps[0] = 0;
+}
+
+void GameState_LoadStatusScreen_Update(void) // 0x800395C0
+{
+    s_Savegame* save;
+
+    if (g_GameWork.gameStateSteps[0] == 0)
+    {
+        DrawSync(SyncMode_Wait);
+        g_IntervalVBlanks = 1;
+        ScreenFade_Reset();
+
+        func_8003943C();
+
+        if (Sd_AudioStreamingCheck())
+        {
+            SD_Call(19);
+        }
+
+        save = g_SavegamePtr;
+        func_800540A4(save->mapIdx);
+        GameFs_MapItemsTextureLoad(save->mapIdx);
+
+        g_GameWork.gameStateSteps[0]++;
+    }
+
+    Screen_BackgroundMotionBlur(SyncMode_Wait2);
+
+    if (Fs_QueueChunksLoad())
+    {
+        Game_StateSetNext(GameState_InventoryScreen);
+    }
+}
+
+void SysState_MapScreen_Update(void) // 0x800396D4
+{
+    if (!HAS_MAP(g_SavegamePtr->paperMapIdx))
+    {
+#ifdef SH_PC_PORT
+        /* Freeze the world while the "I don't have a map" message is up.
+         * MainLoop clears bgmStatusFlags every frame, and the world-object /
+         * collision-trigger updates (~lines 204/214) gate on BgmStatusFlag_Pause;
+         * without re-setting it each tick the player can walk into and fire
+         * triggers behind the message. Mirrors the SysState_GamePaused fix.
+         * Present the captured last gameplay frame behind the message —
+         * the pause gate skips all world/character rendering. */
+        g_SysWork.bgmStatusFlags |= BgmStatusFlag_Pause;
+        {
+            extern int g_PsxPresentLastFrame;
+            g_PsxPresentLastFrame = 1;
+        }
+#endif
+        if (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.map ||
+            Gfx_MapMsg_Draw(MapMsgIdx_NoMap) > MapMsgState_Idle)
+        {
+#ifdef SH_PC_PORT
+            /* See the pause exit: this tick's world draw is already gated off by
+             * the BgmStatusFlag_Pause set above, so releasing here would expose
+             * the raw fog-colored clear for a frame. */
+            {
+                extern int g_PcFreezeReleasePending;
+                g_PcFreezeReleasePending = 1;
+            }
+#endif
+            SysWork_StateSetNext(SysState_Gameplay);
+        }
+    }
+    else if ((g_SysWork.field_2388.field_154.effectsInfo_0.field_0.s_field_0.field_0 & (1 << 1)) && !g_SysWork.field_2388.isFlashlightOn_15 &&
+             ((g_SysWork.field_2388.field_1C[0].effectsInfo_0.field_0.s_field_0.field_0 & (1 << 0)) ||
+              (g_SysWork.field_2388.field_1C[1].effectsInfo_0.field_0.s_field_0.field_0 & (1 << 0))))
+    {
+#ifdef SH_PC_PORT
+        g_SysWork.bgmStatusFlags |= BgmStatusFlag_Pause;
+        {
+            extern int g_PsxPresentLastFrame;
+            g_PsxPresentLastFrame = 1;
+        }
+#endif
+        if (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.map ||
+            Gfx_MapMsg_Draw(MapMsgIdx_TooDarkForMap) > MapMsgState_Idle)
+        {
+#ifdef SH_PC_PORT
+            {
+                extern int g_PcFreezeReleasePending;
+                g_PcFreezeReleasePending = 1;
+            }
+#endif
+            SysWork_StateSetNext(SysState_Gameplay);
+        }
+    }
+    else
+    {
+        if (g_SysWork.sysStateSteps[0] == 0)
+        {
+            if (g_PaperMapMarkingFileIdxs[g_SavegamePtr->paperMapIdx] != NO_VALUE)
+            {
+                Fs_QueueStartReadTim(FILE_TIM_MR_0TOWN_TIM + g_PaperMapMarkingFileIdxs[g_SavegamePtr->paperMapIdx], FS_BUFFER_1, &g_PaperMapMarkingAtlasImg);
+            }
+
+            Fs_QueueStartSeek(FILE_TIM_MP_0TOWN_TIM + g_PaperMapFileIdxs[g_SavegamePtr->paperMapIdx]);
+
+            ScreenFade_Start(true, false, false);
+            g_ScreenFadeTimestep = Q12(0.0f);
+            g_SysWork.sysStateSteps[0]++;
+        }
+
+        if (D_800A9A0C != 0)
+        {
+            Game_StateSetNext(GameState_PaperMapScreen);
+        }
+    }
+}
+
+void SysState_Fmv_Update(void) // 0x80039A58
+{
+    #define BASE_AUDIO_FILE_IDX FILE_XA_ZC_14392
+
+    static RECT D_800A9A6C = { 320, 256, 160, 240 };
+
+#ifdef SH_PC_PORT
+    {
+        static int s_lastLoggedStep = -1;
+        int curStep = (int)g_SysWork.sysStateSteps[0];
+        if (curStep != s_lastLoggedStep) {
+            s_lastLoggedStep = curStep;
+        }
+    }
+#endif
+
+    switch (g_SysWork.sysStateSteps[0])
+    {
+        case 0:
+            ScreenFade_Start(false, false, false);
+            D_800A9A0C                  = 0;
+            g_SysWork.sysStateSteps[0] = 1;
+
+        case 1:
+            if (Ipd_ChunkInitCheck() != 0)
+            {
+                GameFs_StreamBinLoad();
+                g_SysWork.sysStateSteps[0]++;
+            }
+            break;
+    }
+
+    if (D_800A9A0C == 0)
+    {
+        return;
+    }
+
+    // Copy framebuffer into `IMAGE_BUFFER_0` before movie playback.
+    DrawSync(SyncMode_Wait);
+    StoreImage(&D_800A9A6C, (u32*)IMAGE_BUFFER_0);
+    DrawSync(SyncMode_Wait);
+
+    func_800892A4(0);
+    func_80089128();
+
+    // Start playing movie. File to play is based on file ID `BASE_AUDIO_FILE_IDX - g_MapEventParam`.
+    // Blocks until movie has finished playback or user has skipped it.
+    open_main(BASE_AUDIO_FILE_IDX - g_MapEventParam, g_FileTable[BASE_AUDIO_FILE_IDX - g_MapEventParam].blockCount);
+
+    func_800892A4(1);
+
+    // Restore copied framebuffer from `IMAGE_BUFFER_0`.
+    GsSwapDispBuff();
+    LoadImage(&D_800A9A6C, (u32*)IMAGE_BUFFER_0);
+    DrawSync(SyncMode_Wait);
+
+    // Set savegame flag based on `g_MapEventData->disabledEventFlag` flag ID.
+    Savegame_EventFlagSetAlt(g_MapEventData->disabledEventFlag);
+
+    // Return to game.
+    Game_StateSetNext(GameState_InGame);
+
+    // If flag is set, returns to `GameState_InGame` with `gameStateSteps[0]` = 1.
+    if (g_MapEventData->flags_8_13 & EventParamUnkState_1)
+    {
+        g_GameWork.gameStateSteps[0] = 1;
+    }
+}
+
+void SysState_LoadArea_Update(void) // 0x80039C40
+{
+    u32           offsetZ;
+    s_MapPoint2d* mapPoint;
+
+#ifdef SH_PC_PORT
+    /* Crash dump from 2026-05-01 23:49 had FAILURE_BUCKET_ID
+     * INVALID_POINTER_READ at SysState_LoadArea_Update+0x3fe with no
+     * preceding [DOOR] log entry — meaning the crash is somewhere
+     * before line 779's SH_DBG fires. The function dereferences
+     * g_MapEventData and g_MapOverlayHdr.mapPoints
+     * heavily, so guard them first and log enough state to localize. */
+    fflush(g_ShDebugLog);  /* flush NOW so the trace survives the crash */
+    if (g_MapEventData == NULL) {
+        fflush(g_ShDebugLog);
+        return;
+    }
+    if (g_MapOverlayHdr.mapPoints == NULL) {
+        fflush(g_ShDebugLog);
+        return;
+    }
+    fflush(g_ShDebugLog);
+
+    /* Everything below runs to completion inside THIS single tick, and its
+     * blocking parts (GameBoot_MapLoad -> GameFs_PlayerMapAnimLoad ->
+     * Fs_QueueWaitForEmpty) only spin on VSync: they never return to MainLoop's
+     * Screen_FadeUpdate / GsSwapDispBuff / PsyX_EndScene, so not one frame is
+     * presented for the whole multi-second stall and the window keeps showing
+     * the last gameplay frame. Retail's door fade is Screen_BackgroundMotionBlur's
+     * framebuffer feedback, which advances one step per PRESENTED frame, so on
+     * this path it gets a single frame -- "barely fades, then freezes". Run a
+     * real fade to black to completion FIRST, over its own presented frames, and
+     * enter the blocking work only once the screen is already black. Same shape
+     * SysState_Fmv_Update uses: fade out, wait for ScreenFade_IsFinished(), then
+     * block. The far side is untouched -- GameBoot_GameStartup case 11 still
+     * holds 60 vblanks and fires the door-shut SFX, and GameState_InGame_Update
+     * step 0 still fades in. */
+    if (g_SysWork.sysStateSteps[0] == 0)
+    {
+        g_SysWork.sysStateSteps[0] = 1;
+        g_SysWork.sysStateSteps[1] = 0;
+        g_SysWork.sfxPairIdx_2283  = g_MapEventData->sfxPairIdx_8_19;
+
+        /* Retail plays the door-open SFX under the fade, not after it. */
+        SD_Call(SFX_PAIRS[g_SysWork.sfxPairIdx_2283].sfx_0);
+
+        /* Attract demos consume one recorded input entry per frame, so extra
+         * frames desync the recording -- they keep today's presentation and must
+         * not get a fade nothing waits for. A scripted scene that already handed
+         * over on black must not be re-faded, or the world pops back into view.
+         * reset=false so an in-flight fade continues from its current level
+         * instead of snapping, and the colour bit carries over so a scene's
+         * white fade does not turn black. */
+        if (!(g_SysWork.sysFlags & SysFlag_DemoActive) && !ScreenFade_IsFinished())
+        {
+            ScreenFade_Start(false, false, IS_SCREEN_FADE_WHITE(g_Screen_FadeStatus) != 0);
+            /* Timestep is 1/seconds. Retail's out-fade lasted as long as the CD
+             * read, so there is no constant to match -- this is chosen to read as
+             * a deliberate fade without dominating a transition whose load is now
+             * fast. Console: TXNFADE <seconds>. */
+            g_ScreenFadeTimestep = g_PcTxnFadeTimestep;
+        }
+    }
+
+    /* Budget is accumulated REAL TIME, not a frame count: Screen_FadeUpdate steps
+     * by timestep*dt, so the fade lands in ~1.25 s at 30, 60 and 240 fps alike,
+     * whereas a frame count would only be right while MainLoop happens to pin
+     * this state to 60 Hz. It exists purely so a door can never hang --
+     * ScreenFade_IsFinished() is false in ScreenFadeState_None, which a fade
+     * hijacked mid-transition can leave behind. g_DeltaTimeRaw is substituted
+     * when a deliberate freeze has zeroed it, so the budget always advances. */
+    if (!ScreenFade_IsFinished() && !(g_SysWork.sysFlags & SysFlag_DemoActive) &&
+        g_SysWork.sysStateSteps[1] < Q12(3.0f))
+    {
+        g_SysWork.sysStateSteps[1] += (g_DeltaTimeRaw > Q12(0.0f)) ? g_DeltaTimeRaw : TIMESTEP_60_FPS;
+        g_PcTxnFadeEndMs = (int)(clock() * 1000 / CLOCKS_PER_SEC);
+
+        /* Hold the world still under the fade the way retail's decaying frozen
+         * frame does. The fade runs off g_DeltaTimeRaw and is unaffected, and
+         * BgmStatusFlag_Pause is deliberately NOT set so the world still renders
+         * beneath the fade tile. */
+        g_DeltaTime = Q12(0.0f);
+        return;
+    }
+#endif
+
+#ifdef SH_PC_PORT
+    /* Transition timing probe: brackets the blocking work so the black hold can
+     * be attributed to the fade, the queue drain, or the 60-vblank load-screen
+     * hold rather than guessed at. */
+    SH_DBG("[TXNTIME] fade done, blocking work begins (fade took %d ms)",
+           g_PcTxnFadeEndMs - g_PcTxnStartMs);
+#endif
+
+    g_SysWork.unused_229C            = 0;
+    g_SysWork.loadingScreenIdx = D_800BCDB0.loadingScreenId;
+    g_SysWork.sfxPairIdx_2283       = g_MapEventData->sfxPairIdx_8_19;
+    g_SysWork.field_2282            = g_MapEventData->flags_8_13;
+
+#ifndef SH_PC_PORT
+    SD_Call(SFX_PAIRS[g_SysWork.sfxPairIdx_2283].sfx_0);
+#endif
+
+    if (g_SysWork.sfxPairIdx_2283 == SfxPairIdx_7)
+    {
+        D_800BCDD4            = 0;
+        g_SysWork.sysFlags |= SysFlag_LoadActive;
+    }
+
+    D_800BCDB0 = g_MapOverlayHdr.mapPoints[g_MapEventData->eventParam];
+
+
+    if (D_800BCDB0.triggerParam1 == 1)
+    {
+        mapPoint                = &g_MapOverlayHdr.mapPoints[g_MapEventData->pointOfInterestIdx];
+        offsetZ                 = g_SysWork.playerWork.player.position.vz - mapPoint->positionZ;
+        D_800BCDB0.positionX += g_SysWork.playerWork.player.position.vx - mapPoint->positionX;
+        D_800BCDB0.positionZ += offsetZ;
+    }
+
+#ifdef SH_PC_PORT
+    /* Randomizer: a door it rewrote sends the player to a map this one has no
+     * arrival record for (the record for map X is authored inside whichever map
+     * has a real door into X, not inside the source). Swap in the harvested one.
+     * Must land before the backup below, which is what actually gets consumed.
+     * No-op for vanilla doors and when the mode is off. */
+    {
+        extern void Pc_Rando_ArrivalOverride(s_MapPoint2d* arrival, const s_EventData* evt);
+        Pc_Rando_ArrivalOverride(&D_800BCDB0, g_MapEventData);
+    }
+
+    /* D_800BCDB0 gets zeroed somewhere between here and AreaLoad_Update-
+     * PlayerPosition (PSX path runs synchronously, PC's GameBoot_MapLoad
+     * trips through extra subsystems that clear it). Save a backup here
+     * and restore it in AreaLoad_UpdatePlayerPosition if it's been
+     * zeroed -- otherwise the player spawns at (0,0,0) on every door. */
+    s_PC_D_800BCDB0_Backup = D_800BCDB0;
+    s_PC_D_800BCDB0_Saved  = 1;
+#endif
+
+#ifdef SH_PC_PORT
+    /* Snapshot scalar fields from g_MapEventData BEFORE GameBoot_MapLoad
+     * runs. Reason: GameBoot_MapLoad unloads the current map overlay,
+     * which deallocates the s_EventData struct that g_MapEventData
+     * points into (it lives in g_MapOverlayHdr.mapEvents_18 and the
+     * old map's overlay gets unloaded by MapOverlay_Unload). Using
+     * g_MapEventData after the map load is a use-after-free; on PC it
+     * crashed with INVALID_POINTER_READ at the disabledEventFlag access
+     * (movzx eax, word ptr [rax+2]). Crash hash db439cd4 in dump
+     * 2026-05-02 — same scenario kept reproducing because the lifetime
+     * mismatch is in the source flow, not in any of our PC shims. */
+    s16 _eventData_disabledEventFlag = g_MapEventData->disabledEventFlag;
+    u32 _eventData_field_8_24        = g_MapEventData->field_8_24;
+    u32 _eventData_mapIdx            = g_MapEventData->mapIdx;
+    s32 _eventData_eventParam        = g_MapEventData->eventParam;
+    fflush(g_ShDebugLog);
+#endif
+
+    if (g_SysWork.sysState == SysState_LoadOverlay)
+    {
+        g_SysWork.processFlags    = ProcessFlag_OverlayTransition;
+#ifdef SH_PC_PORT
+        fflush(g_ShDebugLog);
+        g_SavegamePtr->mapIdx = _eventData_mapIdx;
+        fflush(g_ShDebugLog);
+#else
+        g_SavegamePtr->mapIdx = g_MapEventData->mapIdx;
+#endif
+        GameBoot_MapLoad(g_SavegamePtr->mapIdx);
+#ifdef SH_PC_PORT
+        fflush(g_ShDebugLog);
+#endif
+    }
+    else
+    {
+        g_SysWork.processFlags = ProcessFlag_RoomTransition;
+#ifdef SH_PC_PORT
+        fflush(g_ShDebugLog);
+        Bgm_TrackChange(_eventData_mapIdx);
+        if (g_MapOverlayHdr.mapPoints[_eventData_eventParam].field_4_5 != 0)
+        {
+            g_SysWork.field_2349 = g_MapOverlayHdr.mapPoints[_eventData_eventParam].field_4_5 - 1;
+        }
+#else
+        Bgm_TrackChange(g_MapEventData->mapIdx);
+        if (g_MapOverlayHdr.mapPoints[g_MapEventData->eventParam].field_4_5 != 0)
+        {
+            g_SysWork.field_2349 = g_MapOverlayHdr.mapPoints[g_MapEventData->eventParam].field_4_5 - 1;
+        }
+#endif
+    }
+
+#ifdef SH_PC_PORT
+    Savegame_EventFlagSetAlt(_eventData_disabledEventFlag);
+
+    if (_eventData_field_8_24)
+    {
+        g_SysWork.sysFlags |= SysFlag_OnCameraRail;
+    }
+    else
+    {
+        g_SysWork.sysFlags &= ~SysFlag_OnCameraRail;
+    }
+#else
+    Savegame_EventFlagSetAlt(g_MapEventData->disabledEventFlag);
+
+    if (g_MapEventData->field_8_24)
+    {
+        g_SysWork.sysFlags |= SysFlag_OnCameraRail;
+    }
+    else
+    {
+        g_SysWork.sysFlags &= ~SysFlag_OnCameraRail;
+    }
+#endif
+
+    g_SysWork.bgmStatusFlags |= BgmStatusFlag_Pause;
+    Game_StateSetNext(GameState_MainLoadScreen);
+    Screen_BackgroundMotionBlur(SyncMode_Immediate);
+}
+
+void AreaLoad_UpdatePlayerPosition(void) // 0x80039F30
+{
+#ifdef SH_PC_PORT
+    SH_DBG("[TRANSITION] AreaLoad_UpdatePlayerPosition: BEFORE playerPos=(%d,%d,%d) targetPos=(%d,%d) loadScreen=%d",
+           g_SysWork.playerWork.player.position.vx,
+           g_SysWork.playerWork.player.position.vy,
+           g_SysWork.playerWork.player.position.vz,
+           D_800BCDB0.positionX, D_800BCDB0.positionZ,
+           D_800BCDB0.loadingScreenId);
+    /* Restore backup if D_800BCDB0 was zeroed */
+    if (s_PC_D_800BCDB0_Saved && D_800BCDB0.positionX == 0 && D_800BCDB0.positionZ == 0 &&
+        (s_PC_D_800BCDB0_Backup.positionX != 0 || s_PC_D_800BCDB0_Backup.positionZ != 0))
+    {
+        SH_DBG("[TRANSITION] D_800BCDB0 was ZEROED! Restoring backup: posX=%d posZ=%d tp0=%d tp1=%d",
+               s_PC_D_800BCDB0_Backup.positionX, s_PC_D_800BCDB0_Backup.positionZ,
+               s_PC_D_800BCDB0_Backup.triggerParam0, s_PC_D_800BCDB0_Backup.triggerParam1);
+        D_800BCDB0 = s_PC_D_800BCDB0_Backup;
+    }
+    s_PC_D_800BCDB0_Saved = 0;
+#endif
+    Chara_PositionSet(&D_800BCDB0);
+#ifdef SH_PC_PORT
+    SH_DBG("[TRANSITION] AreaLoad_UpdatePlayerPosition: AFTER playerPos=(%d,%d,%d)",
+           g_SysWork.playerWork.player.position.vx,
+           g_SysWork.playerWork.player.position.vy,
+           g_SysWork.playerWork.player.position.vz);
+#endif
+}
+
+void AreaLoad_TransitionSound(void) // 0x80039F54
+{
+    SD_Call(SFX_PAIRS[g_SysWork.sfxPairIdx_2283].sfx_2);
+}
+
+s8 func_80039F90(void) // 0x80039F90
+{
+    if (g_SysWork.processFlags & (ProcessFlag_RoomTransition | ProcessFlag_OverlayTransition))
+    {
+        return g_SysWork.field_2282;
+    }
+
+    return 0;
+}
+
+void SysState_ReadMessage_Update(void) // 0x80039FB8
+{
+    s32 i;
+    void (**unfreezePlayerFunc)(bool);
+
+    // When `SysState_ReadMessage_Update` is called, the game world freezes.
+    // The following conditions unfreeze:
+    // - A specific event related flag is disenabled.
+    // - A specific camera related flag is disenabled.
+    // - There is no alive enemy.
+    if (!(g_MapEventData->flags_8_13 & EventParamUnkState_0) && !(g_SysWork.sysFlags & SysFlag_5))
+    {
+        for (i = 0; i < ARRAY_SIZE(g_SysWork.npcs); i++)
+        {
+            if (g_SysWork.npcs[i].model.charaId >= Chara_Harry && g_SysWork.npcs[i].model.charaId <= Chara_MonsterCybil &&
+                g_SysWork.npcs[i].health > Q12(0.0f))
+            {
+                break;
+            }
+        }
+
+        if (i == ARRAY_SIZE(g_SysWork.npcs))
+        {
+            g_DeltaTime = g_DeltaTimeCpy;
+        }
+    }
+    else
+    {
+        g_DeltaTime = g_DeltaTimeCpy;
+    }
+
+    if (g_SysWork.isMgsStringSet == false)
+    {
+        g_MapOverlayHdr.playerControlFreeze();
+    }
+
+    switch (Gfx_MapMsg_Draw(g_MapEventParam))
+    {
+        case MapMsgState_Finish:
+            break;
+
+        case MapMsgState_Idle:
+            break;
+
+        case MapMsgState_SelectEntry0:
+            Savegame_EventFlagSetAlt(g_MapEventData->disabledEventFlag);
+
+            unfreezePlayerFunc = &g_MapOverlayHdr.playerControlUnfreeze;
+
+            SysWork_StateSetNext(SysState_Gameplay);
+
+            (*unfreezePlayerFunc)(false);
+            break;
+    }
+}
+
+void SysWork_SavegameUpdatePlayer(void) // 0x8003A120
+{
+    s_Savegame* save;
+
+    save = g_SavegamePtr;
+
+    save->locationId       = g_MapEventParam;
+    save->playerPositionX = g_SysWork.playerWork.player.position.vx;
+    save->playerPositionZ = g_SysWork.playerWork.player.position.vz;
+    save->playerRotationY = g_SysWork.playerWork.player.rotation.vy;
+    save->playerHealth    = g_SysWork.playerWork.player.health;
+}
+
+void func_8003A16C(void) // 0x8003A16C
+{
+    if (!(g_SysWork.sysFlags & SysFlag_DemoActive))
+    {
+        // Update `savegame` with player info.
+        SysWork_SavegameUpdatePlayer();
+
+        g_GameWork.autosave = g_GameWork.savegame;
+    }
+}
+
+void SysWork_SavegameReadPlayer(void) // 0x8003A1F4
+{
+    g_SysWork.playerWork.player.position.vx = g_SavegamePtr->playerPositionX;
+    g_SysWork.playerWork.player.position.vz = g_SavegamePtr->playerPositionZ;
+    g_SysWork.playerWork.player.rotation.vy = g_SavegamePtr->playerRotationY;
+    g_SysWork.playerWork.player.health      = g_SavegamePtr->playerHealth;
+}
+
+void SysState_SaveMenu_Update(void) // 0x8003A230
+{
+    s32 gameState;
+
+    func_80033548();
+
+    switch (g_SysWork.sysStateSteps[0])
+    {
+        case 0:
+            SysWork_SavegameUpdatePlayer();
+
+            if (Savegame_EventFlagGet(EventFlag_SeenSaveScreen) ||
+                g_SavegamePtr->locationId == SaveLocationId_NextFear || g_MapEventParam == 0)
+            {
+                GameFs_SaveLoadBinLoad();
+
+                ScreenFade_Start(true, false, false);
+                SysWork_StateStepIncrement(0);
+            }
+            else if (Gfx_MapMsg_Draw(MapMsgIdx_SaveGame) == MapMsgState_SelectEntry0)
+            {
+                Savegame_EventFlagSet(EventFlag_SeenSaveScreen);
+
+                GameFs_SaveLoadBinLoad();
+
+                ScreenFade_Start(true, false, false);
+                SysWork_StateStepIncrement(0);
+            }
+            break;
+
+        case 1:
+            if (D_800A9A0C != 0)
+            {
+                ScreenFade_Start(true, true, false);
+
+                func_8003943C();
+
+                gameState = g_GameWork.gameState;
+
+                g_GameWork.gameState = GameState_SaveScreen;
+
+                g_SysWork.counters_1C[0] = 0;
+                g_SysWork.counters_1C[1] = 0;
+
+                g_GameWork.gameStateSteps[1] = 0;
+                g_GameWork.gameStateSteps[2] = 0;
+
+                SysWork_StateSetNext(SysState_Gameplay);
+
+                g_GameWork.gameStateSteps[0] = gameState;
+                g_GameWork.gameStatePrev    = gameState;
+                g_GameWork.gameStateSteps[0] = 0;
+            }
+            break;
+    }
+}
+
+void SysState_EventCallback_Update(void) // 0x8003A3C8
+{
+#ifdef SH_PC_PORT
+    if (g_MapEventData == NULL) {
+        g_SysWork.sysState = SysState_Gameplay;
+        return;
+    }
+#endif
+    if (g_MapEventData->flags_8_13 != EventParamUnkState_None)
+    {
+        Savegame_EventFlagSetAlt(g_MapEventData->disabledEventFlag);
+    }
+
+    g_DeltaTime = g_DeltaTimeCpy;
+#ifdef SH_PC_PORT
+    /* Guard OOB: mapEventFuncs arrays vary per map (e.g. map0_s02 has 7).
+     * A stale lastUsedItem can produce a garbage param well past the end. */
+    if (g_MapEventParam < 0 || g_MapEventParam >= 64) {
+        SH_DBG("[SS] EventCallFunc param=%d OOB — skip", g_MapEventParam);
+        g_SysWork.sysState = SysState_Gameplay;
+        return;
+    }
+    {   /* log on param/step change only, not per-frame */
+        static int _ssParam=-1,_ss0=-1,_ss1=-1,_ss2=-1;
+        int _p=g_MapEventParam, _s0=(int)g_SysWork.sysStateSteps[0],
+            _s1=(int)g_SysWork.sysStateSteps[1], _s2=(int)g_SysWork.sysStateSteps[2];
+        if (_p!=_ssParam||_s0!=_ss0||_s1!=_ss1||_s2!=_ss2) {
+            SH_DBG("[SS] EventCallFunc param=%d func=%p step0=%d step1=%d step2=%d", _p,
+                    (void*)g_MapOverlayHdr.mapEventFuncs[_p], _s0, _s1, _s2);
+            _ssParam=_p; _ss0=_s0; _ss1=_s1; _ss2=_s2;
+        }
+    }
+    if (g_MapOverlayHdr.mapEventFuncs[g_MapEventParam] == NULL) {
+        SH_DBG("[SS] EventCallFunc NULL — skip");
+        g_SysWork.sysState = SysState_Gameplay;
+        return;
+    }
+#endif
+    g_MapOverlayHdr.mapEventFuncs[g_MapEventParam]();
+}
+
+void SysState_EventSetFlag_Update(void) // 0x8003A460
+{
+    g_DeltaTime = g_DeltaTimeCpy;
+    Savegame_EventFlagSetAlt(g_MapEventData->disabledEventFlag);
+    g_SysWork.sysState = SysState_Gameplay;
+}
+
+void SysState_EventPlaySound_Update(void) // 0x8003A4B4
+{
+    g_DeltaTime = g_DeltaTimeCpy;
+
+    SD_Call(((u16)g_MapEventParam + Sfx_Base) & 0xFFFF);
+
+    Savegame_EventFlagSetAlt(g_MapEventData->disabledEventFlag);
+    g_SysWork.sysState = SysState_Gameplay;
+}
+
+void SysState_GameOver_Update(void) // 0x8003A52C
+{
+    #define TIP_COUNT 15
+
+    static u8 prevTipIdx;
+    u16       seenTipIdxs[1];
+    s32       tipIdx;
+    s32       randTipVal;
+    u16*      temp_a0;
+
+    switch (g_SysWork.sysStateSteps[0])
+    {
+        case 0:
+            g_MapOverlayHdr.playerControlFreeze();
+            g_SysWork.field_28 = Q12(0.0f);
+
+            if (g_GameWork.autosave.continueCount < 99)
+            {
+                g_GameWork.autosave.continueCount++;
+            }
+
+            MainMenu_SelectedOptionIdxReset();
+
+            // If every game over tip has been seen, reset flag bits.
+            if (g_GameWork.config.seenGameOverTips[0] == SHRT_MAX)
+            {
+                g_GameWork.config.seenGameOverTips[0] = 0;
+            }
+
+            randTipVal = 0;
+
+            seenTipIdxs[0] = g_GameWork.config.seenGameOverTips[0];
+            for (tipIdx = 0; tipIdx < TIP_COUNT; tipIdx++)
+            {
+                if (!Flags16b_IsSet(seenTipIdxs, tipIdx))
+                {
+                    if ((!(g_SysWork.field_2388.field_154.effectsInfo_0.field_0.field_0 & 0x3) && (tipIdx - 13) >= 2u) ||
+                        ( (g_SysWork.field_2388.field_154.effectsInfo_0.field_0.field_0 & 0x3) && (tipIdx - 13) <  2u))
+                    {
+                        randTipVal += 3;
+                    }
+                    else
+                    {
+                        randTipVal++;
+                    }
+                }
+            }
+
+            randTipVal = Rng_GenerateInt(0, randTipVal - 1);
+
+            // `randTipVal` seems to go unused after loop, gets checked during loop and can cause early exit,
+            // thereby affecting what `tipIdx` will contain.
+            for (tipIdx = 0; tipIdx < TIP_COUNT; tipIdx++)
+            {
+                if (!Flags16b_IsSet(seenTipIdxs, tipIdx))
+                {
+                    if ((!(g_SysWork.field_2388.field_154.effectsInfo_0.field_0.field_0 & 0x3) && (tipIdx - 13) >= 2u) ||
+                        ( (g_SysWork.field_2388.field_154.effectsInfo_0.field_0.field_0 & 0x3) && (tipIdx - 13) <  2u))
+                    {
+                        if (randTipVal < 3)
+                        {
+                            break;
+                        }
+
+                        randTipVal -= 3;
+                    }
+                    else
+                    {
+                        if (randTipVal <= 0)
+                        {
+                            break;
+                        }
+
+                        randTipVal--;
+                    }
+                }
+            }
+
+            // Store current shown `tipIdx`, later `sysStateSteps == 7` will set it inside `seenGameOverTips`.
+            prevTipIdx = tipIdx;
+
+#if VERSION_REGION_IS(NTSC)
+            Fs_QueueStartReadTim(FILE_TIM_TIPS_E01_TIM + tipIdx, FS_BUFFER_1, &g_DeathTipImg);
+#elif VERSION_REGION_IS(NTSCJ)
+            Fs_QueueStartReadTim(FILE_TIM_TIPS_J01_TIM + tipIdx, FS_BUFFER_1, &g_DeathTipImg);
+#endif
+            SysWork_StateStepIncrement(0);
+
+        case 1:
+            SysWork_StateStepIncrementAfterFade(2, true, 0, Q12(0.5f), false);
+            break;
+
+        case 2:
+            SysWork_StateStepIncrementAfterFade(0, false, 0, Q12(0.5f), false);
+            SysWork_StateStepIncrement(0);
+
+        case 3:
+            Gfx_StringSetPosition(SCREEN_POSITION_X(32.5f), SCREEN_POSITION_Y(43.5f));
+            Gfx_StringDraw("\aGAME_OVER", DEFAULT_MAP_MESSAGE_LENGTH);
+#ifdef SH_PC_PORT
+            /* field_28 counts RENDERED frames against a 30fps-authored hold
+             * (240 frames = 8s): 1s at 240fps, 16s at the 15fps floor. Count
+             * 30fps-equivalent frames from dt with a fractional carry. */
+            {
+                static q19_12 s_holdAccum;
+                s32 holdStep;
+
+                s_holdAccum += TIMESTEP_SCALE_30_FPS(g_DeltaTime, Q12(1.0f));
+                holdStep     = FP_FROM(s_holdAccum, Q12_SHIFT);
+                s_holdAccum -= FP_TO(holdStep, Q12_SHIFT);
+                g_SysWork.field_28 += holdStep;
+            }
+#else
+            g_SysWork.field_28++;
+#endif
+
+            if ((g_Controller0->clickedBtnFlags & (g_GameWorkPtr->config.controllerConfig.enter |
+                                                  g_GameWorkPtr->config.controllerConfig.cancel)) ||
+                g_SysWork.field_28 > Q12(1.0f / 17.0f))
+            {
+                SysWork_StateStepIncrement(0);
+            }
+            break;
+
+        case 4:
+            Gfx_StringSetPosition(SCREEN_POSITION_X(32.5f), SCREEN_POSITION_Y(43.5f));
+            Gfx_StringDraw("\aGAME_OVER", DEFAULT_MAP_MESSAGE_LENGTH);
+            SysWork_StateStepIncrementAfterFade(2, true, 0, Q12(2.0f), false);
+            break;
+
+        case 5:
+            if (g_SavegamePtr->gameDifficulty == GameDifficulty_Hard)
+            {
+                SysWork_StateStepReset();
+                break;
+            }
+            else
+            {
+                Fs_QueueWaitForEmpty();
+                Game_RadioSoundStop();
+                SysWork_StateStepIncrement(0);
+            }
+
+        case 6:
+            SysWork_StateStepIncrementAfterFade(2, false, 0, Q12(2.0f), false);
+            g_SysWork.field_28 = Q12(0.0f);
+            Screen_BackgroundImgDraw(&g_DeathTipImg);
+            break;
+
+        case 7:
+#ifdef SH_PC_PORT
+            /* Death-tip hold: 480 30fps frames = 16s authored (see case 3). */
+            {
+                static q19_12 s_tipAccum;
+                s32 tipStep;
+
+                s_tipAccum += TIMESTEP_SCALE_30_FPS(g_DeltaTime, Q12(1.0f));
+                tipStep     = FP_FROM(s_tipAccum, Q12_SHIFT);
+                s_tipAccum -= FP_TO(tipStep, Q12_SHIFT);
+                g_SysWork.field_28 += tipStep;
+            }
+#else
+            g_SysWork.field_28++;
+#endif
+            Screen_BackgroundImgDraw(&g_DeathTipImg);
+
+            if (!(g_Controller0->clickedBtnFlags & (g_GameWorkPtr->config.controllerConfig.enter |
+                                                   g_GameWorkPtr->config.controllerConfig.cancel)))
+            {
+                if (g_SysWork.field_28 <= 480)
+                {
+                    break;
+                }
+            }
+
+            // TODO: some inline FlagSet func? couldn't get matching ver, but pretty sure temp_a0 can be removed somehow
+            temp_a0 = &g_GameWork.config.seenGameOverTips[(prevTipIdx >> 5)];
+            *temp_a0 |= (1 << 0) << (prevTipIdx & 0x1F);
+
+            SysWork_StateStepIncrement(0);
+            break;
+
+        case 8:
+            Screen_BackgroundImgDraw(&g_DeathTipImg);
+            SysWork_StateStepIncrementAfterFade(2, true, 0, Q12(2.0f), false);
+            break;
+
+        default:
+            g_MapOverlayHdr.playerControlUnfreeze(0);
+            SysWork_StateSetNext(SysState_Gameplay);
+            Game_WarmBoot();
+            break;
+    }
+
+    if (g_SysWork.sysStateSteps[0] >= 2 || g_GameWork.gameState != GameState_InGame)
+    {
+        g_SysWork.bgmStatusFlags |= BgmStatusFlag_Pause;
+    }
+
+    #undef TIP_COUNT
+}
+
+void GameState_MapEvent_Update(void) // 0x8003AA4C
+{
+    if (g_GameWork.gameStateSteps[0] == 0)
+    {
+        g_IntervalVBlanks               = 1;
+        ScreenFade_Start(true, true, false);
+        g_GameWork.gameStateSteps[0] = 1;
+    }
+
+    D_800A9A0C = ScreenFade_IsFinished() && Fs_QueueChunksLoad();
+
+    Savegame_EventFlagSetAlt(g_MapEventData->disabledEventFlag);
+
+#ifdef SH_PC_PORT
+    if (g_MapEventParam < 0 || g_MapEventParam >= 64
+        || g_MapOverlayHdr.mapEventFuncs[g_MapEventParam] == NULL) {
+        SH_DBG("[SS] MapEvent param=%d OOB/NULL — skip", g_MapEventParam);
+        Screen_BackgroundImgDraw(&g_ItemInspectionImg);
+        return;
+    }
+#endif
+    g_MapOverlayHdr.mapEventFuncs[g_MapEventParam]();
+
+    Screen_BackgroundImgDraw(&g_ItemInspectionImg);
+}

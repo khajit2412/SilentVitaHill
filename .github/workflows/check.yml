@@ -1,0 +1,44 @@
+name: Check Executables Match
+
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - '**.md'
+
+jobs:
+  build:
+    if: github.repository == 'Vatuu/silent-hill-decomp'
+    
+    container: ghcr.io/vatuu/decomp-images-silent-hill:master
+
+    strategy:
+      fail-fast: true
+      matrix:
+        game_id: [ SLUS-00707 ]
+    
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          lfs: true
+
+      - name: "Install Extra Dependencies"
+        run: apt-get install -y binutils-mipsel-linux-gnu
+
+      - name: "Setup Python"
+        run: pip3 install -r requirements.txt --break-system-packages
+
+      - name: "Copy ROM"
+        run: |
+          mkdir -p ./rom/image
+          cp -r -p /rom/* ./rom/image
+
+      - name: Setup Environment
+        run: make setup
+
+      - name: Check Executables Match
+        run: make CHECKSUM=1 build

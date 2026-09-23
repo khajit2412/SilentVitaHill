@@ -1,0 +1,2098 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* PC port: touchscreen controls. See pc_touch.h for the scheme.
+ *
+ * Fingers are POLLED rather than taken from SDL events. SDL keeps live touch
+ * state (SDL_GetTouchFinger) updated by the pump the frame loop already runs,
+ * so polling needs no hook in PsyCross's event loop and cannot get out of step
+ * with it. Finger IDs are stable for the life of a contact, which is all the
+ * roles below need.
+ *
+ * Positions are carried in VIEWPORT space (0..1 across the presented picture,
+ * via PsyX_MapWindowToViewport) rather than window space, so letterboxing and
+ * pillarboxing cannot put a control somewhere the picture is not, and the same
+ * numbers drive both hit-testing and drawing.
+ */
+#include "game.h"
+#include "pc_config.h"
+#include "pc_touch.h"
+#include "sh_log.h"
+
+#include <libetc.h>
+#include <libgs.h>
+#include <SDL.h>
+#include <PsyX/PsyX_public.h>
+
+#include "bodyprog/screen/screen_data.h"
+#include "bodyprog/sys/joy.h"
+#include "screens/options.h" /* OptionsMenuState_Brightness */
+#include "bodyprog/events/map_msg.h" /* g_MapMsg_Select */
+#include "pc_quick_options.h"     /* the button below opens it */
+
+#define TC_MAX_FINGERS 8
+
+/* Roles a contact can take, decided once when it lands and held until release:
+ * a thumb that starts on the movement side must keep steering even if it slides
+ * across the middle. */
+enum { TR_NONE = 0, TR_MOVE, TR_LOOK, TR_BUTTON, TR_ADVANCE,
+       TR_TG_STICK, TR_TG_BTN };
+
+/* Actions the on-screen buttons drive. Indices into s_Buttons. */
+enum { TB_AIM = 0, TB_ITEM, TB_MAP, TB_START, TB_RUN, TB_BACK, TB_FIRE, TB_MENU,
+       TB_SKIP,
+       TB_LIGHT, TB_VIEW, TB_QSAVE, TB_QLOAD, TB_COUNT };
+
+typedef struct
+{
+    float cx, cy;   /* centre, viewport space */
+    float r;        /* radius in HEIGHT units (x is scaled by aspect) */
+    int   held;     /* 1 while a finger is on it */
+    int   holdFrames; /* minimum-press latch, see TC_BUTTON_MIN_FRAMES */
+} s_TouchButton;
+
+/* Fingers are sampled once per pad update, so a very brief contact could be
+ * pressed and released between two samples and register as nothing at all.
+ * Latch a floor on the press instead: any contact that is seen even once
+ * produces a press the game cannot miss the edge of. Costs a few frames of
+ * extra hold on release, which is imperceptible on Aim and irrelevant on the
+ * rest. (A contact shorter than a single frame is still lost, but that is far
+ * below what a thumb can do -- it took an injected 10ms synthetic tap to
+ * produce one.) */
+#define TC_BUTTON_MIN_FRAMES 3
+
+/* Bottom-right cluster for the two combat-adjacent actions, with Item and Map
+ * above them and Start out of the way in the corner. Right-handed layout: the
+ * looking thumb is already on this side. */
+static s_TouchButton s_Buttons[TB_COUNT] = {
+    [TB_AIM] = { 0.905f, 0.760f, 0.105f, 0 },
+    [TB_ITEM] = { 0.760f, 0.830f, 0.070f, 0 },
+    [TB_MAP] = { 0.905f, 0.510f, 0.070f, 0 },
+    /* Off the very corner: 0.955/0.075 sat hard against the bezel, which is
+     * awkward to reach and close to where a phone puts its own system
+     * gestures. Moved ~20 overlay units down and in. X is a smaller fraction
+     * than Y for the same distance because the overlay is ~570 units wide at
+     * this aspect against 240 tall. */
+    [TB_START] = { 0.920f, 0.158f, 0.055f, 0 },
+    [TB_RUN] = { 0.665f, 0.760f, 0.065f, 0 },
+    /* TB_BACK is only ever drawn in the corner escape slot, so its own
+     * position is never used -- it exists to carry a glyph and a binding. */
+    [TB_BACK] = { 0.920f, 0.158f, 0.055f, 0 },
+    /* Mirror of Aim on the other thumb, and only while Aim is held: firing
+     * meant tapping the steering half of the screen, which fights the stick
+     * the same thumb is holding. Hidden the rest of the time so it never eats
+     * a movement drag. */
+    [TB_FIRE] = { 0.095f, 0.760f, 0.105f, 0 },
+    /* Quick options. Permanent, because a phone has no F10 to press and the
+     * settings behind it are the ones worth changing mid-scene (brightness,
+     * fog, flashlight). Mirrors Start across the screen: same height, other
+     * side, so the two system buttons frame the top and neither sits where a
+     * thumb rests while playing. */
+    [TB_MENU] = { 0.080f, 0.158f, 0.055f, 0 },
+    /* Flashlight and camera change. Both are stock PSX binds the pad has always
+     * had, and without a button here neither is reachable on a phone at all --
+     * the torch in particular is not a preference, it is how you see. Placed in
+     * the gaps the right-hand cluster already leaves rather than crowding it:
+     * Light sits under Item, View between Map and Start. */
+    [TB_LIGHT] = { 0.760f, 0.640f, 0.062f, 0 },
+    [TB_VIEW] = { 0.905f, 0.330f, 0.058f, 0 },
+    /* Corner escape slot only, like TB_BACK -- its own position is never
+     * used; it carries the glyph and the Skip binding. */
+    [TB_SKIP] = { 0.920f, 0.158f, 0.055f, 0 },
+    /* Quick Save / Quick Load, only with touch_quicksave_buttons on. Up in the
+     * empty band of the top edge, a quarter in from each side, about the size
+     * of Menu, Pause and View -- a shade larger, so the letter clears the ring. */
+    [TB_QSAVE] = { 0.245f, 0.068f, 0.060f, 0 },
+    [TB_QLOAD] = { 0.745f, 0.068f, 0.060f, 0 },
+};
+
+typedef struct
+{
+    SDL_TouchID  dev;   /* a finger id is only unique WITHIN its device */
+    SDL_FingerID id;
+    int   active;
+    int   role;
+    int   buttonIdx;
+    float x, y;             /* current, viewport space */
+    float startX, startY;
+    float originX, originY; /* movement stick origin (floating) */
+    float lastX, lastY;     /* previous frame, for look deltas */
+    Uint32 startMs;
+    int   movedFar;         /* travelled beyond the tap slop */
+} s_TouchFinger;
+
+static s_TouchFinger s_Fingers[TC_MAX_FINGERS];
+
+/* Built state, read by Pc_Touch_GetPad and the draw. */
+static unsigned short s_PadWord = 0xFFFF;
+static unsigned char  s_LeftX = 128, s_LeftY = 128, s_RightX = 128, s_RightY = 128;
+static int            s_StickActive;
+static float          s_StickOx, s_StickOy, s_StickKx, s_StickKy;
+static int            s_Running;
+static int            s_ActionFrames;  /* tap pulse, in pad updates */
+static int            s_CancelFrames;  /* the same, for the tap-anywhere Cancel */
+static int            s_AdvanceHeld;   /* a finger is down during an advance state */
+static int            s_PadAttached;   /* an SDL game controller is plugged in */
+static Uint32         s_LastTouchMs;
+
+/* Which kind of input was used LAST. The attached flag alone cannot decide it:
+ * a controller left plugged in and idle must not lock a player out of the
+ * screen, and Android enumerates a phantom device on hardware carrying no pad
+ * at all. TS_NONE is the state before anything has been used, where an attached
+ * controller is the only evidence there is. */
+enum { TS_NONE = 0, TS_TOUCH, TS_PHYSICAL };
+static int            s_LastSource;
+
+/* Movement stick geometry, in height units. The radius is a thumb's comfortable
+ * travel, not a screen fraction that would balloon on a tablet. */
+#define TC_STICK_RADIUS   0.150f
+#define TC_STICK_DEADZONE 0.150f  /* fraction of the radius */
+/* Engage high enough that a normal walk does not trip it, release much
+ * lower so the run survives the dips a thumb makes while steering. One
+ * threshold for both meant 0.850 had to be reachable AND holdable: it was
+ * a long drag to start and dropped the moment the thumb eased off. */
+#define TC_RUN_THRESHOLD  0.680f  /* deflection past this starts a run */
+#define TC_RUN_RELEASE    0.480f  /* below this it stops -- hysteresis */
+
+/* A contact is a tap if it is released quickly without travelling far. The slop
+ * is generous: thumbs roll, and a tap that gets misread as a drag reads to the
+ * player as an input that did nothing. */
+#define TC_TAP_MS        260
+#define TC_TAP_SLOP      0.035f
+#define TC_ACTION_FRAMES 3        /* hold Action long enough to survive an edge test */
+/* A tap has to read as DELIBERATE before it dismisses a screen. Below this a
+ * contact is a graze -- a thumb resting as the phone is picked up, a knuckle
+ * on the way past -- and backing out of a save screen on one of those would
+ * be its own kind of hostile. Well under what a real press takes, so nothing
+ * an actual finger does gets rejected. */
+#define TC_TAP_MIN_MS    45
+
+/* Full right-stick deflection for a drag crossing this much of the picture in
+ * one update. Small enough that a flick whips the camera, large enough that a
+ * slow drag creeps. Scaled by the look-sensitivity setting. */
+#define TC_LOOK_SPAN 0.085f
+
+#define TC_LEFT_ZONE 0.45f /* left of this (and not on a button) steers */
+
+static float Tc_Aspect(void)
+{
+    int sw = 0, sh = 0;
+
+    PsyX_GetScreenSize(&sw, &sh);
+    if (sw <= 0 || sh <= 0)
+        return 4.0f / 3.0f;
+
+    return (float)sw / (float)sh;
+}
+
+static float Tc_LookGain(void)
+{
+    float s = g_PcConfig.touchLookSensitivity;
+
+    if (s <= 0.0f)
+        s = 1.0f;
+
+    return s;
+}
+
+static int Tc_Level(void);
+
+/* How much of the scheme is live.
+ *
+ * ESCAPE is the floor, and it is the answer to a player who turned the controls
+ * off on a phone with no pad paired: the taps that skip a logo or advance a line
+ * of text, and the lone corner button that leaves a pause, map, save or
+ * brightness screen. Those are not controls, they are the route back to the
+ * setting -- with them gone the boot logos could not be dismissed, so the
+ * options menu holding the setting could never be reached again and the only
+ * fix was reinstalling the app.
+ *
+ * So Off takes away the stick, the buttons and the tap-to-Action, and keeps the
+ * way out. Once something else can genuinely play the game -- a pad attached or
+ * a physical button pressed -- Off means off. */
+enum { TC_LEVEL_NONE = 0, TC_LEVEL_ESCAPE, TC_LEVEL_FULL };
+
+/* TC_MODE_BACK_CURSOR is TC_MODE_BACK with the background still LIVE: the same
+ * lone corner button, but a tap on the rest of the screen belongs to whatever
+ * is under it rather than to leaving. Free-cursor puzzles are the case --
+ * tapping IS how you work one, so the tap-anywhere dismissal would back out
+ * the instant you touched a dial and the puzzle could never be solved. */
+enum { TC_MODE_OFF = 0, TC_MODE_GAMEPLAY, TC_MODE_PAUSE, TC_MODE_MAP, TC_MODE_ADVANCE, TC_MODE_BACK,
+       TC_MODE_BACK_CURSOR, TC_MODE_ESCAPE, TC_MODE_TITLE, TC_MODE_SKIP };
+
+/* Gameplay gets the full scheme. Pause gets Start ALONE -- nothing else on that
+ * screen responds to a pointer, so hiding the controls there left no way back
+ * out of a pause once one had been opened by touch. Everywhere else (menus,
+ * inventory, the map) touch already works through pc_mouse_cursor and a pad on
+ * top of it would fight it. */
+/* The attract demo is in-game gameplay as far as the state tests go, so the
+ * quick-options button would draw over it and be tappable. dbg_overlay.c gates
+ * the keyboard open the same way, and game_main.c closes the panel outright if
+ * a demo starts -- so opening it here would last a single frame anyway. Not
+ * drawing it at all beats a button that visibly does nothing. */
+static int Tc_MenuAllowed(void)
+{
+    return !(g_SysWork.sysFlags & SysFlag_DemoActive);
+}
+
+static int Tc_Mode(void)
+{
+    int level = Tc_Level();
+
+    if (level == TC_LEVEL_NONE)
+        return TC_MODE_OFF;
+
+    /* The quick-options panel freezes the game and drives itself through the
+     * pointer. Leaving the thumb controls up under it would both cover it and
+     * keep feeding the frozen game pad input, and a finger meant for a row
+     * would also count as a look-drag. */
+    if (Pc_QuickOptions_IsOpen())
+        return TC_MODE_OFF;
+
+    /* The PAPER map -- the fullscreen one from a wall map or a map-zoom event,
+     * not the Map button's screen. It is not a sys state at all: it runs as a
+     * gameplay SUB-state with the world frozen behind it, so every test below
+     * said TC_MODE_GAMEPLAY and put the full thumb overlay on top of it. It
+     * leaves on enter|cancel and none of the gameplay buttons send either, so
+     * a player with no pad was simply stuck there. Give it the same lone corner
+     * Back the other cancel-only screens get. */
+    {
+        extern int g_PcMapScreenActive;
+
+        /* TWO routes reach a fullscreen map, and they are tracked differently.
+         *
+         * The Map button's map is its own gameState: SysState_MapScreen loads
+         * the art and hands off to GameState_PaperMapScreen. It does NOT set
+         * g_PcMapScreenActive -- only Event_MapTake and the map-zoom events do,
+         * and those run inside GameState_InGame. Testing the flag alone
+         * therefore missed the one route a player uses constantly, and every
+         * test below then fell through to "not InGame" and returned OFF: no
+         * button built, no input taken, nothing drawn.
+         *
+         * Both are checked now, by the thing that actually identifies each.
+         * The screen closes on cancel from either entry point, which is what
+         * TC_MODE_BACK's corner button sends. */
+        /* ...but NOT while the map is asking something. Event_MapTake draws the
+         * map, sets the flag, and THEN puts a Yes/No over it (case 3, "take this
+         * map?"). Treating that as a dismissable map made every tap send Cancel,
+         * so the answer was always No and the map could not be picked up at all.
+         *
+         * A screen with a live selection is not a screen you leave by tapping
+         * it. Falling through here hands the prompt back to the ordinary state
+         * handling, which confirms on a tap the way every other message does.
+         * maxIdx is NO_VALUE whenever no choice is on screen, so this is inert
+         * for a map you are simply reading. */
+        if ((g_GameWork.gameState == GameState_PaperMapScreen || g_PcMapScreenActive) &&
+            g_MapMsg_Select.maxIdx == NO_VALUE)
+        {
+            static int s_loggedMap = 0;
+
+            if (!s_loggedMap)
+            {
+                s_loggedMap = 1;
+                SH_DBG("[TOUCH] map screen: gameState=%d flag=%d -> corner Back",
+                       (int)g_GameWork.gameState, g_PcMapScreenActive);
+            }
+
+            return TC_MODE_BACK;
+        }
+    }
+
+    /* The boot logos and the intro movies are GAME states, not sys states, so
+     * the checks below never saw them and the Konami/KCET screens could not be
+     * skipped by touch the way Start skips them on a pad. */
+    if (g_GameWork.gameState == GameState_KonamiLogo ||
+        g_GameWork.gameState == GameState_KcetLogo ||
+        g_GameWork.gameState == GameState_MovieIntroFadeIn ||
+        g_GameWork.gameState == GameState_MovieIntroAlternate ||
+        g_GameWork.gameState == GameState_MovieIntro ||
+        g_GameWork.gameState == GameState_MovieOpening ||
+        g_GameWork.gameState == GameState_ExitMovie)
+        return TC_MODE_ADVANCE;
+
+    /* The results/ranking screen at the end of a run. Its own gameState, and it
+     * moves on for exactly one bind -- Skip (func_801E342C). Every other test
+     * below fell through to "not InGame" and returned OFF, so a player with no
+     * pad reached the end of the game and could not leave the screen. */
+    if (g_GameWork.gameState == GameState_Unk15)
+        return TC_MODE_SKIP;
+
+    /* The end credits scroll. It runs inside map6_s02's update during InGame,
+     * so it looks exactly like gameplay from here -- the stamp is the only
+     * thing that knows. Two ticks of slack so a frame that skips the credits
+     * update does not blink the button out. */
+    {
+        extern int g_PcCreditsFrame;
+
+        if ((g_TickCount - g_PcCreditsFrame) <= 2)
+            return TC_MODE_SKIP;
+    }
+
+    /* The brightness screen is a slider with no pointer support, so touch could
+     * open it and then had no way out. It leaves on enter|cancel; Back sends
+     * cancel, which leaves the setting as it was. */
+    if (g_GameWork.gameState == GameState_OptionScreen &&
+        g_GameWork.gameStateSteps[0] == OptionsMenuState_Brightness)
+        return TC_MODE_BACK;
+
+    /* The save/load screen needs the corner Back -- it is reachable straight
+     * from the pause menu, and with no pad a player could get in and not back
+     * out -- but it is NOT cancel-only. saveload.c drives the whole screen as a
+     * pointer: a tap picks a slot or a menu option, a drag scrolls the list.
+     *
+     * As TC_MODE_BACK, every tap on a slot was two actions. The pointer turned
+     * it into a click and the save began to load, then the release fired the
+     * tap-anywhere Cancel and backed straight out again: MenuConfirm followed
+     * by MenuCancel on every tap, the screen left half faded, and no save could
+     * be loaded at all. BACK_CURSOR keeps the corner button and leaves the rest
+     * of the screen to the pointer, the same as a free-cursor puzzle. */
+    if (g_GameWork.gameState == GameState_SaveScreen ||
+        g_GameWork.gameState == GameState_LoadSavegameScreen)
+        return TC_MODE_BACK_CURSOR;
+
+    /* Only while the browser is actually up, and only as the way OUT of it.
+     * Opening is the tappable "Achievements" line in the corner now
+     * (title.c), so a permanent button here would be a second control for
+     * something already on screen. Closing still needs one: the browser
+     * takes cancel or map to leave, and its own pointer handling uses a
+     * RIGHT click for that, which a finger cannot produce.
+     *
+     * Self-gating rather than platform-gated, so this file keeps carrying no
+     * platform conditionals: Pc_RaBrowser_IsOpen is false everywhere the
+     * browser is not compiled in or not open. */
+    {
+        extern int Pc_RaBrowser_IsOpen(void);
+
+        if (g_GameWork.gameState == GameState_MainMenu && Pc_RaBrowser_IsOpen())
+            return TC_MODE_TITLE;
+    }
+
+    if (g_GameWork.gameState != GameState_InGame)
+        return TC_MODE_OFF;
+    if (g_SysWork.sysState == SysState_Gameplay)
+    {
+        /* Escape level keeps only the corner Start, so a player already inside
+         * a save when the controls were turned off can still open the pause
+         * menu rather than having to relaunch to reach the options. */
+        return (level == TC_LEVEL_FULL) ? TC_MODE_GAMEPLAY : TC_MODE_ESCAPE;
+    }
+    if (g_SysWork.sysState == SysState_GamePaused)
+        return TC_MODE_PAUSE;
+    if (g_SysWork.sysState == SysState_MapScreen)
+        return TC_MODE_MAP;
+
+    /* States that are just waiting to be advanced or skipped: message and
+     * examine text, scripted scenes, the FMV hand-off, the game-over screen.
+     * A pad presses Start or Cross here; a touchscreen had no way to say it,
+     * so cutscenes could not be skipped and text could not be advanced.
+     *
+     * The save menus belong here too. They open with Harry talking, and with
+     * neither state listed the whole block fell through to OFF -- no advance,
+     * no escape, nothing to tap at the first save point.
+     *
+     * EXCEPT while a free-cursor puzzle is up: those are already driven as a
+     * pointer by pc_mouse_cursor, and injecting a confirm underneath would
+     * fire twice on every tap. That test carries the save menus correctly too,
+     * because the slot list draws a cursor and the dialogue before it does not:
+     * the talking part advances on a tap, and once the slots are up the pointer
+     * drives them with the corner Back button for a way out. */
+    if (g_SysWork.sysState == SysState_ReadMessage ||
+        g_SysWork.sysState == SysState_EventCallback ||
+        g_SysWork.sysState == SysState_Fmv ||
+        g_SysWork.sysState == SysState_GameOver ||
+        g_SysWork.sysState == SysState_SaveMenu0 ||
+        g_SysWork.sysState == SysState_SaveMenu1)
+    {
+        extern int Pc_MouseCursor_PuzzleActive(void);
+
+        /* A free-cursor puzzle is already driven as a pointer by
+         * pc_mouse_cursor, so no confirm may be injected underneath -- it would
+         * fire twice on every tap. But OFF left the corner empty too, and these
+         * screens are cancel-only: with no pad there was no way out at all, so
+         * opening one on a phone was a softlock. Give it the same lone Back
+         * button the brightness screen gets. The drag still reaches the cursor;
+         * only that one corner slot is taken. */
+        if (Pc_MouseCursor_PuzzleActive())
+            return TC_MODE_BACK_CURSOR;
+
+        return TC_MODE_ADVANCE;
+    }
+
+    return TC_MODE_OFF;
+}
+
+/* Full-screen states that a pad closes with one specific button, and that no
+ * pointer can dismiss (unlike the inventory and options screens, which
+ * pc_mouse_cursor already drives). Each keeps exactly that button alive so
+ * touch always has a way back out -- opening one with no way to leave it is
+ * how the pause screen trapped the player. Drawn in the corner slot whatever
+ * the action, so "get out of here" is always in the same place. */
+/* ------------------------------------------------------- gamepad style ---
+ *
+ * The alternate scheme: a fixed PSX pad rather than the context-sensitive
+ * overlay above. Adapted from WhoisMiau0x1's Android fork of this port, which
+ * takes the opposite approach on purpose -- everything in one place, always,
+ * so a player who knows a DualShock already knows this.
+ *
+ * Laid out in units of screen HEIGHT, never width. Height is the stable
+ * dimension in landscape: an 18:9 phone and a 4:3 tablet differ enormously in
+ * width but put the thumbs at the same place relative to height, so this keeps
+ * every control the same physical size and leaves the wide middle -- where the
+ * game is -- clear.
+ *
+ * Raw PSX bits, not controllerConfig binds. This IS a pad, so a face button
+ * has to be the button it is drawn as; routing it through the rebindable
+ * action names would make Circle stop being Circle the moment someone remapped
+ * anything. The word is active-low and ANDed into the pad, same as above.
+ *
+ * These are the RAW pad-buffer bits, not libetc.h's PAD* names: the raw report
+ * is a little-endian u_short whose two bytes are SWAPPED relative to what
+ * PadRead() returns, so PADRup and friends would compile cleanly here and
+ * silently turn triangle into d-pad up. */
+#define TG_SELECT   0x0001
+#define TG_START    0x0008
+#define TG_UP       0x0010
+#define TG_RIGHT    0x0020
+#define TG_DOWN     0x0040
+#define TG_LEFT     0x0080
+#define TG_L2       0x0100
+#define TG_R2       0x0200
+#define TG_L1       0x0400
+#define TG_R1       0x0800
+#define TG_TRIANGLE 0x1000
+#define TG_CIRCLE   0x2000
+#define TG_CROSS    0x4000
+#define TG_SQUARE   0x8000
+
+#define TG_STICK_CX 0.26f
+#define TG_STICK_CY 0.70f
+#define TG_STICK_R  0.165f
+#define TG_KNOB_R   0.075f
+#define TG_DEAD     0.20f
+
+#define TG_BTN_CX   0.26f   /* face cluster centre, from the RIGHT edge */
+#define TG_BTN_CY   0.70f
+#define TG_BTN_D    0.125f  /* cluster arm length */
+#define TG_BTN_R    0.068f
+#define TG_SHLD_W   0.080f
+/* Start and Select carry the longest names on the row (SELECT is 35 prim units
+ * at the smallest legible size, a shoulder plate's inside is 34), so their
+ * plates are a touch wider. */
+#define TG_MID_W    0.095f
+#define TG_SHLD_H   0.040f
+
+/* Drawn small, caught generously: a thumb's contact patch sits below where the
+ * player thinks it is, and a button that catches wide feels accurate while the
+ * reverse feels broken. */
+#define TG_HIT_GROW 1.30f
+
+typedef struct
+{
+    float          cx, cy;  /* centre in HEIGHT units, x from the left edge */
+    float          hw, hh;  /* half extents; circular when hw == hh */
+    int            circle;
+    unsigned short bit;
+} s_TgCtl;
+
+enum { TG_C_TRIANGLE = 0, TG_C_CIRCLE, TG_C_CROSS, TG_C_SQUARE,
+       TG_C_L1, TG_C_L2, TG_C_START, TG_C_MENU, TG_C_SELECT, TG_C_R2, TG_C_R1,
+       TG_C_QSAVE, TG_C_QLOAD,
+       TG_C_COUNT };
+
+/* Quick Save / Quick Load: round, face-button style, between the shoulders and
+ * the middle trio, centred on the row. */
+#define TG_QS_R      0.060f /* the letter needs this much ring to clear it */
+#define TG_QS_ROW_Y  0.08f
+#define TG_QS_LOW_Y  (0.08f + TG_SHLD_H + TG_QS_R + 0.03f)
+
+/* Both styles' quick buttons exist only with touch_quicksave_buttons on:
+ * hidden, they are neither drawn nor hit-tested. */
+extern void Pc_QuickSave_TouchRequest(int load);
+
+static int Tc_QuickButtonsOn(void)
+{
+    return g_PcConfig.touchQuickSaveLoad != 0;
+}
+
+/* The quick-options panel has no PSX button to press, so its control carries no
+ * pad bit and is handled on its own edge below -- the same way TB_MENU is in the
+ * context style. Zero means "not a pad control". */
+#define TG_NOBIT 0x0000
+
+static s_TgCtl s_TgCtls[TG_C_COUNT];
+static int     s_TgHeld[TG_C_COUNT];
+static int     s_TgLaidOut;
+static float   s_TgAspectW;   /* screen width in height units */
+
+/* Rebuilt whenever the aspect changes: x is resolved from the right edge for
+ * the clusters that belong there, which needs the width in height units. */
+static void Tg_Layout(float aspectW)
+{
+    float rx = aspectW - TG_BTN_CX;   /* face cluster centre from the left */
+    int   i;
+
+    if (s_TgLaidOut && s_TgAspectW == aspectW)
+        return;
+
+    s_TgAspectW = aspectW;
+    s_TgLaidOut = 1;
+
+    /* Face diamond, PSX arrangement: triangle up, cross down, square left,
+     * circle right. */
+    s_TgCtls[TG_C_TRIANGLE] = (s_TgCtl){ rx,            TG_BTN_CY - TG_BTN_D, TG_BTN_R, TG_BTN_R, 1, TG_TRIANGLE };
+    s_TgCtls[TG_C_CROSS]    = (s_TgCtl){ rx,            TG_BTN_CY + TG_BTN_D, TG_BTN_R, TG_BTN_R, 1, TG_CROSS };
+    s_TgCtls[TG_C_SQUARE]   = (s_TgCtl){ rx - TG_BTN_D, TG_BTN_CY,            TG_BTN_R, TG_BTN_R, 1, TG_SQUARE };
+    s_TgCtls[TG_C_CIRCLE]   = (s_TgCtl){ rx + TG_BTN_D, TG_BTN_CY,            TG_BTN_R, TG_BTN_R, 1, TG_CIRCLE };
+
+    /* Top row: shoulders at the outside, Start/Select inboard of them. */
+    s_TgCtls[TG_C_L1]     = (s_TgCtl){ 0.14f,            0.08f, TG_SHLD_W, TG_SHLD_H, 0, TG_L1 };
+    s_TgCtls[TG_C_L2]     = (s_TgCtl){ 0.34f,            0.08f, TG_SHLD_W, TG_SHLD_H, 0, TG_L2 };
+    /* Three across the middle -- Start, Menu, Select -- centred on the screen's
+     * midline. The gap gives way on a narrow screen: a phone has room, but at
+     * 4:3 a fixed 0.22 puts Start on top of L2, which sits 0.34 in. */
+    {
+        const float mid   = aspectW * 0.5f;
+        const float room  = mid - (0.34f + TG_SHLD_W + TG_MID_W + 0.02f);
+        /* Never closer than Start's plate to Menu's drawn bars (46% of the
+         * Menu plate's width). The bars are all that is visible there; using
+         * Menu's whole plate pushed the trio onto L2 and R2 at 4:3. */
+        const float tight = TG_MID_W + (TG_SHLD_W * 0.46f) + 0.01f;
+        float       sp    = 0.22f;
+        float       startX, selectX, gap, qy;
+
+        if (sp > room)  sp = room;
+        if (sp < tight) sp = tight;
+        startX  = mid - sp;
+        selectX = mid + sp;
+
+        s_TgCtls[TG_C_START]  = (s_TgCtl){ startX,  0.08f, TG_MID_W,  TG_SHLD_H, 0, TG_START };
+        s_TgCtls[TG_C_MENU]   = (s_TgCtl){ mid,     0.08f, TG_SHLD_W, TG_SHLD_H, 0, TG_NOBIT };
+        s_TgCtls[TG_C_SELECT] = (s_TgCtl){ selectX, 0.08f, TG_MID_W,  TG_SHLD_H, 0, TG_SELECT };
+
+        /* Save midway between L2 and Start, Load midway between Select and
+         * R2 -- the gaps they were asked for. Where that gap is too narrow for
+         * the button (a 4:3 tablet has none), they drop below the row. */
+        gap = (startX - TG_MID_W) - (0.34f + TG_SHLD_W);
+        /* In the row only where the gap also holds their TOUCH areas: each
+         * side's plate catches 30% past its drawn edge and the button 30% past
+         * its ring. At 16:9 the drawn gap fits but those overlap, so the
+         * plates would take the taps meant for Save and Load. */
+        qy  = (gap >= ((TG_SHLD_W + TG_MID_W) * (TG_HIT_GROW - 1.0f)) +
+                      (TG_QS_R * TG_HIT_GROW * 2.0f))
+                  ? TG_QS_ROW_Y : TG_QS_LOW_Y;
+        s_TgCtls[TG_C_QSAVE] = (s_TgCtl){ (0.34f + startX) * 0.5f,            qy, TG_QS_R, TG_QS_R, 1, TG_NOBIT };
+        s_TgCtls[TG_C_QLOAD] = (s_TgCtl){ (selectX + aspectW - 0.34f) * 0.5f, qy, TG_QS_R, TG_QS_R, 1, TG_NOBIT };
+    }
+    s_TgCtls[TG_C_R2]     = (s_TgCtl){ aspectW - 0.34f,   0.08f, TG_SHLD_W, TG_SHLD_H, 0, TG_R2 };
+    s_TgCtls[TG_C_R1]     = (s_TgCtl){ aspectW - 0.14f,   0.08f, TG_SHLD_W, TG_SHLD_H, 0, TG_R1 };
+
+    for (i = 0; i < TG_C_COUNT; i++)
+        s_TgHeld[i] = 0;
+}
+
+/* Viewport coords -> height units, x from the left. */
+static void Tg_ToHeight(float vx, float vy, float aspectW, float* hx, float* hy)
+{
+    *hx = vx * aspectW;
+    *hy = vy;
+}
+
+static int Tg_HitCtl(float hx, float hy)
+{
+    int i;
+
+    for (i = 0; i < TG_C_COUNT; i++)
+    {
+        if ((i == TG_C_QSAVE || i == TG_C_QLOAD) && !Tc_QuickButtonsOn())
+            continue;
+
+        float dx = hx - s_TgCtls[i].cx;
+        float dy = hy - s_TgCtls[i].cy;
+        float hw = s_TgCtls[i].hw * TG_HIT_GROW;
+        float hh = s_TgCtls[i].hh * TG_HIT_GROW;
+
+        if (s_TgCtls[i].circle)
+        {
+            if ((dx * dx) + (dy * dy) <= (hw * hw))
+                return i;
+        }
+        else if (dx > -hw && dx < hw && dy > -hh && dy < hh)
+        {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+static int Tg_HitStick(float hx, float hy)
+{
+    float dx = hx - TG_STICK_CX;
+    float dy = hy - TG_STICK_CY;
+    float r  = TG_STICK_R * TG_HIT_GROW;
+
+    return ((dx * dx) + (dy * dy)) <= (r * r);
+}
+
+static int Tc_GamepadStyle(void)
+{
+    return g_PcConfig.touchStyle == TouchStyle_Gamepad;
+}
+
+static int Tc_SoloButton(int mode)
+{
+    if (mode == TC_MODE_PAUSE || mode == TC_MODE_ESCAPE)
+        return TB_START;   /* pause opens and exits on the same bind */
+    if (mode == TC_MODE_MAP)
+        return TB_MAP;     /* the map screen exits on the map bind */
+    if (mode == TC_MODE_BACK || mode == TC_MODE_BACK_CURSOR)
+        return TB_BACK;    /* brightness and friends leave on cancel */
+    if (mode == TC_MODE_TITLE)
+        return TB_MAP;     /* opens the achievement browser, and closes it */
+    if (mode == TC_MODE_SKIP)
+        return TB_SKIP;    /* results and credits move on with Skip */
+
+    return -1;
+}
+
+/* A controller BUTTON or a pushed stick, which the key word below never
+ * carried: Automatic asks "what was used last", and a pad answered that only
+ * by being ATTACHED. So once a finger had touched the glass -- which every
+ * player does to reach the menu -- s_LastSource stayed TS_TOUCH and the overlay
+ * stayed up for the rest of the session while the pad was doing the playing
+ * (reported). Worse, an overlay that is up overwrites the pad's sticks in
+ * PsyX_pad.cpp, which is why movement was d-pad only. */
+#define TC_PAD_STICK_DEAD 12000
+
+static int Tc_PadInUse(void)
+{
+    static const int AXES[4] = {
+        SDL_CONTROLLER_AXIS_LEFTX, SDL_CONTROLLER_AXIS_LEFTY,
+        SDL_CONTROLLER_AXIS_RIGHTX, SDL_CONTROLLER_AXIS_RIGHTY,
+    };
+    int i;
+
+    if (PsyX_Pad_HeldBindName() != NULL)
+        return 1;
+    for (i = 0; i < 4; i++)
+    {
+        const int v = PsyX_Pad_AxisValue(AXES[i]);
+
+        if (v > TC_PAD_STICK_DEAD || v < -TC_PAD_STICK_DEAD)
+            return 1;
+    }
+    return 0;
+}
+
+/* Real hardware wins. Two tests, because one is not enough here: SDL opens a
+ * pad as a GameController on most platforms, but on Android it frequently never
+ * enumerates one at all -- this project's own GameSir arrives purely as key
+ * events, with SDL reporting no joysticks but the accelerometer. So also treat
+ * ANY keyboard/pad button as proof that something physical is in use.
+ *
+ * Touching the screen hands control back, so a pad left connected and idle
+ * does not permanently lock out a player who puts it down. */
+void Pc_Touch_NoteOtherInput(int padAttached, int keyWord)
+{
+    s_PadAttached = (padAttached != 0);
+
+    if (keyWord != 0xFFFF || Tc_PadInUse())
+        s_LastSource = TS_PHYSICAL;
+}
+
+/* A finger on the glass, asked WITHOUT the enable gate -- this is what decides
+ * the gate. Pc_Touch_AnyContact cannot serve here: it honours the setting, and
+ * the whole point is to notice the screen being used while touch is standing
+ * aside. */
+static int Tc_ContactPresent(void)
+{
+    int n = SDL_GetNumTouchDevices();
+    int d;
+
+    for (d = 0; d < n; d++)
+    {
+        if (SDL_GetNumTouchFingers(SDL_GetTouchDevice(d)) > 0)
+            return 1;
+    }
+
+    return 0;
+}
+
+static int Tc_Level(void)
+{
+    /* Nothing else can drive the game: no pad attached, and no physical button
+     * ever pressed. */
+    int soleInput = (s_LastSource != TS_PHYSICAL) && !s_PadAttached;
+
+    if (g_PcConfig.touchControls == TouchControls_On)
+        return TC_LEVEL_FULL;
+
+    if (g_PcConfig.touchControls == TouchControls_Off)
+        return soleInput ? TC_LEVEL_ESCAPE : TC_LEVEL_NONE;
+
+    /* Automatic: last input wins. A pad left connected and idle only decides it
+     * while nothing at all has been used yet. */
+    if (s_LastSource == TS_TOUCH)
+        return TC_LEVEL_FULL;
+
+    return soleInput ? TC_LEVEL_FULL : TC_LEVEL_NONE;
+}
+
+static unsigned char Tc_AxisByte(float v)
+{
+    int b;
+
+    if (v < -1.0f) v = -1.0f;
+    if (v >  1.0f) v =  1.0f;
+
+    b = 128 + (int)(v * 127.0f);
+    if (b < 0)   b = 0;
+    if (b > 255) b = 255;
+
+    return (unsigned char)b;
+}
+
+/* Press whatever the player has bound to an action. Reading the live config
+ * rather than hardcoding Cross/Square means a rebound pad keeps working, and
+ * the region/difficulty defaults come along for free. */
+static void Tc_PressAction(unsigned short* word, unsigned short mask)
+{
+    if (mask != 0)
+        *word &= (unsigned short)~mask;
+}
+
+/* Buttons that exist only to fill the corner escape slot. They carry a glyph
+ * and a binding and have no place of their own, so their table entry is a copy
+ * of Start's -- which means any mode that draws them alongside Start stacks
+ * them inside the same ring. */
+static int Tc_CornerOnly(int b)
+{
+    return b == TB_BACK || b == TB_SKIP;
+}
+
+static int Tc_HitButton(float x, float y, float aspect)
+{
+    int i;
+
+    /* Gameplay only: the solo modes hit-test Start's circle directly and take
+     * the index from Tc_SoloButton, so nothing here has to answer for them. */
+    for (i = 0; i < TB_COUNT; i++)
+    {
+        if (Tc_CornerOnly(i))
+            continue;
+        if ((i == TB_QSAVE || i == TB_QLOAD) && !Tc_QuickButtonsOn())
+            continue;
+
+        float dx = (x - s_Buttons[i].cx) * aspect;
+        float dy = (y - s_Buttons[i].cy);
+        float r  = s_Buttons[i].r;
+
+        /* Hit radius is padded over the drawn radius: a control you can see is
+         * one players expect to hit near the edge of, and fingers are wide. */
+        r *= 1.25f;
+
+        if ((dx * dx) + (dy * dy) <= (r * r))
+            return i;
+    }
+
+    return -1;
+}
+
+static s_TouchFinger* Tc_FindFinger(SDL_TouchID dev, SDL_FingerID id)
+{
+    int i;
+
+    for (i = 0; i < TC_MAX_FINGERS; i++)
+    {
+        if (s_Fingers[i].active && s_Fingers[i].id == id && s_Fingers[i].dev == dev)
+            return &s_Fingers[i];
+    }
+
+    return NULL;
+}
+
+static s_TouchFinger* Tc_NewFinger(void)
+{
+    int i;
+
+    for (i = 0; i < TC_MAX_FINGERS; i++)
+    {
+        if (!s_Fingers[i].active)
+            return &s_Fingers[i];
+    }
+
+    return NULL;
+}
+
+static void Tc_Reset(void)
+{
+    int i;
+
+    for (i = 0; i < TC_MAX_FINGERS; i++)
+        s_Fingers[i].active = 0;
+    for (i = 0; i < TB_COUNT; i++)
+    {
+        s_Buttons[i].held       = 0;
+        s_Buttons[i].holdFrames = 0;
+    }
+
+    s_PadWord     = 0xFFFF;
+    s_LeftX = s_LeftY = s_RightX = s_RightY = 128;
+    s_StickActive = 0;
+    s_Running     = 0;
+    s_AdvanceHeld = 0;
+    /* Or a pending cancel would fire into whatever screen comes next. */
+    s_CancelFrames = 0;
+}
+
+void Pc_Touch_Update(void)
+{
+    SDL_TouchID dev;
+    Uint32      now;
+    float       aspect;
+    int         nDev, nFingers, i, d, mode;
+    int         seen[TC_MAX_FINGERS];
+    float       lookDx = 0.0f, lookDy = 0.0f;
+    int         winW = 0, winH = 0;
+
+    /* BEFORE the mode gate, not inside the per-finger loop below. That loop only
+     * runs once touch is already enabled, so the clear it used to hold could
+     * never fire: one keyboard or pad byte latched the controls off and no
+     * amount of touching the screen brought them back -- the permanent
+     * disappearance players were reinstalling the app to undo. Setting it here
+     * also means the tap that hands control back is the one that acts, rather
+     * than being swallowed to arm the next. */
+    if (Tc_ContactPresent())
+        s_LastSource = TS_TOUCH;
+
+    mode = Tc_Mode();
+    if (mode == TC_MODE_OFF)
+    {
+        Tc_Reset();
+        return;
+    }
+
+    nDev = SDL_GetNumTouchDevices();
+    if (nDev <= 0)
+    {
+        Tc_Reset();
+        return;
+    }
+
+    now    = SDL_GetTicks();
+    aspect = Tc_Aspect();
+    PsyX_GetScreenSize(&winW, &winH);
+
+    for (i = 0; i < TC_MAX_FINGERS; i++)
+        seen[i] = 0;
+
+    s_PadWord     = 0xFFFF;
+    s_AdvanceHeld = 0;
+
+    if (Tc_GamepadStyle())
+    {
+        int c;
+
+        Tg_Layout(Tc_Aspect());
+        for (c = 0; c < TG_C_COUNT; c++)
+            s_TgHeld[c] = 0;
+    }
+    for (i = 0; i < TB_COUNT; i++)
+    {
+        s_Buttons[i].held = 0;
+        if (s_Buttons[i].holdFrames > 0)
+            s_Buttons[i].holdFrames--;
+    }
+
+    /* EVERY touch device, not just index 0. An Android phone registers several
+     * (this one: 4) and the touchscreen is not necessarily the first -- polling
+     * only device 0 reported zero fingers no matter where the screen was
+     * touched, which looked exactly like touch not working at all. */
+    for (d = 0; d < nDev; d++)
+    {
+    dev      = SDL_GetTouchDevice(d);
+    nFingers = SDL_GetNumTouchFingers(dev);
+
+    if (nFingers > 0)
+        s_LastTouchMs = now;
+
+    for (i = 0; i < nFingers; i++)
+    {
+        SDL_Finger*    f = SDL_GetTouchFinger(dev, i);
+        s_TouchFinger* t;
+        float          vx, vy;
+        int            slot;
+
+        if (f == NULL)
+            continue;
+
+        /* Window-normalized -> viewport-normalized, so a letterboxed picture
+         * does not shift every control off where it is drawn. */
+        {
+            float fx = 0.0f, fy = 0.0f;
+            int   px = (int)(f->x * (float)winW);
+            int   py = (int)(f->y * (float)winH);
+
+            if (!PsyX_MapWindowToViewport(px, py, &fx, &fy))
+                continue; /* inside the black bars -- not on the picture at all */
+
+            vx = fx;
+            vy = fy;
+        }
+
+        t = Tc_FindFinger(dev, f->id);
+        if (t == NULL)
+        {
+            t = Tc_NewFinger();
+            if (t == NULL)
+                continue;
+
+            t->dev       = dev;
+            t->id        = f->id;
+            t->active    = 1;
+            t->startX    = vx;
+            t->startY    = vy;
+            t->originX   = vx;
+            t->originY   = vy;
+            t->lastX     = vx;
+            t->lastY     = vy;
+            t->startMs   = now;
+            t->movedFar  = 0;
+            t->buttonIdx = -1;
+
+            /* Role is decided once, here. A button wins over the zones so the
+             * controls stay reachable with the looking thumb already down. */
+            {
+                int b = Tc_HitButton(vx, vy, aspect);
+
+                if (mode == TC_MODE_GAMEPLAY && Tc_GamepadStyle())
+                {
+                    /* Fixed pad: the stick and the buttons are the only things
+                     * on screen, and everything else is scenery. No drag-look
+                     * and no tap-to-Action -- on a pad those are the right
+                     * stick and Circle, both of which are drawn. */
+                    float hx, hy;
+
+                    Tg_ToHeight(vx, vy, s_TgAspectW, &hx, &hy);
+
+                    {
+                        int c = Tg_HitCtl(hx, hy);
+
+                        if (c >= 0)
+                        {
+                            t->role      = TR_TG_BTN;
+                            t->buttonIdx = c;
+                        }
+                        else if (Tg_HitStick(hx, hy))
+                        {
+                            t->role      = TR_TG_STICK;
+                            t->buttonIdx = -1;
+                        }
+                        else
+                        {
+                            t->role      = TR_NONE;
+                            t->buttonIdx = -1;
+                        }
+                    }
+                }
+                else if (mode == TC_MODE_ADVANCE)
+                {
+                    /* Anywhere on the screen, with no target to find: there is
+                     * nothing else to touch during a scene or a wall of text. */
+                    t->role      = TR_ADVANCE;
+                    t->buttonIdx = -1;
+                }
+                else if (mode != TC_MODE_GAMEPLAY)
+                {
+                    /* One live control, in the corner slot; a stray thumb
+                     * anywhere else must not steer a frozen world. */
+                    int   solo = Tc_SoloButton(mode);
+                    float sdx  = (vx - s_Buttons[TB_START].cx) * aspect;
+                    float sdy  = (vy - s_Buttons[TB_START].cy);
+                    float sr   = s_Buttons[TB_START].r * 1.25f;
+                    int   onIt = (((sdx * sdx) + (sdy * sdy)) <= (sr * sr));
+
+                    t->role      = (onIt && solo >= 0) ? TR_BUTTON : TR_NONE;
+                    t->buttonIdx = (onIt && solo >= 0) ? solo : -1;
+                }
+                else if (b >= 0)
+                {
+                    t->role      = TR_BUTTON;
+                    t->buttonIdx = b;
+                }
+                else if (vx < TC_LEFT_ZONE && !s_StickActive)
+                {
+                    t->role = TR_MOVE;
+                }
+                else
+                {
+                    t->role = TR_LOOK;
+                }
+            }
+        }
+
+        t->x = vx;
+        t->y = vy;
+
+        {
+            float sdx = (vx - t->startX) * aspect;
+            float sdy = (vy - t->startY);
+
+            if (((sdx * sdx) + (sdy * sdy)) > (TC_TAP_SLOP * TC_TAP_SLOP))
+                t->movedFar = 1;
+        }
+
+        slot = (int)(t - s_Fingers);
+        if (slot >= 0 && slot < TC_MAX_FINGERS)
+            seen[slot] = 1;
+
+        switch (t->role)
+        {
+            /* The role the corner-slot branch above hands a thumb that landed
+             * anywhere else. It has to be listed: TR_LOOK is the switch default,
+             * so falling through fed the look rate and a stray thumb spun the
+             * camera behind a frozen pause screen -- and would have steered the
+             * world outright in the escape-only level, where the controls are
+             * meant to be gone. */
+            case TR_NONE:
+                break;
+
+            case TR_ADVANCE:
+                s_AdvanceHeld = 1;
+                break;
+
+            case TR_TG_BTN:
+                if (t->buttonIdx >= 0 && t->buttonIdx < TG_C_COUNT)
+                    s_TgHeld[t->buttonIdx] = 1;
+                break;
+
+            case TR_TG_STICK:
+            {
+                /* Absolute, not floating: the ring is drawn in a fixed place,
+                 * so the knob has to follow the thumb inside it. */
+                float hx, hy, dx, dy, len, mag;
+
+                Tg_ToHeight(vx, vy, s_TgAspectW, &hx, &hy);
+                dx  = hx - TG_STICK_CX;
+                dy  = hy - TG_STICK_CY;
+                len = SDL_sqrtf((dx * dx) + (dy * dy));
+
+                if (len > TG_STICK_R)
+                {
+                    dx  = (dx / len) * TG_STICK_R;
+                    dy  = (dy / len) * TG_STICK_R;
+                    len = TG_STICK_R;
+                }
+
+                mag = (len <= TG_STICK_R * TG_DEAD)
+                        ? 0.0f
+                        : (len - TG_STICK_R * TG_DEAD) / (TG_STICK_R - TG_STICK_R * TG_DEAD);
+
+                s_StickActive = 1;
+                s_StickOx     = TG_STICK_CX / s_TgAspectW;
+                s_StickOy     = TG_STICK_CY;
+                s_StickKx     = (TG_STICK_CX + dx) / s_TgAspectW;
+                s_StickKy     = TG_STICK_CY + dy;
+
+                if (mag > 0.0f && len > 0.0f)
+                {
+                    s_LeftX = Tc_AxisByte((dx / len) * mag);
+                    s_LeftY = Tc_AxisByte((dy / len) * mag);
+
+                    /* The d-pad bits as well as the analog position. Gameplay
+                     * reads the stick, but the inventory, the map screen and
+                     * every "press up or down to pick" prompt read the D-PAD
+                     * only -- a stick-only pad leaves those unnavigable. */
+                    if (mag > 0.5f)
+                    {
+                        if (dx >  len * 0.5f) s_PadWord &= (unsigned short)~TG_RIGHT;
+                        if (dx < -len * 0.5f) s_PadWord &= (unsigned short)~TG_LEFT;
+                        if (dy >  len * 0.5f) s_PadWord &= (unsigned short)~TG_DOWN;
+                        if (dy < -len * 0.5f) s_PadWord &= (unsigned short)~TG_UP;
+                    }
+                }
+                else
+                {
+                    s_LeftX = s_LeftY = 128;
+                }
+
+                /* The same auto-run the context stick has, on the same
+                 * thresholds. A thumb on glass gets no resistance to tell it
+                 * how far it has pushed, so pushing further is the only way to
+                 * ask for a run, and a fixed ring is where that reads best.
+                 * Forward only: Run plus Back is the quick back-jump, which
+                 * would turn every backward step into a lurch. Square is still
+                 * there for a deliberate one. */
+                {
+                    const float engage = s_Running ? TC_RUN_RELEASE : TC_RUN_THRESHOLD;
+                    s_Running = (mag >= engage) && (dy < (0.35f * len));
+                }
+                break;
+            }
+
+            case TR_BUTTON:
+                if (t->buttonIdx >= 0 && t->buttonIdx < TB_COUNT)
+                {
+                    s_Buttons[t->buttonIdx].held       = 1;
+                    s_Buttons[t->buttonIdx].holdFrames = TC_BUTTON_MIN_FRAMES;
+                }
+                break;
+
+            case TR_MOVE:
+            {
+                float dx  = (vx - t->originX) * aspect;
+                float dy  = (vy - t->originY);
+                float len = SDL_sqrtf((dx * dx) + (dy * dy));
+                float dead = TC_STICK_RADIUS * TC_STICK_DEADZONE;
+                float mag;
+
+                /* Drag the origin along once the thumb reaches the rim, so a
+                 * long push cannot run out of stick and stall mid-corridor. */
+                if (len > TC_STICK_RADIUS)
+                {
+                    float ox = dx / len * TC_STICK_RADIUS;
+                    float oy = dy / len * TC_STICK_RADIUS;
+
+                    t->originX = vx - (ox / aspect);
+                    t->originY = vy - oy;
+                    dx  = ox;
+                    dy  = oy;
+                    len = TC_STICK_RADIUS;
+                }
+
+                if (len <= dead)
+                {
+                    mag = 0.0f;
+                }
+                else
+                {
+                    mag = (len - dead) / (TC_STICK_RADIUS - dead);
+                    if (mag > 1.0f)
+                        mag = 1.0f;
+                }
+
+                s_StickActive = 1;
+                s_StickOx     = t->originX;
+                s_StickOy     = t->originY;
+                s_StickKx     = vx;
+                s_StickKy     = vy;
+
+                if (mag > 0.0f && len > 0.0f)
+                {
+                    s_LeftX = Tc_AxisByte((dx / len) * mag);
+                    s_LeftY = Tc_AxisByte((dy / len) * mag);
+                }
+                else
+                {
+                    s_LeftX = s_LeftY = 128;
+                }
+
+                /* Pushing the stick fully BACK used to trip this too, and
+                 * Run + Back is the quick back-jump -- so every backward step
+                 * became a lurch. Auto-run is for going forward; a deliberate
+                 * back-jump is still available by holding the Run button, which
+                 * is how a pad does it. dy is screen-down-positive, and the
+                 * margin keeps a run alive while turning hard. */
+                {
+                    const float engage = s_Running ? TC_RUN_RELEASE : TC_RUN_THRESHOLD;
+                    s_Running = (mag >= engage) && (dy < (0.35f * len));
+                }
+                break;
+            }
+
+            case TR_LOOK:
+            default:
+                lookDx += (vx - t->lastX) * aspect;
+                lookDy += (vy - t->lastY);
+                break;
+        }
+
+        t->lastX = vx;
+        t->lastY = vy;
+    }
+    }
+
+    /* Released contacts: a short, stationary one was a tap. Buttons already
+     * fired while held, so only the free zones produce Action. */
+    for (i = 0; i < TC_MAX_FINGERS; i++)
+    {
+        s_TouchFinger* t = &s_Fingers[i];
+
+        if (!t->active || seen[i])
+            continue;
+
+        /* Every role that IS a control, not just the context style's. TR_TG_BTN
+         * and TR_TG_STICK were missing, so releasing a Gamepad-style pad button
+         * inside the tap window ALSO pressed Action: the log shows heldBtnFlags
+         * going 0x0400 (L1) -> 0x4000 (Cross) two ticks after an L1 press, with
+         * no face button touched. Pressing a shoulder must never press Cross --
+         * on a pad every control is drawn, so there is no free zone to tap. */
+        if (mode == TC_MODE_GAMEPLAY &&
+            t->role != TR_BUTTON && t->role != TR_TG_BTN && t->role != TR_TG_STICK &&
+            !t->movedFar && (now - t->startMs) <= TC_TAP_MS)
+        {
+            s_ActionFrames = TC_ACTION_FRAMES;
+        }
+
+        /* Tap anywhere else on a cancel-only screen to leave it.
+         *
+         * The corner button is still drawn and still works; this is the half
+         * that stops a player hunting for it. Each of these screens has turned
+         * into a reported softlock in its turn -- the map, the brightness
+         * screen -- because the way out was one small target on a phone. The
+         * honest fix is that the whole background is the target.
+         *
+         * Buttons keep priority: a contact that landed on the corner already
+         * has role TR_BUTTON and is excluded, so this never doubles up.
+         *
+         * Only for screens with nothing else to tap. The save screen and the
+         * free-cursor puzzles are TC_MODE_BACK_CURSOR precisely so a tap there
+         * reaches the screen instead of leaving it. */
+        /* Never while a selection is on screen. "Take this map?" and "Is it OK
+         * to save?" are both drawn over a TC_MODE_BACK screen, and a blind
+         * Cancel ANSWERS them -- always with No. That is how the map became
+         * impossible to pick up. A screen asking a question is not a screen you
+         * dismiss by tapping it; maxIdx is NO_VALUE the rest of the time, so
+         * this costs the cancel-only screens nothing. */
+        if (mode == TC_MODE_BACK && t->role != TR_BUTTON && !t->movedFar &&
+            g_MapMsg_Select.maxIdx == NO_VALUE &&
+            (now - t->startMs) >= TC_TAP_MIN_MS &&
+            (now - t->startMs) <= TC_TAP_MS)
+        {
+            s_CancelFrames = TC_ACTION_FRAMES;
+        }
+
+        if (t->role == TR_MOVE || t->role == TR_TG_STICK)
+        {
+            /* TR_TG_STICK was missing here, so the fixed pad's knob stayed
+             * wherever it was let go of -- and because s_LeftX/s_LeftY are only
+             * written while a finger is on the stick, the last deflection kept
+             * being reported and the character kept walking. */
+            s_StickActive = 0;
+            s_LeftX = s_LeftY = 128;
+            s_Running = 0;
+        }
+
+        t->active = 0;
+        t->role   = TR_NONE;
+    }
+
+    /* Look is a RATE: deflection tracks drag speed, so the camera stops the
+     * moment the thumb does instead of drifting to an absolute position. */
+    {
+        float gain = Tc_LookGain() / TC_LOOK_SPAN;
+
+        s_RightX = Tc_AxisByte(lookDx * gain);
+        s_RightY = Tc_AxisByte(lookDy * gain);
+
+        if (g_PcConfig.invertControllerY)
+            s_RightY = Tc_AxisByte(-(lookDy * gain));
+    }
+
+    /* Buttons and gestures -> the player's own bindings. */
+    {
+        const s_ControllerConfig* cfg = &g_GameWorkPtr->config.controllerConfig;
+
+        if (s_Buttons[TB_AIM].holdFrames   > 0) Tc_PressAction(&s_PadWord, cfg->aim);
+        /* Fire only counts while the gun is up. One-button combat folds it into
+         * Aim itself, for players who would rather not hold two things at once. */
+        if (s_Buttons[TB_AIM].holdFrames > 0 &&
+            (g_PcConfig.oneButtonCombat || s_Buttons[TB_FIRE].holdFrames > 0))
+            Tc_PressAction(&s_PadWord, cfg->action);
+        if (s_Buttons[TB_ITEM].holdFrames  > 0) Tc_PressAction(&s_PadWord, cfg->item);
+        if (s_Buttons[TB_MAP].holdFrames   > 0) Tc_PressAction(&s_PadWord, cfg->map);
+        if (s_Buttons[TB_SKIP].holdFrames  > 0) Tc_PressAction(&s_PadWord, cfg->skip);
+
+        if (Tc_GamepadStyle())
+        {
+            int c;
+
+            for (c = 0; c < TG_C_COUNT; c++)
+            {
+                if (s_TgHeld[c] && s_TgCtls[c].bit != TG_NOBIT)
+                    s_PadWord &= (unsigned short)~s_TgCtls[c].bit;
+            }
+
+            /* Edge-triggered, or a held finger would toggle the panel open and
+             * shut every pad update. Same shape as TB_MENU above. */
+            {
+                static int s_tgMenuWas;
+                const int  menuNow = s_TgHeld[TG_C_MENU];
+
+                if (menuNow && !s_tgMenuWas)
+                    Pc_QuickOptions_Toggle();
+                s_tgMenuWas = menuNow;
+            }
+
+            /* Quick Save / Quick Load: no PSX button, so edge-triggered
+             * requests, gated like the keys in pc_quicksave.c. */
+            {
+                static int s_tgSaveWas, s_tgLoadWas;
+                const int  on      = Tc_QuickButtonsOn();
+                const int  saveNow = on && s_TgHeld[TG_C_QSAVE];
+                const int  loadNow = on && s_TgHeld[TG_C_QLOAD];
+
+                if (saveNow && !s_tgSaveWas) Pc_QuickSave_TouchRequest(0);
+                if (loadNow && !s_tgLoadWas) Pc_QuickSave_TouchRequest(1);
+                s_tgSaveWas = saveNow;
+                s_tgLoadWas = loadNow;
+            }
+        }
+        if (s_Buttons[TB_LIGHT].holdFrames > 0) Tc_PressAction(&s_PadWord, cfg->light);
+        /* The raw L2 bit, which is exactly what the Gamepad style's second
+         * shoulder control sends -- not controllerConfig.view. Going through
+         * the bind let the two styles disagree: control type 2 moves `view` to
+         * L1 and puts step-left on L2, so the same button did different things
+         * depending on a setting in another menu. Same bit in both styles now,
+         * by construction. */
+        if (s_Buttons[TB_VIEW].holdFrames  > 0) Tc_PressAction(&s_PadWord, TG_L2);
+        if (s_Buttons[TB_START].holdFrames > 0) Tc_PressAction(&s_PadWord, cfg->pause);
+
+        /* Opens the overlay directly rather than through a pad bind: there is
+         * no PSX button for it to press. Edge-triggered on the latch, or the
+         * three-frame minimum press would toggle it open and shut again. */
+        {
+            static int s_menuWas;
+            const int  menuNow = (s_Buttons[TB_MENU].holdFrames > 0);
+
+            if (menuNow && !s_menuWas && Tc_MenuAllowed())
+                Pc_QuickOptions_Toggle();
+            s_menuWas = menuNow;
+        }
+
+        /* Quick Save / Quick Load, edge-triggered on the latch for the same
+         * reason as Menu. Gamepad style handles its own pair above. */
+        {
+            static int s_saveWas, s_loadWas;
+            const int  on      = Tc_QuickButtonsOn() && !Tc_GamepadStyle();
+            const int  saveNow = on && (s_Buttons[TB_QSAVE].holdFrames > 0);
+            const int  loadNow = on && (s_Buttons[TB_QLOAD].holdFrames > 0);
+
+            if (saveNow && !s_saveWas) Pc_QuickSave_TouchRequest(0);
+            if (loadNow && !s_loadWas) Pc_QuickSave_TouchRequest(1);
+            s_saveWas = saveNow;
+            s_loadWas = loadNow;
+        }
+        if (s_Buttons[TB_BACK].holdFrames  > 0) Tc_PressAction(&s_PadWord, cfg->cancel);
+
+        if (s_Running || s_Buttons[TB_RUN].holdFrames > 0)
+            Tc_PressAction(&s_PadWord, cfg->run);
+
+        if (s_AdvanceHeld)
+            Tc_PressAction(&s_PadWord, cfg->enter);
+
+        if (s_CancelFrames > 0)
+        {
+            Tc_PressAction(&s_PadWord, cfg->cancel);
+            s_CancelFrames--;
+        }
+
+        if (s_ActionFrames > 0)
+        {
+            Tc_PressAction(&s_PadWord, cfg->action);
+            s_ActionFrames--;
+        }
+    }
+}
+
+int Pc_Touch_Active(void)
+{
+    if (SDL_GetNumTouchDevices() <= 0)
+        return 0;
+
+    return Tc_Mode() != TC_MODE_OFF;
+}
+
+void Pc_Touch_GetPad(unsigned short* word,
+                     unsigned char* rightX, unsigned char* rightY,
+                     unsigned char* leftX,  unsigned char* leftY)
+{
+    if (word   != NULL) *word   = s_PadWord;
+    if (rightX != NULL) *rightX = s_RightX;
+    if (rightY != NULL) *rightY = s_RightY;
+    if (leftX  != NULL) *leftX  = s_LeftX;
+    if (leftY  != NULL) *leftY  = s_LeftY;
+}
+
+/* Any finger on the glass right now, whatever the game state. The FMV player
+ * runs its own input loop outside the state machine and has to ask directly.
+ * Honors the touch-controls setting, so someone on a gamepad can rest a hand
+ * on the screen without skipping every movie. */
+int Pc_Touch_AnyContact(void)
+{
+    /* Escape level counts: skipping a movie is a way out, not a control. */
+    if (Tc_Level() == TC_LEVEL_NONE)
+        return 0;
+
+    return Tc_ContactPresent();
+}
+
+/* 1 while the glass is what is playing the game: the full scheme is live and
+ * nothing physical has taken it over. Used by control_style.c, which holds the
+ * camera in classic for as long as this is true. */
+int Pc_Touch_IsDrivingInput(void)
+{
+    return Tc_Level() == TC_LEVEL_FULL && s_LastSource != TS_PHYSICAL;
+}
+
+int Pc_Touch_UsedRecently(void)
+{
+    if (s_LastTouchMs == 0)
+        return 0;
+
+    return (SDL_GetTicks() - s_LastTouchMs) < 3000;
+}
+
+/* ------------------------------------------------------------------ draw --- */
+
+/* The overlay layer is centre-origin, and how far it reaches sideways depends on
+ * whether the picture is widened.
+ *
+ * This deliberately does NOT reuse the minimap's predicate. That one also has to
+ * describe MENUS, which stay pillarboxed under Hor+ and so only widen in stretch
+ * mode. These controls draw during gameplay only, where Hor+ widens the picture
+ * as well — testing for stretch alone computed 160 against a layer that really
+ * spanned +-260, which pulled every button ~15% of the screen toward the centre.
+ * Mode 0 is the genuinely pillarboxed case and keeps the 4:3 extent, which is
+ * also what viewport-space touch coords are relative to. */
+/* The overlay frame, taken from the renderer rather than rebuilt here.
+ *
+ * This used to solve the Hor+ widening again from the window aspect and the
+ * pixel aspect. That is a copy of the renderer's own maths, and it has to be
+ * kept in step with hfov, vfov, the CRT trim and the display-aspect mode as
+ * those arrive -- miss one and the controls are placed in a frame the renderer
+ * is not using. Raising the FOV pushed the buttons off both edges of the
+ * screen, hit zones with them, reported with a screenshot of them clipped
+ * against the bezel.
+ *
+ * g_PcHudRect is the overlay pass's own visible rectangle in PRIM coordinates
+ * (the draw-env offset already removed), published by the renderer for exactly
+ * this. It carries neither hfov nor vfov, which is the behaviour wanted all
+ * along: FOV and scaling are for the world, not the controls.
+ *
+ * Read as bounds rather than a half-extent, so nothing here assumes the frame
+ * is centred on zero -- the renderer decides where it sits.
+ *
+ * Gameplay only, though: g_PcHudRect is latched on 3D frames, so on a 2D
+ * screen drawn 4:3 (save/load, the paper map, brightness) it still held the
+ * WIDE gameplay frame. The corner button landed past the 4:3 picture's right
+ * edge and was clipped, while its hit test, which maps the finger into the
+ * real 4:3 viewport, still answered in the corner: an invisible Back button
+ * (reported on the save screen). Every other mode places against
+ * g_PcUiRect, the rectangle of the overlay pass that actually ran. */
+static const float* Tc_FrameRect(int mode)
+{
+    extern float g_PcHudRect[4];
+    extern float g_PcUiRect[4];
+
+    return (mode == TC_MODE_GAMEPLAY) ? g_PcHudRect : g_PcUiRect;
+}
+
+
+/* Room for the labelled top row and the quick buttons on top of everything
+ * else the pad draws (about 190 at worst); quads past the cap are dropped. */
+#define TC_MAX_QUADS 320
+
+typedef struct
+{
+    POLY_G4* p;
+    int      used;
+} s_TcBatch;
+
+static void Tc_Quad(s_TcBatch* b, int x0, int y0, int x1, int y1,
+                    int x2, int y2, int x3, int y3, int lum)
+{
+    POLY_G4* q;
+
+    if (b->used >= TC_MAX_QUADS)
+        return;
+
+    q = &b->p[b->used++];
+    setXY4(q, x0, y0, x1, y1, x2, y2, x3, y3);
+    q->r0 = q->r1 = q->r2 = q->r3 = (u_char)lum;
+    q->g0 = q->g1 = q->g2 = q->g3 = (u_char)lum;
+    q->b0 = q->b1 = q->b2 = q->b3 = (u_char)lum;
+}
+
+static void Tc_Rect(s_TcBatch* b, int l, int t, int r, int bm, int lum)
+{
+    Tc_Quad(b, l, t, r, t, l, bm, r, bm, lum);
+}
+
+/* A 5x7 pixel font, just the letters the controls need. One byte per row,
+ * 0x10 is the leftmost column. Overlay vertices are whole prim units (about
+ * four screen pixels on a phone), which is too coarse for any smaller face. */
+typedef struct
+{
+    char          ch;
+    unsigned char rows[7];
+} s_TcGlyph;
+
+static const s_TcGlyph s_TcFont[] = {
+    { 'L', { 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F } },
+    { 'R', { 0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11 } },
+    { 'S', { 0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E } },
+    { 'T', { 0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04 } },
+    { 'A', { 0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 } },
+    { 'E', { 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F } },
+    { 'C', { 0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E } },
+    { '1', { 0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E } },
+    { '2', { 0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F } },
+};
+
+#define TC_GLYPH_W   5
+#define TC_GLYPH_H   7
+#define TC_GLYPH_ADV 6 /* one column of spacing */
+
+/* One glyph as few rectangles as possible: each horizontal run is extended
+ * down while the rows below repeat it, so an L is two quads, not eleven. */
+static void Tc_Glyph(s_TcBatch* b, const unsigned char* rows, int x, int y, int px,
+                     int lum)
+{
+    unsigned char used[TC_GLYPH_H] = { 0 };
+    int           row;
+
+    for (row = 0; row < TC_GLYPH_H; row++)
+    {
+        int col = 0;
+
+        while (col < TC_GLYPH_W)
+        {
+            unsigned char bit = (unsigned char)(0x10 >> col);
+            unsigned char mask;
+            int           c1, r1, k;
+
+            if (!(rows[row] & bit) || (used[row] & bit))
+            {
+                col++;
+                continue;
+            }
+
+            c1   = col;
+            mask = bit;
+            while (c1 + 1 < TC_GLYPH_W &&
+                   (rows[row] & (0x10 >> (c1 + 1))) &&
+                   !(used[row] & (0x10 >> (c1 + 1))))
+            {
+                c1++;
+                mask |= (unsigned char)(0x10 >> c1);
+            }
+
+            r1 = row;
+            while (r1 + 1 < TC_GLYPH_H &&
+                   (rows[r1 + 1] & mask) == mask &&
+                   !(used[r1 + 1] & mask))
+                r1++;
+
+            for (k = row; k <= r1; k++)
+                used[k] |= mask;
+
+            Tc_Rect(b, x + col * px, y + row * px,
+                    x + (c1 + 1) * px, y + (r1 + 1) * px, lum);
+            col = c1 + 1;
+        }
+    }
+}
+
+static int Tc_TextLen(const char* s)
+{
+    int n = 0;
+
+    while (s[n] != '\0')
+        n++;
+    return n;
+}
+
+/* Width in font pixels. */
+static int Tc_TextWidth(const char* s)
+{
+    const int n = Tc_TextLen(s);
+
+    return (n > 0) ? ((n * TC_GLYPH_ADV) - 1) : 0;
+}
+
+/* Centred on (cx, cy), px prim units per font pixel. */
+static void Tc_Text(s_TcBatch* b, const char* s, int cx, int cy, int px, int lum)
+{
+    int x = cx - (Tc_TextWidth(s) * px) / 2;
+    int y = cy - (TC_GLYPH_H * px) / 2;
+    int i, g;
+
+    for (i = 0; s[i] != '\0'; i++)
+    {
+        for (g = 0; g < (int)(sizeof(s_TcFont) / sizeof(s_TcFont[0])); g++)
+        {
+            if (s_TcFont[g].ch == s[i])
+            {
+                Tc_Glyph(b, s_TcFont[g].rows, x, y, px, lum);
+                break;
+            }
+        }
+        x += TC_GLYPH_ADV * px;
+    }
+}
+
+/* Filled octagon as three non-overlapping quads (cap, band, cap). Overlapping
+ * pieces would double-blend through the translucent DR_MODE and show their
+ * seams as bright bands. */
+static void Tc_Octagon(s_TcBatch* b, int cx, int cy, int r, int lum)
+{
+    int a = (r * 41) / 100;
+
+    Tc_Quad(b, cx - a, cy - r, cx + a, cy - r, cx - r, cy - a, cx + r, cy - a, lum);
+    Tc_Quad(b, cx - r, cy - a, cx + r, cy - a, cx - r, cy + a, cx + r, cy + a, lum);
+    Tc_Quad(b, cx - r, cy + a, cx + r, cy + a, cx - a, cy + r, cx + a, cy + r, lum);
+}
+
+/* Octagonal ring between radii rOuter and rInner: eight annulus quads, the same
+ * construction the crosshair's circle style uses. */
+static void Tc_Ring(s_TcBatch* b, int cx, int cy, int rOuter, int rInner, int lum)
+{
+    static const int SX[8] = { 100,  71,   0, -71, -100, -71,    0,  71 };
+    static const int SY[8] = {   0,  71, 100,  71,    0, -71, -100, -71 };
+    int i;
+
+    for (i = 0; i < 8; i++)
+    {
+        int j = (i + 1) & 7;
+        int ox0 = cx + ((SX[i] * rOuter) / 100), oy0 = cy + ((SY[i] * rOuter) / 100);
+        int ox1 = cx + ((SX[j] * rOuter) / 100), oy1 = cy + ((SY[j] * rOuter) / 100);
+        int ix0 = cx + ((SX[i] * rInner) / 100), iy0 = cy + ((SY[i] * rInner) / 100);
+        int ix1 = cx + ((SX[j] * rInner) / 100), iy1 = cy + ((SY[j] * rInner) / 100);
+
+        Tc_Quad(b, ox0, oy0, ox1, oy1, ix0, iy0, ix1, iy1, lum);
+    }
+}
+
+/* A quick save/load button: a ring with its letter. */
+static void Tc_QuickButton(s_TcBatch* b, int load, int cx, int cy, int r, int lum)
+{
+    int px;
+    int inner = (r * 80) / 100;
+
+    Tc_Ring(b, cx, cy, r, inner, lum);
+    /* 80% of the ring's inside: two prim units a font pixel at phone size,
+     * which still clears the ring corner to corner. */
+    px = ((inner * 2 * 80) / 100) / TC_GLYPH_H;
+    if (px < 1)
+        px = 1;
+    Tc_Text(b, load ? "L" : "S", cx, cy, px, lum);
+}
+
+void Pc_Touch_Draw(void)
+{
+    static POLY_G4 s_pool[2][TC_MAX_QUADS];
+    static DR_MODE s_drMode[2];
+    static int     s_inited = 0;
+
+    s_TcBatch batch;
+    /* A TAG, not the GsOT. AddPrim writes the prim's address into the low 24
+     * bits of whatever it is handed, so handing it a GsOT* clobbers that
+     * struct's `length` field -- see the assignment below. Declaring it as the
+     * GsOT* it is not was exactly what let that through unnoticed. */
+    GsOT_TAG* ot;
+    int       buf, i, mode;
+    float     rectL, rectR, rectT, rectB;
+
+    mode = Tc_Mode();
+    if (mode == TC_MODE_OFF)
+        return;
+    if (SDL_GetNumTouchDevices() <= 0)
+        return;
+
+    if (!s_inited)
+    {
+        s_inited = 1;
+        for (i = 0; i < 2; i++)
+        {
+            setcode(&s_drMode[i], 0xE1);
+            setlen(&s_drMode[i], 1);
+            s_drMode[i].code[0] = 0xE1000200; /* ABR=0 -> 0.5*src + 0.5*dst */
+        }
+        for (i = 0; i < 2 * TC_MAX_QUADS; i++)
+        {
+            POLY_G4* q = (POLY_G4*)&s_pool[0][0] + i;
+            setPolyG4(q);
+            setSemiTrans(q, 1);
+        }
+    }
+
+    buf         = g_ActiveBufferIdx;
+    batch.p     = s_pool[buf];
+    batch.used  = 0;
+    rectL       = Tc_FrameRect(mode)[0];
+    rectR       = Tc_FrameRect(mode)[1];
+    rectT       = Tc_FrameRect(mode)[2];
+    rectB       = Tc_FrameRect(mode)[3];
+
+    /* Viewport space -> the centre-origin overlay, sized by the ortho the UI
+     * pass published (Tc_FrameRect). */
+    #define TC_UX(vx) ((int)((rectL + ((vx) * (rectR - rectL))) + 0.5f))
+    #define TC_UY(vy) ((int)((rectT + ((vy) * (rectB - rectT))) + 0.5f))
+    /* A radius given in height units spans the frame's full height. */
+    #define TC_UR(r)  ((int)(((r) * (rectB - rectT)) + 0.5f))
+
+    /* Movement stick: only while a thumb is down. A permanently drawn stick is
+     * clutter on a screen this small, and the floating origin means a fixed
+     * one would be lying about where it is anyway. */
+    if (mode == TC_MODE_GAMEPLAY && Tc_GamepadStyle())
+    {
+        /* The fixed pad. Drawn whole and always, unlike the context overlay:
+         * a pad the player cannot see is a pad they cannot aim at, and the
+         * point of this style is that everything is in one known place. */
+        int   c;
+        float aw = s_TgAspectW;
+        int   ox = TC_UX(TG_STICK_CX / aw), oy = TC_UY(TG_STICK_CY);
+        int   rr = TC_UR(TG_STICK_R);
+        int   kx = s_StickActive ? TC_UX(s_StickKx) : ox;
+        int   ky = s_StickActive ? TC_UY(s_StickKy) : oy;
+
+        Tc_Ring(&batch, ox, oy, rr, (rr * 88) / 100, 140);
+        /* Brightest while running, so the auto-run has a state the player can
+         * see. The context stick already reads this way. */
+        Tc_Octagon(&batch, kx, ky, TC_UR(TG_KNOB_R),
+                   s_Running ? 255 : (s_StickActive ? 225 : 175));
+
+        for (c = 0; c < TG_C_COUNT; c++)
+        {
+            int bx  = TC_UX(s_TgCtls[c].cx / aw);
+            int by  = TC_UY(s_TgCtls[c].cy);
+            int lum = s_TgHeld[c] ? 255 : 145;
+
+            if (c == TG_C_QSAVE || c == TG_C_QLOAD)
+            {
+                if (Tc_QuickButtonsOn())
+                    Tc_QuickButton(&batch, c == TG_C_QLOAD, bx, by,
+                                   TC_UR(s_TgCtls[c].hw), lum);
+                continue;
+            }
+
+            if (s_TgCtls[c].circle)
+            {
+                int br = TC_UR(s_TgCtls[c].hw);
+                int d  = (br * 34) / 100;
+
+                Tc_Ring(&batch, bx, by, br, (br * 80) / 100, lum);
+
+                /* The PSX face marks, so a player reads the pad rather than
+                 * learning four identical circles by position. */
+                switch (s_TgCtls[c].bit)
+                {
+                    case TG_TRIANGLE:
+                        Tc_Quad(&batch, bx, by - d, bx, by - d,
+                                        bx - d, by + d, bx + d, by + d, lum);
+                        break;
+                    case TG_CIRCLE:
+                        Tc_Ring(&batch, bx, by, d, (d * 55) / 100, lum);
+                        break;
+                    case TG_CROSS:
+                    {
+                        int t = (d * 30) / 100;
+                        Tc_Quad(&batch, bx - d, by - d + t, bx - d + t, by - d,
+                                        bx + d - t, by + d, bx + d, by + d - t, lum);
+                        Tc_Quad(&batch, bx + d - t, by - d, bx + d, by - d + t,
+                                        bx - d, by + d - t, bx - d + t, by + d, lum);
+                        break;
+                    }
+                    default: /* square */
+                        Tc_Quad(&batch, bx - d, by - d, bx + d, by - d,
+                                        bx - d, by + d, bx + d, by + d, lum);
+                        break;
+                }
+            }
+            else
+            {
+                int hw = TC_UR(s_TgCtls[c].hw);
+                int hh = TC_UR(s_TgCtls[c].hh);
+
+                if (s_TgCtls[c].bit == TG_NOBIT)
+                {
+                    /* Three stacked bars: the settings mark every phone player
+                     * already reads, and the only control here that is not a
+                     * PSX button. Outlined so it does not read as a slab. */
+                    int t = (hh * 16) / 100;
+                    int g = (hh * 42) / 100;
+                    int w = (hw * 46) / 100;
+                    int k;
+
+                    for (k = -1; k <= 1; k++)
+                    {
+                        int yc = by + k * g;
+
+                        Tc_Quad(&batch, bx - w, yc - t, bx + w, yc - t,
+                                        bx - w, yc + t, bx + w, yc + t, lum);
+                    }
+                }
+                else
+                {
+                    /* An outlined plate carrying the button's own name, so the
+                     * top row reads like the pad it stands in for rather than
+                     * six identical slabs. Filled while held, like a pressed
+                     * key. */
+                    const unsigned short bit = s_TgCtls[c].bit;
+                    const char* label = (bit == TG_L1)     ? "L1"
+                                      : (bit == TG_L2)     ? "L2"
+                                      : (bit == TG_R1)     ? "R1"
+                                      : (bit == TG_R2)     ? "R2"
+                                      : (bit == TG_START)  ? "START"
+                                      : (bit == TG_SELECT) ? "SELECT" : "";
+                    int t = (hh * 12) / 100;
+                    int fw, availW, availH, px;
+
+                    if (t < 1)
+                        t = 1;
+
+                    if (s_TgHeld[c])
+                        Tc_Rect(&batch, bx - hw + t, by - hh + t, bx + hw - t, by + hh - t, 90);
+
+                    Tc_Rect(&batch, bx - hw, by - hh,     bx + hw, by - hh + t, lum);
+                    Tc_Rect(&batch, bx - hw, by + hh - t, bx + hw, by + hh,     lum);
+                    Tc_Rect(&batch, bx - hw, by - hh + t, bx - hw + t, by + hh - t, lum);
+                    Tc_Rect(&batch, bx + hw - t, by - hh + t, bx + hw, by + hh - t, lum);
+
+                    /* As large as the plate allows: the shoulder names fit at
+                     * two prim units a font pixel, START and SELECT at one. */
+                    fw     = Tc_TextWidth(label);
+                    availW = (2 * hw) - (2 * t) - 2;
+                    availH = (2 * hh) - (2 * t) - 2;
+                    px     = availH / TC_GLYPH_H;
+                    if (fw > 0 && px * fw > availW)
+                        px = availW / fw;
+                    if (px < 1)
+                        px = 1;
+
+                    Tc_Text(&batch, label, bx, by, px, lum);
+                }
+            }
+        }
+    }
+    else if (s_StickActive && mode == TC_MODE_GAMEPLAY)
+    {
+        int ox = TC_UX(s_StickOx), oy = TC_UY(s_StickOy);
+        int kx = TC_UX(s_StickKx), ky = TC_UY(s_StickKy);
+        int rr = TC_UR(TC_STICK_RADIUS);
+
+        Tc_Ring(&batch, ox, oy, rr, (rr * 88) / 100, 150);
+        Tc_Octagon(&batch, kx, ky, (rr * 38) / 100, s_Running ? 255 : 190);
+    }
+
+    if (mode == TC_MODE_ADVANCE)
+    {
+        /* Deliberately draws nothing. The whole screen is the control, and a
+         * button here would cover the very text it exists to advance. */
+        if (batch.used <= 0)
+            return;
+    }
+
+    for (i = 0; i < TB_COUNT; i++)
+    {
+        float bcx = s_Buttons[i].cx, bcy = s_Buttons[i].cy, br = s_Buttons[i].r;
+
+        /* The context buttons belong to the other style. Every non-gameplay
+         * mode still draws its solo escape button in both styles, which is what
+         * keeps the results screen and the map leavable either way. */
+        if (mode == TC_MODE_GAMEPLAY && Tc_GamepadStyle())
+            break;
+        int   cx;
+
+        if (mode == TC_MODE_ADVANCE)
+            continue;
+
+        /* Both corner-slot buttons, not just Back. Skip was missing from this
+         * test, so it drew its fast-forward mark inside Start's ring all through
+         * play: one control wearing two symbols, and on the stock binds the same
+         * one, since Skip and Pause are both Start (settings_reset.c). */
+        if (mode == TC_MODE_GAMEPLAY && Tc_CornerOnly(i))
+            continue;
+
+        if (i == TB_MENU && !Tc_MenuAllowed())
+            continue;
+
+        /* Quick Save / Quick Load: only with the option on, and only in play. */
+        if ((i == TB_QSAVE || i == TB_QLOAD) &&
+            (mode != TC_MODE_GAMEPLAY || !Tc_QuickButtonsOn()))
+            continue;
+
+        /* Fire appears with the gun and goes away with it. */
+        if (i == TB_FIRE &&
+            (mode != TC_MODE_GAMEPLAY || g_PcConfig.oneButtonCombat ||
+             s_Buttons[TB_AIM].holdFrames <= 0))
+            continue;
+
+        if (mode != TC_MODE_GAMEPLAY)
+        {
+            if (i != Tc_SoloButton(mode))
+                continue;
+
+            bcx = s_Buttons[TB_START].cx;
+            bcy = s_Buttons[TB_START].cy;
+            br  = s_Buttons[TB_START].r;
+        }
+
+        cx = TC_UX(bcx);
+        {
+        int cy = TC_UY(bcy);
+        int r  = TC_UR(br);
+        int lum = (s_Buttons[i].holdFrames > 0) ? 255 : 140;
+
+        if (i == TB_QSAVE || i == TB_QLOAD)
+        {
+            Tc_QuickButton(&batch, i == TB_QLOAD, cx, cy, r, lum);
+            continue;
+        }
+
+        Tc_Ring(&batch, cx, cy, r, (r * 82) / 100, lum);
+
+        /* A distinct mark per button, so they read as different controls
+         * without a font: crosshair, square, folded sheet, two bars. */
+        switch (i)
+        {
+            case TB_FIRE:
+            {
+                int d = (r * 34) / 100;
+                Tc_Quad(&batch, cx - d, cy - d, cx + d, cy - d, cx - d, cy + d, cx + d, cy + d, lum);
+                Tc_Quad(&batch, cx - (d * 3) / 2, cy, cx, cy - (d * 3) / 2,
+                                cx, cy + (d * 3) / 2, cx + (d * 3) / 2, cy, lum);
+                break;
+            }
+            case TB_AIM:
+            {
+                int t = (r * 9) / 100, l = (r * 46) / 100;
+                Tc_Quad(&batch, cx - l, cy - t, cx + l, cy - t, cx - l, cy + t, cx + l, cy + t, lum);
+                Tc_Quad(&batch, cx - t, cy - l, cx + t, cy - l, cx - t, cy + l, cx + t, cy + l, lum);
+                break;
+            }
+            case TB_ITEM:
+            {
+                int s = (r * 34) / 100;
+                Tc_Quad(&batch, cx - s, cy - s, cx + s, cy - s, cx - s, cy + s, cx + s, cy + s, lum);
+                break;
+            }
+            case TB_MAP:
+            {
+                int w = (r * 42) / 100, h = (r * 32) / 100;
+                Tc_Quad(&batch, cx - w, cy - h, cx + w, cy - h, cx - w, cy + h, cx + w, cy + h, lum);
+                break;
+            }
+            case TB_LIGHT:
+            {
+                /* A torch: a small barrel with a beam widening out of it. */
+                int b = (r * 20) / 100, l = (r * 34) / 100;
+
+                Tc_Quad(&batch, cx - l, cy - b, cx - l + b, cy - b,
+                                cx - l, cy + b, cx - l + b, cy + b, lum);
+                Tc_Quad(&batch, cx - l + b, cy - b, cx + l, cy - (b * 9) / 5,
+                                cx - l + b, cy + b, cx + l, cy + (b * 9) / 5, lum);
+                break;
+            }
+            case TB_VIEW:
+            {
+                /* A lens: a ring around a filled pupil. It was a camera body
+                 * with a viewfinder bump, which at this size drew as a plain
+                 * rectangle and read as a second Item square two rows up. */
+                int ro = (r * 40) / 100;
+
+                Tc_Ring(&batch, cx, cy, ro, (ro * 60) / 100, lum);
+                Tc_Octagon(&batch, cx, cy, (ro * 32) / 100, lum);
+                break;
+            }
+            case TB_SKIP:
+            {
+                /* Two right-pointing triangles: the fast-forward mark, which is
+                 * what this does -- move the screen along. */
+                int a = (r * 30) / 100;
+                int k;
+
+                for (k = -1; k <= 1; k += 2)
+                {
+                    int ox = cx + (k * a) / 2;
+
+                    Tc_Quad(&batch, ox - a / 2, cy - a, ox - a / 2, cy + a,
+                                    ox + a / 2, cy,     ox + a / 2, cy, lum);
+                }
+                break;
+            }
+            case TB_MENU:
+            {
+                /* Three stacked bars -- the one symbol every phone user
+                 * already reads as "settings live here". */
+                int w = (r * 40) / 100, t = (r * 7) / 100, g = (r * 20) / 100;
+                int k;
+
+                for (k = -1; k <= 1; k++)
+                {
+                    int yc = cy + k * g;
+                    Tc_Quad(&batch, cx - w, yc - t, cx + w, yc - t,
+                                    cx - w, yc + t, cx + w, yc + t, lum);
+                }
+                break;
+            }
+            case TB_START:
+            default:
+            {
+                int w = (r * 12) / 100, h = (r * 34) / 100, g = (r * 22) / 100;
+                Tc_Quad(&batch, cx - g - w, cy - h, cx - g + w, cy - h, cx - g - w, cy + h, cx - g + w, cy + h, lum);
+                Tc_Quad(&batch, cx + g - w, cy - h, cx + g + w, cy - h, cx + g - w, cy + h, cx + g + w, cy + h, lum);
+                break;
+            }
+            case TB_BACK:
+            {
+                /* Left chevron: two slanted bars meeting at the point. */
+                int a = (r * 34) / 100, t = (r * 11) / 100;
+
+                Tc_Quad(&batch, cx + a, cy - a, cx + a + t, cy - a + t,
+                                cx - a, cy,     cx - a + t, cy + t,       lum);
+                Tc_Quad(&batch, cx - a, cy,     cx - a + t, cy - t,
+                                cx + a, cy + a, cx + a + t, cy + a - t,   lum);
+                break;
+            }
+            case TB_RUN:
+            {
+                /* Three stacked speed lines -- distinct at a glance from
+                 * Start's two upright bars. */
+                int h = (r * 7) / 100, g = (r * 26) / 100;
+                int w0 = (r * 46) / 100, w1 = (r * 34) / 100, w2 = (r * 22) / 100;
+
+                Tc_Quad(&batch, cx - w0, cy - g - h, cx + w0, cy - g - h, cx - w0, cy - g + h, cx + w0, cy - g + h, lum);
+                Tc_Quad(&batch, cx - w1, cy - h,     cx + w1, cy - h,     cx - w1, cy + h,     cx + w1, cy + h,     lum);
+                Tc_Quad(&batch, cx - w2, cy + g - h, cx + w2, cy + g - h, cx - w2, cy + g + h, cx + w2, cy + g + h, lum);
+                break;
+            }
+        }
+        }
+    }
+
+    if (batch.used <= 0)
+        return;
+
+    /* OT0 is drawn first and OT2 after it. In gameplay OT0 is right -- the
+     * controls sit over the world exactly like the crosshair. But the map, save
+     * and item screens draw their fullscreen 2D into OT2, which then paints
+     * straight over anything left in OT0: the lone escape button was being
+     * submitted every frame and buried, so the corner was tappable with nothing
+     * visible in it. Put the solo-button modes in OT2 so the way out is drawn
+     * on top of the screen it is meant to leave.
+     *
+     * The index is into g_OtTags0, which despite the name IS OT2's tag array
+     * (g_OrderingTable2 is { 4, &g_OtTags0[buf][0], ... }; OT0 lives in
+     * g_OtTags1). Higher index draws in front -- the 2D screens put their fill
+     * at 6 and its border at 7 -- so 15 is on top of everything, and 4 in
+     * gameplay leaves the controls behind any screen that opens over them.
+     *
+     * This used to pass &g_OrderingTable2[buf], the GsOT STRUCT, where a tag
+     * belongs. AddPrim then wrote the prim's low 24 bits over the struct's
+     * first word, which is `length` (4). GsClearOt clears `1 << ot->length`
+     * entries, so the next frame cleared a garbage-sized span of memory and the
+     * process died -- only in the solo-button modes, because only they took
+     * this branch, which is why it presented as "pause crashes". */
+    if (mode != TC_MODE_GAMEPLAY)
+        ot = &g_OtTags0[buf][15];
+    else
+        ot = &g_OtTags0[buf][4];
+
+    for (i = 0; i < batch.used; i++)
+        AddPrim(ot, &batch.p[i]);
+    AddPrim(ot, &s_drMode[buf]);
+
+    #undef TC_UX
+    #undef TC_UY
+    #undef TC_UR
+}

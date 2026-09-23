@@ -1,0 +1,461 @@
+name: Main Game Logic Overlay (BODYPROG)
+sha1: 9E867F8410735EED4D45E49282EA65F8EE4FDAC2
+options:
+  basename: BODYPROG.BIN
+  target_path: assets/JAP2/1ST/BODYPROG.BIN
+  base_path: ../..
+  platform: psx
+  compiler: GCC
+
+  asm_path: asm/JAP2/bodyprog
+  src_path: src/bodyprog
+  asset_path: asm/JAP2/bodyprog
+  build_path: build/JAP2
+
+  ld_script_path: linkers/JAP2/bodyprog.ld
+
+  find_file_boundaries: False
+  gp_value: 0x80022BB0
+  global_vram_start: 0x80010000
+  global_vram_end: 0x80200000
+
+  o_as_suffix: False
+  use_legacy_include_asm: False
+
+  asm_function_macro: glabel
+  asm_jtbl_label_macro: jlabel
+  asm_data_macro: dlabel
+  generate_asm_macros_files: False # Disabled as our include_asm.h is customized to work with different game versions.
+
+  section_order: [".rodata", ".text", ".data", ".sdata", ".bss"]
+
+  symbol_addrs_path:
+    - configs/JAP1/screens/sym.b_konami.txt
+    - configs/JAP1/screens/sym.stream.txt
+    - configs/JAP1/screens/sym.saveload.txt
+    - configs/JAP1/screens/sym.options.txt
+    - configs/JAP1/screens/sym.credits.txt
+    - configs/JAP1/sym.bodyprog.txt
+    - configs/USA/sym.main.txt
+  reloc_addrs_path:
+    - configs/JAP2/rel.bodyprog.txt
+
+  undefined_funcs_auto_path: linkers/JAP2/undefined_funcs_auto.bodyprog.txt
+  undefined_syms_auto_path: linkers/JAP2/undefined_syms_auto.bodyprog.txt
+
+  subalign: 4
+
+  string_encoding: ASCII
+  data_string_encoding: ASCII
+  rodata_string_guesser_level: 2
+  data_string_guesser_level: 2
+segments:
+  - name: bodyprog
+    type: code
+    start: 0x0
+    vram: 0x80024B60
+    align: 4
+    subalign: 4
+    subsegments:
+      - [0x0, rodata, bodyprog]
+      - [0x4, .rodata, memcard]
+      - [0x130, rodata]
+      - [0x134, .rodata, screen/screen_fade]
+      - [0x17C, .rodata, screen/cutscene_border]
+      - [0x1DC, rodata]
+      - [0x5A4, .rodata, sys/fs_screens]
+      - [0x5B4, .rodata, sys/settings_reset]
+      - [0x610, .rodata, sys/memcard_2]
+      - [0x68C, rodata] # Garbage padding
+      - [0x698, .rodata, game_boot/game_boot]
+      - [0x6CC, .rodata, events/bgm]
+      - [0x6F4, rodata] # Garbage padding
+      - [0x6F8, .rodata, events/map_msg_display]
+      - [0x750, rodata, events/bodyprog_data_800A99B4]
+      - [0x810, .rodata, events/game_sys_states]
+      - [0x914, .rodata, events/title]
+      - [0x9B8, rodata]
+      - [0x9BC, .rodata, gfx/bodyprog_8003BE50]
+      - [0x104C, .rodata, gfx/map_effects]
+      - [0x107C, rodata] # Garbage padding
+      - [0x108C, .rodata, sound/sd_call]
+      - [0x11F8, rodata]
+      - [0x1200, .rodata, text/text_draw_jp]
+      - [0x145C, .rodata, items/item_screens_1]
+      - [0x147C, .rodata, items/item_screens_2]
+      - [0x1854, .rodata, items/item_screens_3]
+      - [0x36F8, .rodata, gfx/bodyprog_80055028]
+      - [0x3720, rodata]
+      - [0x3740, .rodata, bodyprog_8005E0DC]
+      - [0x3BE4, rodata] # Garbage padding
+      - [0x3BEC, .rodata, bodyprog_mapscreen_80066EB0]
+      - [0x3BF4, rodata] # Garbage padding
+      - [0x3BF8, .rodata, bodyprog_mapscreen_80066D90]
+      - [0x3D10, .rodata, collision]
+      - [0x491C, .rodata, player_control]
+      - [0x5A1C, .rodata, view/vc_main]
+      - [0x5CC8, .rodata, events/events_util]
+      - [0x5DD0, .rodata, bodyprog_80089090]
+      - [0x6168, .rodata, bodyprog_combat_8008A058]
+      - [0x6480, .rodata, water]
+      - [0x64A4, .rodata, demo]
+      - [0x64C0, .rodata, ranking]
+      - [0x6798, rodata] # Garbage padding
+      - [0x67A0, rodata]
+      - [0x94D0, .rodata, libsd/smf_io]
+      - [0x9764, .rodata, libsd/smf_mid]
+
+      - [0x985C, c, memcard]
+      - [0xC6F4, c, screen/background_draw]
+      - [0xD104, c, text/text_debug_draw]
+      - [0xD560, c, screen/screen_draw]
+      - [0xD7AC, c, screen/screen_fade]
+      - [0xDAA4, c, screen/cutscene_border]
+      - [0xDD88, c, sys/vsync]
+      - [0xDDD8, c, sys/fs_screens]
+      - [0xDF24, c, sys/game_main] # Name from SH2 symbols. This name also applies for SH4 instance too.
+      - [0xE5BC, c, sys/settings_reset]
+      - [0xE6C8, c, sys/memcard_2]
+      - [0xF2F4, c, sys/warm_boot]
+      - [0xF630, c, sys/joy]
+      - [0xFAD4, c, game_boot/game_boot]
+      - [0x104A0, c, game_boot/fs_chara_anim]
+      - [0x10994, c, game_boot/background_sound_init]
+      - [0x10D18, c, game_boot/load_screen]
+      - [0x10FC8, c, events/bgm]
+      - [0x117CC, c, events/map_msg_display]
+      - [0x123CC, c, events/radio]
+      - [0x12460, c, events/player_pos_update]
+      - [0x12600, c, events/events_main]
+      - [0x1303C, c, events/npc_main]
+      - [0x13E4C, c, events/game_sys_states]
+      - [0x15DA0, c, events/title]
+      - [0x16FA4, c, events/bodyprog_8003BD2C]
+      - [0x170C8, c, gfx/bodyprog_8003BE50]
+      - [0x19860, c, gfx/map_effects]
+      - [0x1B27C, c, events/collision_trigger]
+      - [0x1B2C4, c, view/vc_util]
+      - [0x1BDEC, c, gfx/bodyprog_80040B74]
+      - [0x1F81C, c, gfx/bodyprog_anim_800445A4]
+      - [0x2018C, c, gfx/bodyprog_bone_80044F14]
+      - [0x20CF4, c, sound/sd_call]
+      - [0x23CB0, c, view/vw_main]
+      - [0x241A0, c, view/vw_calc] # Contains part of SH2's `vb_main`?
+      - [0x25AF4, c, text/text_draw_jp]
+      - [0x28098, c, items/item_screens_cam]
+      - [0x28624, c, items/item_screens_1]
+      - [0x28E78, c, items/item_screens_2]
+      - [0x2BD34, c, items/item_screens_3]
+      - [0x31FD0, c, gfx/bodyprog_80055028]
+      - [0x38EE0, c, bodyprog_math_8005BF38]
+      - [0x39778, c, bodyprog_combat_8005BF38]
+      - [0x3A814, c, sound/sfx]
+      - [0x3B084, c, bodyprog_8005E0DC]
+      - [0x4229C, c, bodyprog_800652F4]
+      - [0x43D38, c, bodyprog_mapscreen_80066EB0]
+      - [0x43E58, c, bodyprog_mapscreen_80066D90]
+      - [0x4679C, c, collision]
+      - [0x4D694, c, player_control]
+      - [0x5D8F0, c, view/vc_main]
+      - [0x62D28, c, events/events_util]
+      - [0x64E58, c, bodyprog_bgm_80087EA8]
+      - [0x65168, c, bodyprog_800881B8]
+      - [0x65C2C, c, chara_spawn]
+      - [0x66040, c, bodyprog_80089090]
+      - [0x67008, c, bodyprog_combat_8008A058]
+      - [0x69950, c, dms]
+      - [0x6A3CC, c, water]
+      - [0x6BED0, c, demo]
+      - [0x6C8FC, c, ranking]
+      - [0x6E728, c, credits_init]
+
+      # PsyQ libs
+      - [0x6EAAC, asm, lib/libapi/a09]
+      - [0x6EABC, asm, lib/libapi/a11]
+      - [0x6EACC, asm, lib/libapi/a39]
+      - [0x6EADC, asm, lib/libapi/a51]
+      - [0x6EAEC, asm, lib/libapi/a53]
+      - [0x6EAFC, asm, lib/libapi/a65]
+      - [0x6EB0C, asm, lib/libapi/a67]
+      - [0x6EB1C, asm, lib/libapi/a68]
+      - [0x6EB2C, asm, lib/libapi/a69]
+      - [0x6EB3C, asm, lib/libapi/a81]
+      - [0x6EB4C, asm, lib/libapi/first]
+      - [0x6EDEC, asm, lib/libapi/a66]
+      - [0x6EDFC, asm, lib/libc/a56]
+      - [0x6EE0C, asm, lib/libc/c24]
+      - [0x6EE1C, asm, lib/libc/c25]
+      - [0x6EE2C, asm, lib/libc/c26]
+      - [0x6EE3C, asm, lib/libc/c27]
+      - [0x6EE4C, asm, lib/libc/c37]
+      - [0x6EE5C, asm, lib/libc/memcmp]
+      - [0x6EEAC, asm, lib/libcard/c171]
+      - [0x6EEBC, asm, lib/libcard/c172]
+      - [0x6EECC, asm, lib/libcard/a78]
+      - [0x6EEDC, asm, lib/libcard/a80]
+      - [0x6EEEC, asm, lib/libcard/card]
+      - [0x6EF2C, asm, lib/libcard/init]
+      - [0x6EFFC, asm, lib/libapi/pad]
+      - [0x6F2FC, asm, lib/libapi/a18]
+      - [0x6F30C, asm, lib/libapi/a19]
+      - [0x6F31C, asm, lib/libapi/a20]
+      - [0x6F32C, asm, lib/libapi/a21]
+      - [0x6F33C, asm, lib/libapi/l02]
+      - [0x6F34C, asm, lib/libapi/l03]
+      - [0x6F35C, asm, lib/libapi/patch]
+      - [0x6F3FC, asm, lib/libapi/c68]
+      - [0x6F40C, asm, lib/libapi/chclrpad]
+      - [0x6F47C, asm, lib/libcard/a74]
+      - [0x6F48C, asm, lib/libcard/a75]
+      - [0x6F49C, asm, lib/libcard/a76]
+      - [0x6F4AC, asm, lib/libcard/patch]
+      - [0x6F67C, asm, lib/libcard/end]
+      - [0x6F6FC, asm, lib/libcd/cdrom]
+      - [0x6F72C, asm, lib/libcd/iso9660]
+      - [0x7009C, asm, lib/libcd/cdread2]
+      - [0x7014C, asm, lib/libcd/type] # JAP only?
+      - [0x703DC, asm, lib/libcd/c_002]
+      - [0x7043C, asm, lib/libcd/c_003]
+      - [0x704BC, asm, lib/libcd/c_004]
+      - [0x705AC, asm, lib/libcd/c_005]
+      - [0x7063C, asm, lib/libcd/c_007]
+      - [0x706EC, asm, lib/libcd/c_008]
+      - [0x7072C, asm, lib/libcd/c_009]
+      - [0x707EC, asm, lib/libcd/c_010]
+      - [0x7080C, asm, lib/libcd/c_011]
+      - [0x712FC, asm, lib/libgpu/ext]
+      - [0x7159C, asm, lib/libgpu/ktrans]
+      - [0x71CBC, asm, lib/libgpu/p00]
+      - [0x71CFC, asm, lib/libgpu/p01]
+      - [0x71D1C, asm, lib/libgpu/p06]
+      - [0x71D5C, asm, lib/libgpu/p09]
+      - [0x71D7C, asm, lib/libgpu/p14]
+      - [0x71D9C, asm, lib/libgpu/p16]
+      - [0x71DBC, asm, lib/libgpu/p17]
+      - [0x71DDC, asm, lib/libgpu/p18]
+      - [0x71DFC, asm, lib/libgpu/p26]
+      - [0x71E1C, asm, lib/libgpu/p33]
+      - [0x71E4C, asm, lib/libgpu/p34]
+      - [0x71EAC, asm, lib/libgs/2d_sp1]
+      - [0x7202C, asm, lib/libgs/gs_001]
+      - [0x7257C, asm, lib/libgs/gs_002]
+      - [0x7269C, asm, lib/libgs/gs_003]
+      - [0x7271C, asm, lib/libgs/gs_007]
+      - [0x7275C, asm, lib/libapi/counter]
+      - [0x728CC, asm, lib/libgs/gs_008]
+      - [0x728FC, asm, lib/libgs/gs_009]
+      - [0x7292C, asm, lib/libgs/gs_010]
+      - [0x729DC, asm, lib/libgs/matrix]
+      - [0x72D9C, asm, lib/libgs/gs_104]
+      - [0x72E1C, asm, lib/libgs/gs_105]
+      - [0x72E8C, asm, lib/libgs/gs_106]
+      - [0x72EAC, asm, lib/libgs/gs_107]
+      - [0x7341C, asm, lib/libgs/gs_108]
+      - [0x7349C, asm, lib/libgs/gs_110]
+      - [0x734CC, asm, lib/libgs/gs_111]
+      - [0x734FC, asm, lib/libgs/gs_113]
+      - [0x7355C, asm, lib/libgs/gs_114]
+      - [0x7361C, asm, lib/libgs/gs_121]
+      - [0x7366C, asm, lib/libgs/gs_123]
+      - [0x7373C, asm, lib/libgs/gs_127]
+      - [0x737BC, asm, lib/libgs/objt]
+      - [0x7394C, asm, lib/libgs/objt3]
+
+      - [0x741DC, asm, lib_unk2/lib_8009687C]
+
+      - [0x74828, asm, lib/libgte/msc00]
+      - [0x748B8, asm, lib/libgte/msc01]
+      - [0x74948, asm, lib/libgte/msc02]
+      - [0x74BF8, asm, lib/libgte/msc06]
+      - [0x74E88, asm, lib/libgte/msc09]
+      - [0x74F28, asm, lib/libgte/mtx_000]
+      - [0x75038, asm, lib/libgte/mtx_001]
+      - [0x75128, asm, lib/libgte/mtx_003]
+      - [0x75288, asm, lib/libgte/mtx_004]
+      - [0x753E8, asm, lib/libgte/mtx_005]
+      - [0x75418, asm, lib/libgte/mtx_006]
+      - [0x75568, asm, lib/libgte/mtx_007]
+      - [0x755B8, asm, lib/libgte/mtx_01]
+      - [0x756F8, asm, lib/libgte/mtx_02]
+      - [0x757E8, asm, lib/libgte/mtx_03]
+      - [0x758F8, asm, lib/libgte/mtx_04]
+      - [0x75A08, asm, lib/libgte/mtx_05]
+      - [0x75A58, asm, lib/libgte/mtx_06]
+      - [0x75AB8, asm, lib/libgte/mtx_07]
+      - [0x75AE8, asm, lib/libgte/mtx_08]
+      - [0x75C28, asm, lib/libgte/mtx_09]
+      - [0x75C58, asm, lib/libgte/mtx_10]
+      - [0x75C88, asm, lib/libgte/mtx_11]
+      - [0x75CB8, asm, lib/libgte/mtx_12]
+      - [0x75CD8, asm, lib/libgte/reg08]
+      - [0x75CF8, asm, lib/libgte/reg09]
+      - [0x75D08, asm, lib/libgte/reg10]
+      - [0x75D28, asm, lib/libgte/reg11]
+      - [0x75D48, asm, lib/libgte/reg12]
+      - [0x75D68, asm, lib/libgte/reg13]
+      - [0x75D78, asm, lib/libgte/smp]
+      - [0x75F58, asm, lib/libgte/smp_00]
+      - [0x76168, asm, lib/libgte/smp_02]
+      - [0x76198, asm, lib/libgte/smp_03]
+      - [0x761F8, asm, lib/libgte/smp_04]
+      - [0x76228, asm, lib/libgte/cmb_00]
+      - [0x762A8, asm, lib/libgte/fgo_00]
+      - [0x762E8, asm, lib/libgte/g3]
+      - [0x76898, asm, lib/libgte/g4]
+      - [0x76F58, asm, lib/libgte/gt3]
+      - [0x77598, asm, lib/libgte/gt4]
+      - [0x77D08, asm, lib/libgte/ratan]
+      - [0x77E88, asm, lib/libgte/patchgte]
+      - [0x77F68, asm, lib/libpad/padentry]
+      - [0x78418, asm, lib/libpad/padmain]
+      - [0x79118, asm, lib/libpad/padcmd]
+      - [0x79A78, asm, lib/libpad/padif]
+      - [0x7A068, asm, lib/libpad/padportd]
+      - [0x7A6C8, asm, lib/libpad/padseqd]
+      - [0x7AB58, asm, lib/libpad/waitrc2]
+      - [0x7AC18, asm, lib/libspu/s_crwa]
+      - [0x7ADB8, asm, lib/libapi/a10]
+      - [0x7ADC8, asm, lib/libspu/s_m_util]
+      - [0x7AED8, asm, lib/libspu/s_stm]
+      - [0x7AF08, asm, lib/libspu/s_sva]
+      - [0x7B508, asm, lib/libspu/s_n2p]
+      - [0x7B708, asm, lib/libspu/s_gva]
+
+      - [0x7BAF8, c, lib_unk/lib_8009E198]
+      - [0x7C704, c, libsd/smf_snd]
+
+      - [0x7FCBC, asm, lib/libspu/s_q]      # SpuQuit
+      - [0x7FD3C, asm, lib/libapi/a13]      # DisableEvent
+      - [0x7FD4C, asm, lib/libspu/s_m_init] # SpuInitMalloc
+      - [0x7FDAC, asm, lib/libspu/s_sr]     # SpuSetReverb
+      - [0x7FE7C, asm, lib/libspu/s_srmp]   # SpuSetReverbModeParam
+      - [0x8035C, asm, lib/libspu/s_sra]    # _spu_setReverbAttr
+      - [0x8082C, asm, lib/libspu/s_rrwa]   # SpuReserveReverbWorkArea
+      - [0x8087C, asm, lib/libspu/s_srv]    # SpuSetReverbVoice
+      - [0x808AC, asm, lib/libspu/s_sav]    # _SpuSetAnyVoice
+      - [0x80B6C, asm, lib/libspu/s_sk]     # SpuSetKey
+      - [0x80D2C, asm, lib/libspu/s_gks]    # SpuGetKeyStatus
+      - [0x80DBC, asm, lib/libspu/s_skowa]  # SpuSetKeyOnWithAttr
+      - [0x80DEC, asm, lib/libspu/s_w]      # SpuWrite
+      - [0x80E4C, asm, lib/libspu/s_stsa]   # SpuSetTransferStartAddr
+      - [0x80EAC, asm, lib/libspu/s_itc]    # SpuIsTransferCompleted
+      - [0x80F5C, asm, lib/libspu/s_sca]    # SpuSetCommonAttr
+
+      - [0x812DC, c, libsd/smf_io]
+
+      - [0x84618, asm, lib/libspu/s_grv] # SpuGetReverbVoice
+      - [0x84648, asm, lib/libspu/s_gav] # _SpuGetAnyVoice
+      
+      - [0x84678, c, libsd/smf_main]
+      - [0x84918, c, libsd/smf_mid]
+
+      - [0x866F8, data, bodyprog] # TODO [.data, memcard]
+      - [0x867B8, .data, screen/background_draw]
+      - [0x867BC, .data, screen/screen_fade]
+      - [0x867F8, .data, screen/cutscene_border]
+      - [0x868A4, data]
+      - [0x870C8, .data, sys/game_main]
+      - [0x87134, .data, sys/memcard_2]
+      - [0x87164, .data, game_boot/background_sound_init]
+      - [0x8725C, .data, game_boot/fs_chara_anim]
+      - [0x872FC, .data, events/bgm]
+      - [0x8730C, .data, events/map_msg_display] # Garbage data at 0x87312 in JAP2
+      - [0x87314, data]
+      - [0x87380, .data, events/events_main]
+      - [0x8738C, .data, events/game_sys_states]
+      - [0x873D4, .data, events/title]
+      - [0x87814, .data, gfx/bodyprog_8003BE50]
+      - [0x878E0, .data, gfx/map_effects]
+      - [0x87928, data]
+      - [0x8ADE0, .data, view/vw_calc]
+      - [0x8ADF8, .data, text/text_draw_jp]
+      - [0x8AE00, data]
+      - [0x8AE24, .data, items/item_screens_3]
+      - [0x8D618, .data, view/vc_main]
+      - [0x8D688, .data, bodyprog_80089090]
+      # 0x8D6A0 should hold D_800AFD1C here, but that gets included by the bodyprog_combat_8008A058 .bss below somehow?
+      - [0x8D6C0, .data, water]
+      - [0x8D73C, .data, demo]
+      - [0x8D778, .data, ranking]
+      - [0x8D78C, .data, credits_init]
+      - [0x8D800, data]
+      - [0x8EEE0, .data, lib_unk/lib_8009E198]
+      - [0x8EF30, .data, libsd/smf_main]
+      
+      # .sdata section
+      - [0x90104, .sdata, lib_unk/lib_8009E198]
+      - [0x9010A, pad] # Garbage padding, some reason splat doesn't output data into the .s, so postbuild currently has to add it.
+
+      - [0x90110, .bss, memcard]
+      - [0x93718, .bss, text/text_debug_draw]
+      - [0x93720, .bss, screen/screen_fade]
+      - [0x9372C, bss]
+      - [0x9A80C, pad]
+      - [0x9A810, .bss, sys/memcard_2] # Garbage data at 0x9A839
+      - [0x9A83C, pad]
+      - [0x9A840, .bss, game_boot/game_boot]
+      - [0x9A844, pad]
+      - [0x9A848, .bss, events/bgm]
+      - [0x9A858, .bss, events/map_msg_display]
+      - [0x9A874, pad]
+      - [0x9A878, .bss, events/game_sys_states]
+      - [0x9A8D4, pad]
+      - [0x9A8D8, .bss, events/title]
+      - [0x9A8DC, pad]
+      - [0x9A8E0, .bss, gfx/map_effects]
+      - [0x9A8F0, bss]
+      - [0x9D6E4, pad]
+      - [0x9D6E8, .bss, gfx/bodyprog_80040B74]
+      - [0x9F0A4, pad]
+      - [0x9F0A8, .bss, gfx/bodyprog_bone_80044F14]
+      - [0x9F0AD, pad]
+      - [0x9F0B0, .bss, sound/sd_call]
+      - [0xA12D8, .bss, view/vw_main]
+      - [0xA1360, .bss, view/vw_calc]
+      - [0xA13A0, .bss, text/text_draw_jp]
+      - [0xA13A8, bss]
+      - [0xA1420, .bss, items/item_screens_cam]
+      - [0xA1458, .bss, items/item_screens_1]
+      - [0xA1460, .bss, items/item_screens_2]
+      - [0xA14A0, .bss, items/item_screens_3]
+      - [0xA1C60, bss]
+      - [0xA1DB4, pad]
+      - [0xA1DB8, .bss, sound/sfx]
+      - [0xA1DC8, bss]
+      - [0xA1DCC, pad]
+      - [0xA1DD0, .bss, bodyprog_8005E0DC]
+      - [0xA1F20, .bss, bodyprog_800652F4]
+      - [0xA1F40, .bss, bodyprog_mapscreen_80066D90]
+      - [0xA1F4C, pad]
+      - [0xA1F50, .bss, collision]
+      - [0xA1FC4, pad]
+      - [0xA1FC8, .bss, player_control]
+      - [0xA2114, pad]
+      - [0xA2118, bss]
+      - [0xA2124, pad]
+      - [0xA2128, .bss, view/vc_main]
+      - [0xA2138, .bss, events/events_util]
+      - [0xA2220, .bss, bodyprog_combat_8008A058]
+      - [0xA2310, .bss, water]
+      - [0xA2338, .bss, demo]
+      - [0xA2398, .bss, ranking]
+      - [0xA23E4, pad]
+      - [0xA23E8, .bss, credits_init]
+      - [0xA23EC, pad]
+      - [0xA23F0, bss]
+      - [0xA4A34, pad]
+      - [0xA4A38, bss]
+      - [0xA4B24, pad]
+      - [0xA4B28, bss]
+      - [0xA4F10, .bss, libsd/smf_snd]
+      - [0xA51E0, bss]
+      - [0xA51E4, pad]
+      - [0xA51E8, .bss, libsd/smf_io]
+      - [0xA65F4, pad]
+      - [0xA65F8, .bss, libsd/smf_mid]
+
+  # Random garbage data at end, define as bin file to make Splat ignore it.
+  - name: footer_data
+    type: bin
+    start: 0xA7070
+  - [0xA7100]
