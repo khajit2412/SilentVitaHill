@@ -11,8 +11,19 @@ if(DEFINED VITASDK AND CMAKE_C_COMPILER MATCHES "arm-vita-eabi")
     set(VITA_TITLEID  "SHPC00001")
     set(VITA_VERSION  "00.10")
     # Route every SDL_GL_* call (PsyCross and game alike) to vitaGL.
+    # -fsigned-char: the decomp (MIPS) and the PC port (x86) both assume plain
+    # char is signed; ARM makes it unsigned, so any char holding a negative
+    # value compared or widened differently on Vita. CTR: High Octane builds
+    # with it too.
+    # -fno-short-enums: arm-vita-eabi defaults to short enums, so the decomp's
+    # `typedef enum { false, true } bool` was one byte and `b = flags & (1<<25)`
+    # stored 0 (the inventory ignored the d-pad), and a small enum could not
+    # hold NO_VALUE. PSX and PC enums are 4 bytes. The only vitasdk structs with
+    # enum members the port reads (SDL bind type, SDL_Scancode) are masked at
+    # their two read sites; the linker's enum-size warning is expected.
     add_compile_options("SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/vita_port/vita_sdlgl_shim.h"
-                        -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard)
+                        -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard -fsigned-char -fno-short-enums)
+    add_link_options("-Wl,--no-enum-size-warning")
     message(STATUS "Target: PS Vita (vitasdk ${VITASDK})")
 endif()
 

@@ -27,9 +27,11 @@ Host needs llvm-nm + llvm-objcopy (static map symbol prefixing), python3.
 - Game target links: eboot.bin + SilentHillPC.vpk (vitasdk 2026.08, packages snapshot 20260916).
   glad.h forwards to vitaGL.h; dll_loader / pc_crash / pc_discord_ipc have Vita stubs;
   pc_ra_http.c excluded (RA off); libmathneon added after vitaGL.
-- arm-vita-eabi defaults to SHORT ENUMS (sizeof(enum) == 1). Kept for ABI parity with the SDK
-  libs; the decomp's STATIC_ASSERT_SIZEOF checks all pass. Watch for enum-typed fields in any
-  struct that mirrors file/PSX data.
+- arm-vita-eabi defaults to SHORT ENUMS (sizeof(enum) == 1). That broke the decomp's
+  `typedef enum { false, true } bool`: `b = flags & (1 << 25)` stored 0 (inventory ignored the
+  d-pad, logged by [INVPAD]). The build now uses -fno-short-enums (4-byte enums as on PSX/PC) and
+  -fsigned-char (plain char signed as on MIPS/x86). The two vitasdk structs with enum members the
+  port reads (SDL bind type, SDL_Scancode) are masked at their read sites.
 - vitaGL.h lacks GL_VERTEX_ARRAY_BINDING; the overlays query it to restore the VAO. Defined in
   glad.h so it compiles -- confirm on device that vitaGL answers it (else VAO 0 gets restored).
 
@@ -84,6 +86,13 @@ Host needs llvm-nm + llvm-objcopy (static map symbol prefixing), python3.
    - Next: leaner shader variants (opaque, no discard) for the GPU side; World-draw (GTE) on CPU.
    - Open: stale splash in the title screen's left bar (not the pillarbox clear; `dream_blur = 0`
      untested).
+
+## Later (after performance is fine-tuned)
+- Optional CRT look, off by default: RF/composite filter + subtle scanlines as a toggle, tuned for
+  the Vita screen. Needs a GLSL ES 1.00 port of the PC post-process pass (PSYX_HAS_POSTPROCESS is 0
+  on ES2), the scene rendered to a target first, and scanlines matched to the PSX line count or
+  drawn at 960x544 output (720x408 is not a multiple of 240). Pair it with restoring the PSX dither,
+  which the ES2 shader path currently skips, so the composite blur has something to blend.
 
 ## Flashlight shadows on Vita
 vitaGL has no depth textures, CLAMP_TO_BORDER or glDrawBuffers, so the shadow pre-pass renders into

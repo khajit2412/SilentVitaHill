@@ -122,7 +122,13 @@ s_PcConfig g_PcConfig = {
     .crosshairStyle      = 0, /* 0 = cross (+), 1 = dot, 2 = circle, 3 = dashes/gap */
     .crosshairSize       = 100.0f,
     .aimAssist           = 1, /* OTS/TPS free-aim aim assist (mouse body-coverage + controller auto-aim) */
+#if defined(SH_VITA)
+    /* No mouse, and the touch corners are L2/R2: the touch pointer kept
+     * snapping the inventory selection back under the finger. */
+    .mouseCursor         = 0,
+#else
     .mouseCursor         = 1, /* mouse controls cursor puzzles + clickable main menu */
+#endif
 #if defined(__ANDROID__) || defined(SH_IOS)
     /* Automatic by default only where the touchscreen IS the controller. A
      * desktop with a touch-capable monitor still has a mouse and a pad, and

@@ -1138,6 +1138,30 @@ void Inventory_DirectionalInputSet(void) // 0x8004F5DC
         g_Inventory_IsRightHeld    = g_Controller0->heldBtnFlags     & ControllerFlag_LStickRight;
         g_Inventory_IsRightPulsed  = g_Controller0->pulsedBtnFlags  & ControllerFlag_LStickRight;
     }
+
+#if defined(SH_PC_PORT) && defined(SH_VITA)
+    /* The d-pad works in every menu but here; the stick test above is the one
+     * input difference, so record what it sees, on change only. */
+    {
+        static s32 s_prev = -1;
+        const s32  stickBranch = (g_Controller0->sticks_20.sticks_0.leftY < -STICK_THRESHOLD ||
+                                  g_Controller0->sticks_20.sticks_0.leftY >= STICK_THRESHOLD ||
+                                  g_Controller0->sticks_20.sticks_0.leftX < -STICK_THRESHOLD ||
+                                  g_Controller0->sticks_20.sticks_0.leftX >= STICK_THRESHOLD);
+        const s32  key = (stickBranch << 4) | (g_Inventory_IsLeftClicked ? 1 : 0) | (g_Inventory_IsRightClicked ? 2 : 0) |
+                         (((g_Controller0->heldBtnFlags & (ControllerFlag_LStickLeft | ControllerFlag_LStickRight)) != 0) << 2);
+
+        if (key != s_prev)
+        {
+            s_prev = key;
+            SH_DBG("[INVPAD] stickBranch=%d leftX=%d leftY=%d rightX=%d rightY=%d held=0x%08x clicked=0x%08x L=%d R=%d",
+                   stickBranch, g_Controller0->sticks_20.sticks_0.leftX, g_Controller0->sticks_20.sticks_0.leftY,
+                   g_Controller0->sticks_20.sticks_0.rightX, g_Controller0->sticks_20.sticks_0.rightY,
+                   (unsigned)g_Controller0->heldBtnFlags, (unsigned)g_Controller0->clickedBtnFlags,
+                   g_Inventory_IsLeftClicked ? 1 : 0, g_Inventory_IsRightClicked ? 1 : 0);
+        }
+    }
+#endif
 }
 
 void Gfx_ItemScreens_DrawInit(u32* selectedItemId) // 0x8004F764

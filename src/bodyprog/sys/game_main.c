@@ -3087,7 +3087,15 @@ void MainLoop(void) // 0x80032EE0
 
                     if (!g_PcFastForward)
                     {
+#ifdef SH_VITA
+                        /* In-game events and scripted scenes step some of their
+                         * work per frame, as on PSX where they ran at 30: on Vita
+                         * they reached ~37 fps and played visibly fast. Menus
+                         * (no world underneath) keep the one-vblank wait. */
+                        const s32    target   = g_PrevVBlanks + (g_GameWork.gameState == GameState_InGame ? 2 : 1);
+#else
                         const s32    target   = g_PrevVBlanks + 1;
+#endif
                         const Uint32 deadline = SDL_GetTicks() + 50; /* never hang on a stalled counter */
 
                         while (VSync(SyncMode_Count) < target && SDL_GetTicks() < deadline)
@@ -3206,12 +3214,30 @@ void MainLoop(void) // 0x80032EE0
                     if (effectiveMin > 0 || s_lastFrameTime == 0)
                         s_lastFrameTime = 0; /* reset SDL timer when not in use */
 
+#ifdef SH_VITA
+                    /* PsyCross's VSync(0) returns at once when a vblank has
+                     * already passed since its last call. A frame slower than a
+                     * vblank (every frame on Vita) then had that vblank counted
+                     * twice by the ++ below: the game ran fast and the cap did
+                     * not hold. Count only what the counter says. */
+                    {
+                        const s32 base = g_PrevVBlanks - g_VBlanks;
+
+                        while (g_VBlanks < effectiveMin)
+                        {
+                            VSync(SyncMode_Wait);
+                            g_PrevVBlanks = VSync(SyncMode_Count);
+                            g_VBlanks     = g_PrevVBlanks - base;
+                        }
+                    }
+#else
                     while (g_VBlanks < effectiveMin)
                     {
                         VSync(SyncMode_Wait);
                         g_VBlanks++;
                         g_PrevVBlanks++;
                     }
+#endif
                 }
 #else
                 while (g_VBlanks < g_IntervalVBlanks)
