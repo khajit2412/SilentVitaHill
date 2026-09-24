@@ -135,7 +135,11 @@ s_PcConfig g_PcConfig = {
     .touchQuickSaveLoad  = 0,
     .screenOrientation   = 0, /* lock landscape: what the port has always done */
     .touchLookSensitivity = 1.0f,
+#if defined(SH_VITA)
+    .renderScale         = 0.75f, /* 720x408 display mode: 960x544 left the GPU the bottleneck outdoors */
+#else
     .renderScale         = 1.0f,
+#endif
     .lowEndMode          = 0,
     .oneButtonCombat      = 0, /* off: Aim holds, a separate Fire button shoots */
     .altButtonSprint     = 0, /* alt cams sprint from the run control only (off = full stick push also sprints) */

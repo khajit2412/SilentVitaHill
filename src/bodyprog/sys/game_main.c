@@ -2227,7 +2227,7 @@ unsigned g_ShOtWalk = 0;
  * file loads, log volume) came back clean -- so the only way left to find it is
  * to time the phases from inside. Tags are string literals, so identity compare
  * is enough to bucket them. */
-#define ML_MAX_TAGS 24
+#define ML_MAX_TAGS 40
 static const char* s_mlTag[ML_MAX_TAGS];
 static unsigned    s_mlMs[ML_MAX_TAGS];
 static int         s_mlTagCount = 0;
@@ -2270,7 +2270,7 @@ static void Ml_TraceReport(unsigned frames)
 {
     int i, k;
 
-    for (k = 0; k < 4; k++)
+    for (k = 0; k < 8; k++)
     {
         int best = -1;
 
@@ -2291,6 +2291,11 @@ static void Ml_TraceReport(unsigned frames)
 
     for (i = 0; i < s_mlTagCount; i++)
         s_mlMs[i] = 0;
+}
+/* For phase markers outside this file (the in-game state update). */
+void Pc_MlTrace(const char* tag)
+{
+    Ml_Trace(tag);
 }
 #endif /* SH_PC_PORT -- phase timing */
 
@@ -2741,9 +2746,11 @@ void MainLoop(void) // 0x80032EE0
         // Call update function for current GameState.
 #ifdef SH_PC_PORT
         s_sfUpdStart = (unsigned int)SDL_GetTicks();
+        Ml_Trace("GameStateUpdate");
 #endif
         g_GameStateUpdateFuncs[g_GameWork.gameState]();
 #ifdef SH_PC_PORT
+        Ml_Trace("post-update");
         s_sfUpdEnd = (unsigned int)SDL_GetTicks();
         /* The touch overlay, for EVERY game state, drawn right after the state
          * that owns the frame has queued its own prims.

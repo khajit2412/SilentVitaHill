@@ -72,6 +72,16 @@ Host needs llvm-nm + llvm-objcopy (static map symbol prefixing), python3.
    - render_scale had never applied on Vita: GR_InitialiseRender asked GR_SceneAlwaysOffscreen
      before the context existed ("desktop GL"), made a target before vglInit, and that target blocked
      render_scale. Fixed; render_scale is re-applied after the context like Android/iOS.
+   - Busy-spin fix confirmed: swap 36 ms -> ~0.2 ms indoors. Outdoors at 960x544 the GPU was the
+     limit (swap 23-47 ms); render_scale is now a Vita DISPLAY MODE (960x544 / 720x408 / 640x368 /
+     480x272, scaled by the display hardware) instead of an offscreen target, whose
+     glBlitFramebuffer stretch vitaGL did not do. Vita default render_scale = 0.75 (720x408).
+   - At 720x408, dense town (~340 draws): ~18.6 fps. GPU (swap) ~20 ms; CPU: OT0 16.8 ms (parse
+     5.5 + submit 10.6), World-draw 9.7 ms, Harry/particles/NPC ~5 ms. [SPLITS]: texture+shader
+     3.3 ms, draw 4.1 ms (~12 us/draw). Every split re-sent ~25 uniforms + texture binds, so the
+     shim now filters redundant glUniform*/glUseProgram/glBindTexture/glActiveTexture/glViewport
+     calls and PsyCross caches the projection matrices (UNTESTED on device at commit time).
+   - Next: leaner shader variants (opaque, no discard) for the GPU side; World-draw (GTE) on CPU.
    - Open: stale splash in the title screen's left bar (not the pillarbox clear; `dream_blur = 0`
      untested).
 

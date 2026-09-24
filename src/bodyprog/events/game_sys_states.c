@@ -315,9 +315,15 @@ void GameState_InGame_Update(void) // 0x80038BD4
         Demo_DemoRandSeedRestore();
 
         player = &g_SysWork.playerWork.player;
+#ifdef SH_PC_PORT
+        { extern void Pc_MlTrace(const char*); Pc_MlTrace("Player_Update"); }
+#endif
         Player_Update(player, FS_BUFFER_0, g_SysWork.playerBoneCoords);
 
         Demo_DemoRandSeedRestore();
+#ifdef SH_PC_PORT
+        { extern void Pc_MlTrace(const char*); Pc_MlTrace("Flashlight+particles"); }
+#endif
         Gfx_FlashlightUpdate();
 
         if (g_SavegamePtr->mapIdx != MapIdx_MAP7_S03)
@@ -334,6 +340,9 @@ void GameState_InGame_Update(void) // 0x80038BD4
          * e.g. the intro's LookAtDeadBody shot clears AnimFlag_Visible so
          * Harry doesn't block the camera, and PC showed his face anyway. */
 
+#ifdef SH_PC_PORT
+        { extern void Pc_MlTrace(const char*); Pc_MlTrace("Harry-draw+combat"); }
+#endif
         if (player->model.anim.flags & AnimFlag_Visible)
         {
 #ifdef SH_PC_PORT
@@ -372,11 +381,20 @@ void GameState_InGame_Update(void) // 0x80038BD4
         }
 
         Demo_DemoRandSeedRestore();
+#ifdef SH_PC_PORT
+        { extern void Pc_MlTrace(const char*); Pc_MlTrace("Npc-update"); }
+#endif
         Game_NpcRoomInitSpawn(true);
         Game_NpcUpdate();
         func_8005E89C();
         Ipd_CloseRangeChunksInit();
+#ifdef SH_PC_PORT
+        { extern void Pc_MlTrace(const char*); Pc_MlTrace("World-draw"); }
+#endif
         Gfx_InGameDraw(1);
+#ifdef SH_PC_PORT
+        { extern void Pc_MlTrace(const char*); Pc_MlTrace("post-InGameDraw"); }
+#endif
 #ifdef SH_PC_PORT
         /* The world is in the OT for this frame, so the fog-colored clear behind
          * it is correct. Without the world, that clear is the whole image. */
