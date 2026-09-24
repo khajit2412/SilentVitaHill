@@ -3091,8 +3091,11 @@ void MainLoop(void) // 0x80032EE0
                         /* In-game events and scripted scenes step some of their
                          * work per frame, as on PSX where they ran at 30: on Vita
                          * they reached ~37 fps and played visibly fast. Menus
-                         * (no world underneath) keep the one-vblank wait. */
-                        const s32    target   = g_PrevVBlanks + (g_GameWork.gameState == GameState_InGame ? 2 : 1);
+                         * (no world underneath) keep one vblank. Counted from the
+                         * previous frame's start, not from now, so a frame that
+                         * already took longer waits for nothing. */
+                        const s32    target   = (g_PrevVBlanks - g_VBlanks) +
+                                                (g_GameWork.gameState == GameState_InGame ? 2 : 1);
 #else
                         const s32    target   = g_PrevVBlanks + 1;
 #endif

@@ -52,7 +52,7 @@ Host needs llvm-nm + llvm-objcopy (static map symbol prefixing), python3.
    vita_sdlgl_shim.c; vitaGL's RAM pool is the remainder minus ram_threshold (16 MB). Both are
    guesses: tune from the "Vita free memory after GL init" log line on device.
    `-Wl,--defsym,__sce_headroom=0x2000` keeps vita-elf-create's "segment 1 overlaps" away.
-5. Controls — partial. L2/R2 = front-touch top corners (vita_port/vita_touch_buttons.c, one
+5. Controls — partial. L/R = L2/R2 (look/aim); L1/R1 = front-touch top corners (vita_port/vita_touch_buttons.c, one
    table; SDL touch-to-mouse is off on Vita). A proper remappable layout is still to do.
 6. On-device — boots to gameplay (2026-09-23, ~15-17 fps, CPU 444 MHz, culling on). Findings:
    - vitaGL compiles GLSL inside glLinkProgram (VGL_MODE_POSTPONED) and crashes on a failed
@@ -93,6 +93,15 @@ Host needs llvm-nm + llvm-objcopy (static map symbol prefixing), python3.
   on ES2), the scene rendered to a target first, and scanlines matched to the PSX line count or
   drawn at 960x544 output (720x408 is not a multiple of 240). Pair it with restoring the PSX dither,
   which the ES2 shader path currently skips, so the composite blur has something to blend.
+
+## Known issues
+- Glass shatter (cafe window) shards show VRAM noise: they sample the PSX framebuffer band, which
+  PsyCross fills from the screen via GR_StoreFrameBufferPsx. That path needs scaled
+  glBlitFramebuffer (USE_FRAMEBUFFER_BLIT, ES3 only), so it is compiled out on Vita. A Vita path
+  (glCopyTexSubImage2D 1:1 + quad downscale into the pack target) was tried and reverted: the packed
+  frame landed in the wrong VRAM rows and erased the inventory font/portrait. Suspect vitaGL's
+  render-to-texture Y orientation in GR_PackFrameToVramRect; verify before re-enabling. Also affects
+  dream blur / loading trail / soft-focus.
 
 ## Flashlight shadows on Vita
 vitaGL has no depth textures, CLAMP_TO_BORDER or glDrawBuffers, so the shadow pre-pass renders into

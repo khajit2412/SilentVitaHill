@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* vita_touch_buttons.c - PSX buttons the Vita does not have, on the front
- * touchscreen. Called from PsyX_Pad_InternalPadUpdates for player 1. */
+ * touchscreen: L1/R1 (sidestep), since the shoulder buttons are L2/R2 (look,
+ * aim; see the SH_VITA pad defaults in pc_config.c). Called from
+ * PsyX_Pad_InternalPadUpdates for player 1. */
 #if defined(__vita__)
 #include <psp2/touch.h>
 
@@ -16,8 +18,8 @@ typedef struct
 
 /* The two top corners, a quarter of the width by a third of the height each. */
 static const VitaTouchButton s_buttons[] = {
-    { 0,                 0, PANEL_W / 4, PANEL_H / 3, 0x0100 }, /* L2 */
-    { PANEL_W * 3 / 4,   0, PANEL_W,     PANEL_H / 3, 0x0200 }, /* R2 */
+    { 0,                 0, PANEL_W / 4, PANEL_H / 3, 0x0400 }, /* L1 */
+    { PANEL_W * 3 / 4,   0, PANEL_W,     PANEL_H / 3, 0x0800 }, /* R1 */
 };
 
 static int s_started = 0;

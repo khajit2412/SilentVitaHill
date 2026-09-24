@@ -249,8 +249,15 @@ s_PcConfig g_PcConfig = {
         .keyL1 = "A", .keyR1 = "D", .keyL2 = "Right Shift", .keyR2 = "Left Shift",
         .keyL3 = "NONE", .keyR3 = "NONE", .keyStart = "Return", .keySelect = "Space",
         .padCross = "a", .padCircle = "b", .padTriangle = "y", .padSquare = "x",
+#if defined(SH_VITA)
+        /* Two shoulder buttons: L/R take look and aim (L2/R2); sidestep
+         * (L1/R1) moves to the front-touch corners (vita_touch_buttons.c). */
+        .padL1 = "NONE", .padR1 = "NONE",
+        .padL2 = "leftshoulder", .padR2 = "rightshoulder",
+#else
         .padL1 = "leftshoulder", .padR1 = "rightshoulder",
         .padL2 = "lefttrigger", .padR2 = "righttrigger",
+#endif
         .padL3 = "leftstick", .padR3 = "rightstick",
         .padStart = "start", .padSelect = "back",
         .keyChangeCam = "F9", .padChangeCam = "rightstick",
@@ -270,9 +277,16 @@ s_PcConfig g_PcConfig = {
         .keyL1 = "A", .keyR1 = "D", .keyL2 = "NONE", .keyR2 = "Mouse2",
         .keyL3 = "NONE", .keyR3 = "NONE", .keyStart = "Return", .keySelect = "Space",
         .keyCross2 = "E",
+#if defined(SH_VITA)
+        /* No triggers: fire on R, aim on L, run back on square. */
+        .padCross = "rightshoulder", .padCircle = "b", .padTriangle = "y", .padSquare = "x",
+        .padL1 = "NONE", .padR1 = "NONE",
+        .padL2 = "NONE", .padR2 = "leftshoulder",
+#else
         .padCross = "righttrigger", .padCircle = "b", .padTriangle = "y", .padSquare = "leftshoulder",
         .padL1 = "NONE", .padR1 = "NONE",
         .padL2 = "NONE", .padR2 = "lefttrigger",
+#endif
         .padL3 = "leftstick", .padR3 = "rightstick",
         .padStart = "start", .padSelect = "back",
         .padCross2 = "a",
