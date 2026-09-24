@@ -63,8 +63,17 @@ Host needs llvm-nm + llvm-objcopy (static map symbol prefixing), python3.
    - vitaGL allocates per glBufferData: the 17 MB orphan per upload cost ~290 ms/frame. Vita now
      uploads exactly the used vertices.
    - SDL_GetWindowSize is the requested size, so Vita config defaults to 960x544.
-   - Now GPU-heavy (EndScene ~25 ms) with game logic ~18 ms. To try: render_scale, flashlight_mode,
-     `dream_blur = 0` (suspected cause of the stale splash in the title screen's left bar).
+   - Frame time (2026-09-24, ~15 fps): game logic ~12 ms, OT parse+submit ~9 ms, and a near-constant
+     ~36 ms in vglSwapBuffers even at 2-3 draws/frame. [ENDSCENE] / [GLCOUNT] log lines (every 300
+     frames) showed no FBO switches, readbacks or uploads, and render_scale made no difference.
+     Ruled out: vsync (config vsync now reaches vitaGL, which starts with vblank wait off) and fill.
+     Suspect under test: psyX_intr and the main-thread vblank wait both busy-spun, starving the GXM
+     display-queue thread on the Vita's three cores; both now yield (200 / 100 us).
+   - render_scale had never applied on Vita: GR_InitialiseRender asked GR_SceneAlwaysOffscreen
+     before the context existed ("desktop GL"), made a target before vglInit, and that target blocked
+     render_scale. Fixed; render_scale is re-applied after the context like Android/iOS.
+   - Open: stale splash in the title screen's left bar (not the pillarbox clear; `dream_blur = 0`
+     untested).
 
 ## Flashlight shadows on Vita
 vitaGL has no depth textures, CLAMP_TO_BORDER or glDrawBuffers, so the shadow pre-pass renders into

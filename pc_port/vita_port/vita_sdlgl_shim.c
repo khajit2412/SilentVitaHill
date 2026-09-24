@@ -29,6 +29,58 @@ int _newlib_heap_size_user = 160 * 1024 * 1024;
 
 static int s_vglReady = 0;
 
+#undef glBindFramebuffer
+#undef glClear
+#undef glReadPixels
+#undef glCopyTexSubImage2D
+#undef glTexSubImage2D
+#undef glTexImage2D
+#undef glDrawArrays
+
+unsigned g_vitaGlCount[VGLC_COUNT];
+
+void VitaGL_Count_BindFramebuffer(GLenum target, GLuint fb)
+{
+    g_vitaGlCount[VGLC_FBO]++;
+    glBindFramebuffer(target, fb);
+}
+
+void VitaGL_Count_Clear(GLbitfield mask)
+{
+    g_vitaGlCount[VGLC_CLEAR]++;
+    glClear(mask);
+}
+
+void VitaGL_Count_ReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum f, GLenum t, void* p)
+{
+    g_vitaGlCount[VGLC_READ]++;
+    glReadPixels(x, y, w, h, f, t, p);
+}
+
+void VitaGL_Count_CopyTexSubImage2D(GLenum tg, GLint l, GLint xo, GLint yo, GLint x, GLint y, GLsizei w, GLsizei h)
+{
+    g_vitaGlCount[VGLC_COPYTEX]++;
+    glCopyTexSubImage2D(tg, l, xo, yo, x, y, w, h);
+}
+
+void VitaGL_Count_TexSubImage2D(GLenum tg, GLint l, GLint xo, GLint yo, GLsizei w, GLsizei h, GLenum f, GLenum t, const void* p)
+{
+    g_vitaGlCount[VGLC_TEXUP]++;
+    glTexSubImage2D(tg, l, xo, yo, w, h, f, t, p);
+}
+
+void VitaGL_Count_TexImage2D(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h, GLint b, GLenum f, GLenum t, const void* p)
+{
+    g_vitaGlCount[VGLC_TEXUP]++;
+    glTexImage2D(tg, l, ifmt, w, h, b, f, t, p);
+}
+
+void VitaGL_Count_DrawArrays(GLenum m, GLint first, GLsizei n)
+{
+    g_vitaGlCount[VGLC_DRAW]++;
+    glDrawArrays(m, first, n);
+}
+
 SDL_GLContext VitaGL_CreateContext(SDL_Window* w)
 {
     (void)w;
@@ -42,6 +94,9 @@ SDL_GLContext VitaGL_CreateContext(SDL_Window* w)
         vglInitExtended(0, VITA_SCREEN_W, VITA_SCREEN_H,
                         16 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
         shark_install_log_cb(VitaGL_SharkLog);
+        /* Off until the config says otherwise (GR_UpdateSwapIntervalState):
+         * the game paces itself to 30 fps. */
+        vglWaitVblankStart(GL_FALSE);
         s_vglReady = 1;
     }
     return (SDL_GLContext)(uintptr_t)1; /* any non-NULL handle */

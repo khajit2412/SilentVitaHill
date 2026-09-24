@@ -31,9 +31,30 @@ void          VitaGL_GetDrawableSize(SDL_Window* w, int* x, int* y);
 int           VitaGL_GetAttribute(SDL_GLattr attr, int* value);
 void*         VitaGL_GetProcAddress(const char* name);
 
+/* Per-frame counts of the GL calls that cost a tiled GPU the most (render
+ * target switches, clears, readbacks, uploads), reported by PsyX_EndScene.
+ * vglSwapBuffers took 20-49 ms/frame even on near-empty screens. */
+enum { VGLC_FBO, VGLC_CLEAR, VGLC_READ, VGLC_COPYTEX, VGLC_TEXUP, VGLC_DRAW, VGLC_COUNT };
+extern unsigned g_vitaGlCount[VGLC_COUNT];
+void VitaGL_Count_BindFramebuffer(GLenum target, GLuint fb);
+void VitaGL_Count_Clear(GLbitfield mask);
+void VitaGL_Count_ReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum f, GLenum t, void* p);
+void VitaGL_Count_CopyTexSubImage2D(GLenum tg, GLint l, GLint xo, GLint yo, GLint x, GLint y, GLsizei w, GLsizei h);
+void VitaGL_Count_TexSubImage2D(GLenum tg, GLint l, GLint xo, GLint yo, GLsizei w, GLsizei h, GLenum f, GLenum t, const void* p);
+void VitaGL_Count_TexImage2D(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h, GLint b, GLenum f, GLenum t, const void* p);
+void VitaGL_Count_DrawArrays(GLenum m, GLint first, GLsizei n);
+
 #ifdef __cplusplus
 }
 #endif
+
+#define glBindFramebuffer(t,f)                  VitaGL_Count_BindFramebuffer(t,f)
+#define glClear(m)                              VitaGL_Count_Clear(m)
+#define glReadPixels(x,y,w,h,f,t,p)             VitaGL_Count_ReadPixels(x,y,w,h,f,t,p)
+#define glCopyTexSubImage2D(tg,l,xo,yo,x,y,w,h) VitaGL_Count_CopyTexSubImage2D(tg,l,xo,yo,x,y,w,h)
+#define glTexSubImage2D(tg,l,xo,yo,w,h,f,t,p)   VitaGL_Count_TexSubImage2D(tg,l,xo,yo,w,h,f,t,p)
+#define glTexImage2D(tg,l,i,w,h,b,f,t,p)        VitaGL_Count_TexImage2D(tg,l,i,w,h,b,f,t,p)
+#define glDrawArrays(m,first,n)                 VitaGL_Count_DrawArrays(m,first,n)
 
 /* The Vita SDL video driver rejects SDL_WINDOW_OPENGL outright ("No OpenGL
  * support in video driver"); a plain window is all vitaGL needs. */
