@@ -40,12 +40,15 @@
  * 2026-05-01 21:37 (ParsePrimitivesLinkedList +0xa5, bad next-pointer
  * with the muzzle-flash tpage byte 0x2B in upper bytes). */
 #undef gte_stsxy3_g3
+/* Through the struct, not byte offsets: the header is 12 bytes on 64-bit
+ * PC but 8 on the 32-bit Vita, where 16/24/32 hit the UV/CLUT/tpage words
+ * and left x0-x2 stale (the glass/blood/muzzle "triangles"). */
 #if defined(_M_X64) || defined(__amd64__) || defined(SH_PC_PORT)
 #define gte_stsxy3_g3( p ) do { \
     char *_b = (char*)(p); \
-    *(uint*)(_b + 16) = MFC2(12); \
-    *(uint*)(_b + 24) = MFC2(13); \
-    *(uint*)(_b + 32) = MFC2(14); \
+    *(uint*)&((POLY_G3*)_b)->x0 = MFC2(12); \
+    *(uint*)&((POLY_G3*)_b)->x1 = MFC2(13); \
+    *(uint*)&((POLY_G3*)_b)->x2 = MFC2(14); \
 } while(0)
 #else
 #define gte_stsxy3_g3( p ) do { \

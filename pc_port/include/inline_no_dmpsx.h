@@ -92,13 +92,16 @@ extern void PGXP_StoreAddr(void* addr, int slot);
  * On PSX (32-bit, non-extended) compiles, fall back to the original
  * offsets so this header stays valid for both targets. */
 #undef gte_stsxy3_g3
+/* Through the struct, not byte offsets: the header is 12 bytes on 64-bit
+ * PC but 8 on the 32-bit Vita, where 16/24/32 hit the UV/CLUT/tpage words
+ * and left x0-x2 stale (the glass/blood/muzzle "triangles"). */
 #if defined(_M_X64) || defined(__amd64__) || defined(SH_PC_PORT)
 #define gte_stsxy3_g3( p ) do { \
     char *_b = (char*)(p); \
-    *(uint*)(_b + 16) = MFC2(12); \
-    *(uint*)(_b + 24) = MFC2(13); \
-    *(uint*)(_b + 32) = MFC2(14); \
-    if (g_PsxUsePgxp || g_PsyX_UsePerPixelFlashlight) { PGXP_StoreAddr(_b + 16, 0); PGXP_StoreAddr(_b + 24, 1); PGXP_StoreAddr(_b + 32, 2); } \
+    *(uint*)&((POLY_G3*)_b)->x0 = MFC2(12); \
+    *(uint*)&((POLY_G3*)_b)->x1 = MFC2(13); \
+    *(uint*)&((POLY_G3*)_b)->x2 = MFC2(14); \
+    if (g_PsxUsePgxp || g_PsyX_UsePerPixelFlashlight) { PGXP_StoreAddr(&((POLY_G3*)_b)->x0, 0); PGXP_StoreAddr(&((POLY_G3*)_b)->x1, 1); PGXP_StoreAddr(&((POLY_G3*)_b)->x2, 2); } \
 } while(0)
 #else
 #define gte_stsxy3_g3( p ) do { \

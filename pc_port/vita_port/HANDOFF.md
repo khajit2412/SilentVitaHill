@@ -95,13 +95,22 @@ Host needs llvm-nm + llvm-objcopy (static map symbol prefixing), python3.
   which the ES2 shader path currently skips, so the composite blur has something to blend.
 
 ## Known issues
-- Glass shatter (cafe window) shards show VRAM noise: they sample the PSX framebuffer band, which
-  PsyCross fills from the screen via GR_StoreFrameBufferPsx. That path needs scaled
-  glBlitFramebuffer (USE_FRAMEBUFFER_BLIT, ES3 only), so it is compiled out on Vita. A Vita path
-  (glCopyTexSubImage2D 1:1 + quad downscale into the pack target) was tried and reverted: the packed
-  frame landed in the wrong VRAM rows and erased the inventory font/portrait. Suspect vitaGL's
-  render-to-texture Y orientation in GR_PackFrameToVramRect; verify before re-enabling. Also affects
-  dream blur / loading trail / soft-focus.
+- Glass/blood/muzzle "triangles" (fixed): gte_stsxy3_g3 stored SXY0-2 at the 64-bit PC byte offsets
+  16/24/32; the Vita prim header is 8 bytes (P_LEN 2), so the writes hit uv/clut/tpage and left x0-x2
+  stale. The garbage tpage also pointed into the framebuffer band, arming the feedback capture (a
+  glReadPixels stall every frame: fights at ~11 fps). Any PC-port code that hardcodes the 12-byte
+  prim header, or other x64 layouts, is suspect on Vita.
+- Framebuffer feedback is live on Vita (GR_StoreFrameBufferPsx, capture via glCopyTexSubImage2D +
+  quad downscale). GXM does not clip to the viewport: full-screen passes into a VRAM sub-rect must draw
+  an exact NDC quad, never the oversize triangle (its overhang packed smeared capture edges over the
+  font rows 496-511 and the sign textures at x 320-400). Scissored glClear on vitaGL FBOs is flipped
+  and drawn through a stencil mask, so VRAM rects are zeroed with a viewport quad (GR_VitaZeroRect).
+- The capture's glReadPixels on the display forces sceGxmFinish; it only runs while a prim samples the
+  display band (dream blur, loading trail). If that ever shows up in gameplay, render the scene
+  offscreen and copy on the GPU instead.
+- Draw batching (Vita_BatchSplits): untextured prims join the neighbouring VRAM split via a ulo>uhi
+  vertex marker, then equal-state splits are joined.
+- Open: the cafe Air Screamer hovers over Harry and never attacks.
 
 ## Flashlight shadows on Vita
 vitaGL has no depth textures, CLAMP_TO_BORDER or glDrawBuffers, so the shadow pre-pass renders into
