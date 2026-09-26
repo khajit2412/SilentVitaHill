@@ -25,12 +25,13 @@ static const VitaTouchButton s_buttons[] = {
 
 static int s_started = 0;
 
-/* Rear panel tap: step through palette-cache settings, so their effect on fps
- * can be compared in place: off, every split, splits of 1024+ / 4096+ PSX px. */
+/* Rear panel tap: step through draw-batching settings so their effect on fps
+ * can be compared in place (see the table in the tap handler). */
 extern int  g_vitaPalCache;
 extern int  g_vitaPalMinArea;
+extern int  g_vitaReorder;
 static int  s_backDown = 0;
-static int  s_palMode = 2;
+static int  s_palMode = 1;
 
 static void VitaTouch_PollBack(void)
 {
@@ -42,12 +43,19 @@ static void VitaTouch_PollBack(void)
     down = back.reportNum > 0;
     if (down && !s_backDown)
     {
-        static const int areas[4] = { 0, 0, 1024, 4096 };
+        /* mode: palette cache, min area, reorder */
+        static const int modes[4][3] = {
+            { 0, 0,    1 },
+            { 1, 0,    1 },
+            { 1, 1024, 1 },
+            { 1, 1024, 0 },
+        };
         s_palMode = (s_palMode + 1) & 3;
-        g_vitaPalCache   = s_palMode != 0;
-        g_vitaPalMinArea = areas[s_palMode];
-        SH_DBG("[PALCACHE] rear touch: mode %d (%s, min area %d)", s_palMode,
-               g_vitaPalCache ? "on" : "off", g_vitaPalMinArea);
+        g_vitaPalCache   = modes[s_palMode][0];
+        g_vitaPalMinArea = modes[s_palMode][1];
+        g_vitaReorder    = modes[s_palMode][2];
+        SH_DBG("[PALCACHE] rear touch: mode %d (palette %s, min area %d, reorder %s)", s_palMode,
+               g_vitaPalCache ? "on" : "off", g_vitaPalMinArea, g_vitaReorder ? "on" : "off");
     }
     s_backDown = down;
 }

@@ -134,14 +134,20 @@ void AsRodata_Reformat(void)
     dst->ptr_D48[3] = (SVECTOR*)&g_AsPtrD48Vecs[8];
     dst->ptr_D48[4] = (SVECTOR*)&g_AsPtrD48Vecs[11];
 
-    /* field_D5C[4][2] — 16 B s16 array. */
-    memcpy(dst->field_D5C, &src[0xD5C], 4 * 2 * sizeof(s16));
+    /* field_D5C[5][2] — 20 B s16 array (the decomp once split row 4 off as
+     * "unk_D6C"). */
+    memcpy(dst->field_D5C, &src[0xD5C], 5 * 2 * sizeof(s16));
 
-    /* unk_D6C[4] — 4 B s8 array. */
-    memcpy(dst->unk_D6C, &src[0xD6C], 4);
-
-    /* field_D70[2][2] — 8 B s16 array. */
+    /* field_D70[5][2]: rows 0-1 are the last bytes of the extract; rows 2-4
+     * run past it and were read from every AS overlay on the USA disc (all
+     * six agree). sharedFunc_800D82B8 indexes this with 0-4 for the hitbox
+     * radius, so with only two rows the hover attack's reach test read past
+     * the struct: 0 by luck on 64-bit PC, a pointer's high half (negative) on
+     * the Vita -- the Air Screamer that hovers over Harry and never strikes. */
     memcpy(dst->field_D70, &src[0xD70], 2 * 2 * sizeof(s16));
+    dst->field_D70[2][0] = -327;  dst->field_D70[2][1] = 2662;
+    dst->field_D70[3][0] = -1228; dst->field_D70[3][1] = 2867;
+    dst->field_D70[4][0] = 0;     dst->field_D70[4][1] = 1433;
 
     SH_LOG("AsRodata_Reformat: populated sharedData_800CAA98_0_s01 from %d-byte raw extract",
            0xD78);

@@ -107,7 +107,10 @@ native_gpu.c. Its Vita-specific techniques and our status:
   256 nodes per domain) that picks the most state-compatible ready split. NOT DONE: our depth
   buffer carries GTE depth for items vs world, so order depth would change that; the bbox
   scheduler is safe for all splits. Interim: palette splits under g_vitaPalMinArea (PSX px bbox)
-  fall back to VRAM sampling and merge; rear touch cycles off/all/1024/4096.
+  fall back to VRAM sampling and merge. DONE since: windowed version (Vita_ReorderSplits, 32
+  groups, bbox-disjoint moves only, dfe=0/modern/capture splits are barriers), reordered
+  vertices drawn in place (s_drawVerts). Rear touch cycles: 0 palette off, 1 all+reorder
+  (default), 2 area 1024+reorder, 3 area 1024 no reorder. [SUBMIT] splits the submit time.
 - Measured 2026-09-26 (town fight): scratch vertex upload took swap from 19 ms to 0.2 ms (the
   wait was vitaGL's GC); palette cache on every split raised draws 145 -> 450-600 and OT0 submit
   to 12-16 ms (CPU-bound again). GPU backlog at swap ~24 ms but swap-after-drain 0.14 ms.
@@ -145,7 +148,11 @@ native_gpu.c. Its Vita-specific techniques and our status:
   offscreen and copy on the GPU instead.
 - Draw batching (Vita_BatchSplits): untextured prims join the neighbouring VRAM split via a ulo>uhi
   vertex marker, then equal-state splits are joined.
-- Open: the cafe Air Screamer hovers over Harry and never attacks.
+- Air Screamer hover attack (fixed): s_func_800D2E04.field_D70 is [5][2] (and field_D5C [5][2],
+  swallowing "unk_D6C"); only rows 0-1 were extracted, so sharedFunc_800D82B8's hitbox radius read
+  past the struct -- 0 on x64 by luck, a pointer's high half (negative) on Vita, failing the
+  Control_23 reach test forever. Rows 2-4 read from the USA disc (all six AS overlays agree).
+  General lesson: any out-of-bounds read the x64 build survives by luck can misbehave on Vita.
 
 ## Flashlight shadows on Vita
 vitaGL has no depth textures, CLAMP_TO_BORDER or glDrawBuffers, so the shadow pre-pass renders into

@@ -114,9 +114,8 @@ typedef struct
     u16         field_D24[2][3][2];
     u8          field_D3C[2][6];
     SVECTOR*    ptr_D48[5];
-    s16         field_D5C[4][2]; // Related to animations. Move offset distances?
-    s8          unk_D6C[4];
-    s16         field_D70[2][2];
+    s16         field_D5C[5][2]; // Related to animations. Move offset distances? Indexed 0-4 by `sharedFunc_800D4A80_0_s01`.
+    s16         field_D70[5][2]; // Collision offset/radius per `sharedFunc_800D4A80_0_s01` index 0-4 (rodata runs past 0xD78).
 } s_func_800D2E04;
 
 typedef struct

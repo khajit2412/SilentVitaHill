@@ -386,6 +386,9 @@ void GameState_InGame_Update(void) // 0x80038BD4
 #endif
         Game_NpcRoomInitSpawn(true);
         Game_NpcUpdate();
+#ifdef SH_PC_PORT
+        { extern void Pc_MlTrace(const char*); Pc_MlTrace("Npc-post"); }
+#endif
         func_8005E89C();
         Ipd_CloseRangeChunksInit();
 #ifdef SH_PC_PORT

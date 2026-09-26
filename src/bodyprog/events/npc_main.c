@@ -847,7 +847,13 @@ void Game_NpcUpdate(void) // 0x80038354
             else
 #endif
             {
+#ifdef SH_PC_PORT
+                { extern void Pc_MlTrace(const char*); Pc_MlTrace("Npc-ai"); }
+#endif
                 g_MapOverlayHdr.charaUpdateFuncs[npc->model.charaId](npc, g_CharaModelAnimsData[animDataInfoIdx].activeAnmHdr, boneCoords);
+#ifdef SH_PC_PORT
+                { extern void Pc_MlTrace(const char*); Pc_MlTrace("Npc-collision"); }
+#endif
 #ifdef SH_PC_PORT
                 /* Randomizer enemy-HP scale: the AI update above sets an enemy's
                  * health on its first tick; latch + multiply once (no-op off). */
@@ -864,8 +870,14 @@ void Game_NpcUpdate(void) // 0x80038354
 
             if (npc->model.anim.flags & AnimFlag_Visible)
             {
+#ifdef SH_PC_PORT
+                { extern void Pc_MlTrace(const char*); Pc_MlTrace("Npc-draw"); }
+#endif
                 func_8003DA9C(npc->model.charaId, boneCoords, 1, npc->timer_C6, (s8)npc->model.paletteIdx);
             }
+#ifdef SH_PC_PORT
+            { extern void Pc_MlTrace(const char*); Pc_MlTrace("Npc-update"); }
+#endif
         }
     }
 
