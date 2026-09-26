@@ -100,6 +100,7 @@ static char* Png_Inflate(const char* buf, int len, int initialSize, int* outLen,
 
 #include <PsyX/common/glad.h>
 #include <PsyX/PsyX_backend.h>
+#include <SDL.h>
 
 #define MAX_HIRES_OVERRIDES 256
 
@@ -999,12 +1000,16 @@ int HiresOverride_PoolSlotRegister(int slotId,
      * from the number of rows actually written rather than the declared count. */
     int status = 0;
     int doneRows = 0;
+    Uint64 tStart = SDL_GetPerformanceCounter(), tDecode = 0, tUpload = 0;
 
     for (r = 0; r < rows; r++)
     {
         unsigned char* rgba = NULL;
         int w = 0, h = 0, srcBpp = 0, timRows = 1;
-        if (decode_to_rgba(tag, data, size, &rgba, &w, &h, &srcBpp, r, &timRows) != 0)
+        Uint64 t0 = SDL_GetPerformanceCounter();
+        int decodeFailed = decode_to_rgba(tag, data, size, &rgba, &w, &h, &srcBpp, r, &timRows) != 0;
+        tDecode += SDL_GetPerformanceCounter() - t0;
+        if (decodeFailed)
         {
             status = (r == 0) ? -1 : 0;
             break;
@@ -1047,12 +1052,17 @@ int HiresOverride_PoolSlotRegister(int slotId,
                 rowSlot->nativeW = nativePixelW;
                 rowSlot->nativeH = nativePixelH;
             }
-            if (upload_rgba(&rowSlot->glTexture[rowIdx], rgba,
-                            w, h, (w == nativePixelW && h == nativePixelH)) != 0)
             {
-                free(rgba);
-                status = (r == 0) ? -1 : 0;
-                break;
+                Uint64 u0 = SDL_GetPerformanceCounter();
+                int upFailed = upload_rgba(&rowSlot->glTexture[rowIdx], rgba,
+                                           w, h, (w == nativePixelW && h == nativePixelH)) != 0;
+                tUpload += SDL_GetPerformanceCounter() - u0;
+                if (upFailed)
+                {
+                    free(rgba);
+                    status = (r == 0) ? -1 : 0;
+                    break;
+                }
             }
             free(rgba);
             if (r < HIRES_POOL_MAX_ROWS)
@@ -1090,9 +1100,11 @@ int HiresOverride_PoolSlotRegister(int slotId,
     static int s_regLog = 0;
     if (s_regLog < 256)
     {
-        SH_DBG("[POOLTEX] slot %d <- %dx%d x%d rows (native %dx%d) tex=%u",
+        const double f = 1000.0 / (double)SDL_GetPerformanceFrequency();
+        SH_DBG("[POOLTEX] slot %d <- %dx%d x%d rows (native %dx%d) tex=%u ms: total=%.1f decode=%.1f upload=%.1f",
                slotId, hiW, hiH, rows, nativePixelW, nativePixelH,
-               (unsigned)s->glTexture[0]);
+               (unsigned)s->glTexture[0], (SDL_GetPerformanceCounter() - tStart) * f,
+               tDecode * f, tUpload * f);
         s_regLog++;
     }
     return status;

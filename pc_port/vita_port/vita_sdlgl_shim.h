@@ -38,7 +38,7 @@ void*         VitaGL_GetProcAddress(const char* name);
 /* Per-frame counts of the GL calls that cost a tiled GPU the most (render
  * target switches, clears, readbacks, uploads), reported by PsyX_EndScene.
  * vglSwapBuffers took 20-49 ms/frame even on near-empty screens. */
-enum { VGLC_FBO, VGLC_CLEAR, VGLC_READ, VGLC_COPYTEX, VGLC_TEXUP, VGLC_DRAW, VGLC_COUNT };
+enum { VGLC_FBO, VGLC_CLEAR, VGLC_READ, VGLC_COPYTEX, VGLC_TEXUP, VGLC_DRAW, VGLC_SCISSOR, VGLC_COUNT };
 extern unsigned g_vitaGlCount[VGLC_COUNT];
 void VitaGL_Count_BindFramebuffer(GLenum target, GLuint fb);
 void VitaGL_Count_Clear(GLbitfield mask);
@@ -66,6 +66,10 @@ void VitaGL_ActiveTexture(GLenum unit);
 void VitaGL_BindTexture(GLenum target, GLuint tex);
 void VitaGL_DeleteTextures(GLsizei n, const GLuint* tex);
 
+/* vitaGL redraws the stencil scissor mask (a full-screen pass) on every
+ * glScissor while the test is on; identical rects are dropped. */
+void VitaGL_Scissor(GLint x, GLint y, GLsizei w, GLsizei h);
+
 #ifdef __cplusplus
 }
 #endif
@@ -91,6 +95,7 @@ void VitaGL_DeleteTextures(GLsizei n, const GLuint* tex);
 #define glActiveTexture(u)                      VitaGL_ActiveTexture(u)
 #define glBindTexture(t,x)                      VitaGL_BindTexture(t,x)
 #define glDeleteTextures(n,x)                   VitaGL_DeleteTextures(n,x)
+#define glScissor(x,y,w,h)                      VitaGL_Scissor(x,y,w,h)
 
 /* The Vita SDL video driver rejects SDL_WINDOW_OPENGL outright ("No OpenGL
  * support in video driver"); a plain window is all vitaGL needs. */

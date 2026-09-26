@@ -66,6 +66,7 @@ static void VitaGL_PickDisplayMode(void)
 #undef glActiveTexture
 #undef glBindTexture
 #undef glDeleteTextures
+#undef glScissor
 
 /* ---- redundant-state filter ------------------------------------------------
  * Uniform values belong to a program, so the cache is keyed by (program,
@@ -172,6 +173,17 @@ void VitaGL_Uniform3fv(GLint l, GLsizei n, const GLfloat* v)
 void VitaGL_UniformMatrix4fv(GLint l, GLsizei n, GLboolean t, const GLfloat* v)
 {
     if (n != 1 || t || !UCache_Same(l, v, 16)) glUniformMatrix4fv(l, n, t, v);
+}
+
+static GLint s_scissor[4] = { -1, -1, -1, -1 };
+
+void VitaGL_Scissor(GLint x, GLint y, GLsizei w, GLsizei h)
+{
+    if (x == s_scissor[0] && y == s_scissor[1] && w == s_scissor[2] && h == s_scissor[3])
+        return;
+    g_vitaGlCount[VGLC_SCISSOR]++;
+    s_scissor[0] = x; s_scissor[1] = y; s_scissor[2] = w; s_scissor[3] = h;
+    glScissor(x, y, w, h);
 }
 
 static GLenum s_activeUnit = 0;

@@ -5,6 +5,7 @@
  * PsyX_Pad_InternalPadUpdates for player 1. */
 #if defined(__vita__)
 #include <psp2/touch.h>
+#include "sh_log.h"
 
 /* Front panel coordinates are 1920x1088 (twice the screen). */
 #define PANEL_W 1920
@@ -24,6 +25,33 @@ static const VitaTouchButton s_buttons[] = {
 
 static int s_started = 0;
 
+/* Rear panel tap: step through palette-cache settings, so their effect on fps
+ * can be compared in place: off, every split, splits of 1024+ / 4096+ PSX px. */
+extern int  g_vitaPalCache;
+extern int  g_vitaPalMinArea;
+static int  s_backDown = 0;
+static int  s_palMode = 2;
+
+static void VitaTouch_PollBack(void)
+{
+    SceTouchData back;
+    int          down;
+
+    if (sceTouchPeek(SCE_TOUCH_PORT_BACK, &back, 1) < 1)
+        return;
+    down = back.reportNum > 0;
+    if (down && !s_backDown)
+    {
+        static const int areas[4] = { 0, 0, 1024, 4096 };
+        s_palMode = (s_palMode + 1) & 3;
+        g_vitaPalCache   = s_palMode != 0;
+        g_vitaPalMinArea = areas[s_palMode];
+        SH_DBG("[PALCACHE] rear touch: mode %d (%s, min area %d)", s_palMode,
+               g_vitaPalCache ? "on" : "off", g_vitaPalMinArea);
+    }
+    s_backDown = down;
+}
+
 /* Returns the pad-word bits to clear (pressed = 0, as libpad reports them). */
 unsigned short VitaTouch_PressedBits(void)
 {
@@ -34,8 +62,11 @@ unsigned short VitaTouch_PressedBits(void)
     if (!s_started)
     {
         sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
+        sceTouchSetSamplingState(SCE_TOUCH_PORT_BACK, SCE_TOUCH_SAMPLING_STATE_START);
         s_started = 1;
     }
+
+    VitaTouch_PollBack();
 
     if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1) < 1)
         return 0;

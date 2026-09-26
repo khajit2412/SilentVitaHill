@@ -59,7 +59,13 @@ s_PcConfig g_PcConfig = {
 #else
     .allowLooseFiles = 0, /* 0=disc image only, 1=scan gamedata/load/ first */
 #endif
+#if defined(SH_VITA)
+    /* Each overflow slot is a GL texture per CLUT row: ~400 extra draw calls a
+     * town frame, and a 150-300 ms decode+upload hitch per streamed chunk. */
+    .residentTextures = 0, /* 1=expanded chunk-texture pool w/ per-slot GL textures (whole map textured), 0=vanilla 8+2 VRAM pool */
+#else
     .residentTextures = 1, /* 1=expanded chunk-texture pool w/ per-slot GL textures (whole map textured), 0=vanilla 8+2 VRAM pool */
+#endif
     .texturePacks = 1, /* 1=scan gamedata/texturemods/ for DuckStation texture packs (loose dirs or .zip) */
     .texpackCacheMb = 2048, /* composed-canvas cache RAM cap; kills pack re-compose stutter on chunk churn */
     .texpackBudgetMb = 6144, /* HD pack GL-texture cap; generous for 64-bit/real VRAM + big packs (0 = unlimited) */
@@ -1543,6 +1549,15 @@ else if (strcmp(key, "enable_plugins") == 0)
         {
             g_PcConfig.fpsCap = 60;
             PcConfig_SaveKeyValue("fps_cap", "60");
+        }
+#endif
+
+#if defined(SH_VITA)
+        /* v6 (Vita only): resident_textures 1 -> 0, see the default above. */
+        if (g_PcConfig.configVersion < 6 && g_PcConfig.residentTextures == 1)
+        {
+            g_PcConfig.residentTextures = 0;
+            PcConfig_SaveKeyValue("resident_textures", "0");
         }
 #endif
 

@@ -87,7 +87,42 @@ Host needs llvm-nm + llvm-objcopy (static map symbol prefixing), python3.
    - Open: stale splash in the title screen's left bar (not the pillarbox clear; `dream_blur = 0`
      untested).
 
+## Performance roadmap (from Rinnegatamante's CTR: High Octane, a PsyCross-derived Vita port)
+Source: github.com/Rinnegatamante/Crash-Team-Racing-High-Octane (GPL-3.0), platform/native_renderer.c,
+native_gpu.c. Its Vita-specific techniques and our status:
+- Vertex upload into vitaGL scratch memory (vglAllocFromScratch + vglBufferData): DONE.
+- Hardware paletted textures (GL_PALETTE4/8_RGBA8_OES) cached per (tpage, format, clut), rebuilt on
+  VRAM writes (per-64x64-tile generations): DONE, GR_VitaPaletteTexture; rear-touch toggles it
+  (g_vitaPalCache) for A/B, [PALCACHE] in the log. Split key includes the palette, so draws rise.
+- No-discard shader variant for palettes without a transparent entry (PowerVR hidden-surface
+  removal is off for any shader containing discard): DONE for cached palette splits (BM_NONE).
+- Dedicated GPU thread: the game thread parses the OT into a frame packet (vertices, splits, envs),
+  a render thread does BeginScene/draws/EndScene/swap; synchronous GL work is queued as tasks.
+  NOT DONE: every GL caller (VRAM upload, feedback capture, offscreen, shadows, modern meshes,
+  hires/pool textures, minimap, decals, FMV) must move to that thread or sync with it.
+- Draw reordering (CTR native_gpu.c NativeGpu_DrawReorderedSplits): opaque splits carry an order
+  depth per vertex (a_orderDepth, gl_Position.z = 1 - order*2/65535) so the depth test reproduces
+  painter order and same-state splits are grouped into depth batches; semi-transparent splits go
+  through a bbox-overlap dependency scheduler (only overlapping splits keep their order, capped at
+  256 nodes per domain) that picks the most state-compatible ready split. NOT DONE: our depth
+  buffer carries GTE depth for items vs world, so order depth would change that; the bbox
+  scheduler is safe for all splits. Interim: palette splits under g_vitaPalMinArea (PSX px bbox)
+  fall back to VRAM sampling and merge; rear touch cycles off/all/1024/4096.
+- Measured 2026-09-26 (town fight): scratch vertex upload took swap from 19 ms to 0.2 ms (the
+  wait was vitaGL's GC); palette cache on every split raised draws 145 -> 450-600 and OT0 submit
+  to 12-16 ms (CPU-bound again). GPU backlog at swap ~24 ms but swap-after-drain 0.14 ms.
+- Dirty-rect VRAM uploads instead of the full 1 MB glTexSubImage2D: not done (uploads are rare).
+- Stripped Vita shaders (nearest only, no dither, low precision): partly (no filter, no dither,
+  arithmetic decode). vglUseLowPrecision would break the exact CLUT index math in highp.
+- Timing thread sleeps to its next deadline (was 5000 wake-ups/s at high priority): DONE.
+- [GPUDRAIN] every 60th frame measures the GPU backlog at swap: tells GPU-bound from display/GC wait.
+
 ## Later (after performance is fine-tuned)
+- Ramp graphics back up once there is headroom. Turned down for speed on Vita so far:
+  resident_textures 1 -> 0 (expanded chunk-texture pool: longer texture draw distance),
+  render_scale 1.0 -> 0.75 (960x544 -> 720x408), PSX dither (not in the ES2 shader path),
+  texture filtering compiled out (PSYX_NO_TEXFILTER), flashlight shadow map 512 (PC 2048) and
+  its 16-tap PCF, lean no-flashlight shaders. Re-test each against the fps budget.
 - Optional CRT look, off by default: RF/composite filter + subtle scanlines as a toggle, tuned for
   the Vita screen. Needs a GLSL ES 1.00 port of the PC post-process pass (PSYX_HAS_POSTPROCESS is 0
   on ES2), the scene rendered to a target first, and scanlines matched to the PSX line count or
