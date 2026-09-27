@@ -18,6 +18,7 @@
 #ifdef SH_PC_PORT
 #include <ctype.h>
 #include "pc_config.h"
+#include "control_style.h" /* the Camera row */
 #include "pc_audio_config.h" /* the software-SPU row */
 #endif
 
@@ -164,7 +165,7 @@ int Pc_ExitToMenuRowActive(void)
 }
 
 
-enum { PCK_INT, PCK_RES, PCK_FILTER, PCK_WINMODE, PCK_VSYNC, PCK_SLIDER, PCK_MAP, PCK_FLMODE, PCK_NEXT, PCK_PREV, PCK_BACK, PCK_RESET, PCK_STORAGE, PCK_RALOGIN };
+enum { PCK_INT, PCK_RES, PCK_FILTER, PCK_WINMODE, PCK_VSYNC, PCK_SLIDER, PCK_MAP, PCK_FLMODE, PCK_CAMSTYLE, PCK_NEXT, PCK_PREV, PCK_BACK, PCK_RESET, PCK_STORAGE, PCK_RALOGIN };
 
 /* PC-options row origin. The heading sits at y=20 and the rows used to start at 56,
  * leaving a full empty row beneath it while the pages ran off the BOTTOM of the
@@ -382,7 +383,14 @@ static const s_PcOpt PCOPT_C[] = {
  * that limit, so Crosshair moved to the System page and the New-Game start Map
  * row to the Graphics page — both of which had spare rows. Third_Person_FOV
  * lives with First_Person_FOV on the Controls page. */
+/* Camera style (control_style): the launcher and the Change-Camera bind are
+ * the only other ways to pick it, and a Vita has neither. */
+static const int VAL_CAMSTYLE[] = { 0, 1, 2, 3 };
+static const char* const LBL_CAMSTYLE[] = { "Original", "Third_Person", "Over_Shoulder", "First_Person" };
+
 static const s_PcOpt PCOPT_T[] = {
+    /* 12th row: the page fits PCOPT_LINE_BASE_Y 40 + 12 x 16 on 240 lines. */
+    { "Camera",            &g_ControlStyle,                "control_style",         VAL_CAMSTYLE, 4, LBL_CAMSTYLE, NULL, 1, PCK_CAMSTYLE },
     /* The minimap rows moved to the HUD page (PCOPT_H) when the low-health
      * glow arrived: every page was at the 11-row ceiling. */
     { "Aim_Assist",        &g_PcConfig.aimAssist,          "aim_assist",            VAL_ONOFF, 2, LBL_ONOFF, NULL, 1, PCK_INT },
@@ -698,6 +706,8 @@ static void PcOpt_Adjust(const s_PcOpt* e, int dir)
             PsyX_ApplyVsync(g_PcConfig.vsync);
         } else if (e->kind == PCK_FLMODE) {
             Pc_FlashlightModeApply(*e->field, 1);
+        } else if (e->kind == PCK_CAMSTYLE) {
+            Pc_ControlStyleSet(*e->field);
         } else if (e->live) {
             *e->live = *e->field;
         }
@@ -1297,6 +1307,8 @@ static void PcOpt_ResetEntry(const s_PcOpt* e)
             PsyX_ApplyVsync(g_PcConfig.vsync);
         } else if (e->kind == PCK_FLMODE) {
             Pc_FlashlightModeApply(dv, 1);
+        } else if (e->kind == PCK_CAMSTYLE) {
+            Pc_ControlStyleSet(dv);
         } else if (e->live) {
             *e->live = dv;
         }

@@ -70,31 +70,62 @@ void VitaGL_DeleteTextures(GLsizei n, const GLuint* tex);
  * glScissor while the test is on; identical rects are dropped. */
 void VitaGL_Scissor(GLint x, GLint y, GLsizei w, GLsizei h);
 
+/* Render thread (vita_glcmd.c): every GL call below is recorded and replayed
+ * into vitaGL on its own thread. */
+void VGLR_Start(void (*init)(void*));
+int  VGLR_HelperCoreMask(void);
+void VGLR_Report(double frames);
+#include "vita_glcmd_protos.h"
+
 #ifdef __cplusplus
 }
 #endif
 
+#include "vita_glcmd_redirect.h"
+
+#undef glBindFramebuffer
 #define glBindFramebuffer(t,f)                  VitaGL_Count_BindFramebuffer(t,f)
+#undef glClear
 #define glClear(m)                              VitaGL_Count_Clear(m)
+#undef glReadPixels
 #define glReadPixels(x,y,w,h,f,t,p)             VitaGL_Count_ReadPixels(x,y,w,h,f,t,p)
+#undef glCopyTexSubImage2D
 #define glCopyTexSubImage2D(tg,l,xo,yo,x,y,w,h) VitaGL_Count_CopyTexSubImage2D(tg,l,xo,yo,x,y,w,h)
+#undef glTexSubImage2D
 #define glTexSubImage2D(tg,l,xo,yo,w,h,f,t,p)   VitaGL_Count_TexSubImage2D(tg,l,xo,yo,w,h,f,t,p)
+#undef glTexImage2D
 #define glTexImage2D(tg,l,i,w,h,b,f,t,p)        VitaGL_Count_TexImage2D(tg,l,i,w,h,b,f,t,p)
+#undef glDrawArrays
 #define glDrawArrays(m,first,n)                 VitaGL_Count_DrawArrays(m,first,n)
+#undef glViewport
 #define glViewport(x,y,w,h)                     VitaGL_CachedViewport(x,y,w,h)
+#undef glUseProgram
 #define glUseProgram(p)                         VitaGL_UseProgram(p)
+#undef glLinkProgram
 #define glLinkProgram(p)                        VitaGL_LinkProgram(p)
+#undef glDeleteProgram
 #define glDeleteProgram(p)                      VitaGL_DeleteProgram(p)
+#undef glUniform1f
 #define glUniform1f(l,a)                        VitaGL_Uniform1f(l,a)
+#undef glUniform1i
 #define glUniform1i(l,a)                        VitaGL_Uniform1i(l,a)
+#undef glUniform2f
 #define glUniform2f(l,a,b)                      VitaGL_Uniform2f(l,a,b)
+#undef glUniform4f
 #define glUniform4f(l,a,b,c,d)                  VitaGL_Uniform4f(l,a,b,c,d)
+#undef glUniform2fv
 #define glUniform2fv(l,n,v)                     VitaGL_Uniform2fv(l,n,v)
+#undef glUniform3fv
 #define glUniform3fv(l,n,v)                     VitaGL_Uniform3fv(l,n,v)
+#undef glUniformMatrix4fv
 #define glUniformMatrix4fv(l,n,t,v)             VitaGL_UniformMatrix4fv(l,n,t,v)
+#undef glActiveTexture
 #define glActiveTexture(u)                      VitaGL_ActiveTexture(u)
+#undef glBindTexture
 #define glBindTexture(t,x)                      VitaGL_BindTexture(t,x)
+#undef glDeleteTextures
 #define glDeleteTextures(n,x)                   VitaGL_DeleteTextures(n,x)
+#undef glScissor
 #define glScissor(x,y,w,h)                      VitaGL_Scissor(x,y,w,h)
 
 /* The Vita SDL video driver rejects SDL_WINDOW_OPENGL outright ("No OpenGL

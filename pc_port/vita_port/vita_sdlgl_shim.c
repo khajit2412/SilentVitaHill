@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <vitashark.h>
+#include <psp2/kernel/cpu.h>
 
 extern FILE* g_ShDebugLog;
 
@@ -67,6 +68,8 @@ static void VitaGL_PickDisplayMode(void)
 #undef glBindTexture
 #undef glDeleteTextures
 #undef glScissor
+/* The wrappers below sit on top of the render thread's recorders. */
+#include "vita_glcmd_redirect.h"
 
 /* ---- redundant-state filter ------------------------------------------------
  * Uniform values belong to a program, so the cache is keyed by (program,
@@ -282,27 +285,38 @@ void VitaGL_Count_DrawArrays(GLenum m, GLint first, GLsizei n)
     glDrawArrays(m, first, n);
 }
 
+/* Runs on the render thread (VGLR_Start), which then owns vitaGL. */
+#undef vglWaitVblankStart
+static void VitaGL_InitOnRenderThread(void* unused)
+{
+    (void)unused;
+    /* ram_threshold: RAM vitaGL leaves free for the newlib heap.
+     * Tuned later against real memory pressure (map .bss, VRAM tex). */
+    /* O3 + fast math. Precision and int shortcuts stay off: the CLUT/VRAM
+     * decode does exact index arithmetic in the fragment shader. */
+    vglSetupRuntimeShaderCompiler(SHARK_OPT_FAST, GL_TRUE, GL_FALSE, GL_FALSE);
+    /* Its frees run beside the game and render threads (cores 0 and 1). */
+    vglSetupGarbageCollector(0x10000100, VGLR_HelperCoreMask());
+    vglInitExtended(0, VITA_SCREEN_W, VITA_SCREEN_H,
+                    16 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
+    shark_install_log_cb(VitaGL_SharkLog);
+    /* Off until the config says otherwise (GR_UpdateSwapIntervalState):
+     * the game paces itself to 30 fps. */
+    vglWaitVblankStart(GL_FALSE);
+}
+#define vglWaitVblankStart VGLR_vglWaitVblankStart
+
 SDL_GLContext VitaGL_CreateContext(SDL_Window* w)
 {
     (void)w;
     if (!s_vglReady)
     {
-        /* ram_threshold: RAM vitaGL leaves free for the newlib heap.
-         * Tuned later against real memory pressure (map .bss, VRAM tex). */
-        /* O3 + fast math. Precision and int shortcuts stay off: the CLUT/VRAM
-         * decode does exact index arithmetic in the fragment shader. */
-        vglSetupRuntimeShaderCompiler(SHARK_OPT_FAST, GL_TRUE, GL_FALSE, GL_FALSE);
         VitaGL_PickDisplayMode();
-        vglInitExtended(0, VITA_SCREEN_W, VITA_SCREEN_H,
-                        16 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
-        shark_install_log_cb(VitaGL_SharkLog);
+        VGLR_Start(VitaGL_InitOnRenderThread);
         /* A fresh context: unit 0 active, nothing bound. */
         s_activeUnit    = GL_TEXTURE0;
         memset(s_bound2D, 0, sizeof(s_bound2D));
         s_texCacheValid = 1;
-        /* Off until the config says otherwise (GR_UpdateSwapIntervalState):
-         * the game paces itself to 30 fps. */
-        vglWaitVblankStart(GL_FALSE);
         s_vglReady = 1;
     }
     return (SDL_GLContext)(uintptr_t)1; /* any non-NULL handle */

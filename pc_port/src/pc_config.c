@@ -89,7 +89,7 @@ s_PcConfig g_PcConfig = {
     .postProcess    = 0, /* 0=off, 1.. = post-process look */
     .tonemap        = 0, /* 0=off, 1=Reinhard, 2=ACES, 3=Filmic */
 #if defined(SH_VITA)
-    .flashlightMode = 1, /* 0=Classic (PSX), 1=Classic+Shadows, 2=Modern, 3=Modern+Shadows */
+    .flashlightMode = 3, /* 0=Classic (PSX), 1=Classic+Shadows, 2=Modern, 3=Modern+Shadows */
 #else
     .flashlightMode = 0, /* 0=Classic (PSX), 1=Classic+Shadows, 2=Modern, 3=Modern+Shadows */
 #endif
@@ -161,7 +161,7 @@ s_PcConfig g_PcConfig = {
     .minimap                 = 0, /* minimap overlay off by default */
     .anisoLevel              = 8,
 #if defined(SH_VITA)
-    .shadowMapSize           = 512, /* fill-rate: the depth pass redraws the scene every frame */
+    .shadowMapSize           = 256, /* the depth pass redraws the scene every frame; the wide PCF over big texels gives the soft blob shadows wanted here */
 #else
     .shadowMapSize           = 1024,
 #endif
@@ -474,21 +474,39 @@ void Pc_FlashlightModeApply(int mode, int persist)
     shadows = (mode == 1 || mode == 3);
 
     /* Each per-pixel style has its own calibrated intensity/size defaults
-     * (Modern 2.10/2.40, Classic+Shadows 1.20/3.00). Swap only when the
+     * (Modern 2.10/2.40, Vita 1.00/0.70; Classic+Shadows 1.20/3.00). Swap only when the
      * current value IS the other style's default — a customized value is a
      * user choice and follows them across styles. */
     if (pp)
     {
-        float defInt  = style ? 1.20f : 2.10f, otherInt  = style ? 2.10f : 1.20f;
-        float defSize = style ? 3.00f : 2.40f, otherSize = style ? 2.40f : 3.00f;
-        if (g_PcConfig.flashlightIntensity > otherInt - 0.005f &&
-            g_PcConfig.flashlightIntensity < otherInt + 0.005f)
+#if defined(SH_VITA)
+        /* Vita Modern is tuned on device to a smaller, dimmer cone (1.00/0.70):
+         * it looks right on the small screen and fewer triangles need the lit
+         * shader. The old Modern defaults (2.10/2.40) migrate to it. */
+        const float modernInt = 1.00f, modernSize = 0.70f;
+        const float legacyInt = 2.10f, legacySize = 2.40f;
+#else
+        const float modernInt = 2.10f, modernSize = 2.40f;
+        const float legacyInt = 2.10f, legacySize = 2.40f;
+#endif
+        float defInt  = style ? 1.20f : modernInt,  otherInt  = style ? modernInt : 1.20f;
+        float defSize = style ? 3.00f : modernSize, otherSize = style ? modernSize : 3.00f;
+        float legInt  = style ? otherInt : legacyInt;
+        float legSize = style ? otherSize : legacySize;
+        if ((g_PcConfig.flashlightIntensity > otherInt - 0.005f &&
+             g_PcConfig.flashlightIntensity < otherInt + 0.005f) ||
+            (g_PcConfig.flashlightIntensity > legInt - 0.005f &&
+             g_PcConfig.flashlightIntensity < legInt + 0.005f &&
+             legInt != defInt))
         {
             g_PcConfig.flashlightIntensity = defInt;
             swapped = 1;
         }
-        if (g_PcConfig.flashlightSize > otherSize - 0.005f &&
-            g_PcConfig.flashlightSize < otherSize + 0.005f)
+        if ((g_PcConfig.flashlightSize > otherSize - 0.005f &&
+             g_PcConfig.flashlightSize < otherSize + 0.005f) ||
+            (g_PcConfig.flashlightSize > legSize - 0.005f &&
+             g_PcConfig.flashlightSize < legSize + 0.005f &&
+             legSize != defSize))
         {
             g_PcConfig.flashlightSize = defSize;
             swapped = 1;
@@ -1558,6 +1576,13 @@ else if (strcmp(key, "enable_plugins") == 0)
         {
             g_PcConfig.residentTextures = 0;
             PcConfig_SaveKeyValue("resident_textures", "0");
+        }
+
+        /* v7 (Vita only): flashlight_mode 1 -> 3 (Modern + Shadows). */
+        if (g_PcConfig.configVersion < 7 && g_PcConfig.flashlightMode == 1)
+        {
+            g_PcConfig.flashlightMode = 3;
+            PcConfig_SaveKeyValue("flashlight_mode", "3");
         }
 #endif
 

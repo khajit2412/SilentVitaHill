@@ -5,7 +5,6 @@
  * PsyX_Pad_InternalPadUpdates for player 1. */
 #if defined(__vita__)
 #include <psp2/touch.h>
-#include "sh_log.h"
 
 /* Front panel coordinates are 1920x1088 (twice the screen). */
 #define PANEL_W 1920
@@ -25,41 +24,6 @@ static const VitaTouchButton s_buttons[] = {
 
 static int s_started = 0;
 
-/* Rear panel tap: step through draw-batching settings so their effect on fps
- * can be compared in place (see the table in the tap handler). */
-extern int  g_vitaPalCache;
-extern int  g_vitaPalMinArea;
-extern int  g_vitaReorder;
-static int  s_backDown = 0;
-static int  s_palMode = 1;
-
-static void VitaTouch_PollBack(void)
-{
-    SceTouchData back;
-    int          down;
-
-    if (sceTouchPeek(SCE_TOUCH_PORT_BACK, &back, 1) < 1)
-        return;
-    down = back.reportNum > 0;
-    if (down && !s_backDown)
-    {
-        /* mode: palette cache, min area, reorder */
-        static const int modes[4][3] = {
-            { 0, 0,    1 },
-            { 1, 0,    1 },
-            { 1, 1024, 1 },
-            { 1, 1024, 0 },
-        };
-        s_palMode = (s_palMode + 1) & 3;
-        g_vitaPalCache   = modes[s_palMode][0];
-        g_vitaPalMinArea = modes[s_palMode][1];
-        g_vitaReorder    = modes[s_palMode][2];
-        SH_DBG("[PALCACHE] rear touch: mode %d (palette %s, min area %d, reorder %s)", s_palMode,
-               g_vitaPalCache ? "on" : "off", g_vitaPalMinArea, g_vitaReorder ? "on" : "off");
-    }
-    s_backDown = down;
-}
-
 /* Returns the pad-word bits to clear (pressed = 0, as libpad reports them). */
 unsigned short VitaTouch_PressedBits(void)
 {
@@ -70,11 +34,8 @@ unsigned short VitaTouch_PressedBits(void)
     if (!s_started)
     {
         sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
-        sceTouchSetSamplingState(SCE_TOUCH_PORT_BACK, SCE_TOUCH_SAMPLING_STATE_START);
         s_started = 1;
     }
-
-    VitaTouch_PollBack();
 
     if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1) < 1)
         return 0;

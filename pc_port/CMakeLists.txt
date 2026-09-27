@@ -745,6 +745,7 @@ elseif(VITA)
     # SDL2's Vita backend needs. Order matters: static archives, stubs last.
     target_sources(SilentHillPC PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/vita_port/vita_sdlgl_shim.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/vita_port/vita_glcmd.c
         ${CMAKE_CURRENT_SOURCE_DIR}/vita_port/vita_touch_buttons.c)
     # vita-elf-create appends the import/export tables after the code segment,
     # and the data segment is 64 KB aligned, so whether they fit depended on the
