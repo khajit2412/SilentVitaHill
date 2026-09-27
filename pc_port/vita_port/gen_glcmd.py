@@ -37,7 +37,16 @@ HOOKS = {
     "glDeleteBuffers":         "VGLR_Shadow_DeleteNames(n, gl_buffers, &s_sh.arrayBuffer);",
     "glDeleteVertexArrays":    "VGLR_Shadow_DeleteNames(n, gl_arrays, &s_sh.vao);",
     "glDeleteFramebuffers":    "VGLR_Shadow_DeleteNames(n, framebuffers, &s_sh.drawFbo); VGLR_Shadow_DeleteNames(n, framebuffers, &s_sh.readFbo);",
-    "glDeleteProgram":         "if (s_sh.program == prog) s_sh.program = 0;",
+    "glDeleteProgram":         "if (s_sh.program == prog) s_sh.program = 0; VGLR_UniformCacheClear();",
+    "glLinkProgram":           "VGLR_UniformCacheClear();",
+    "glUniform1f":             "if (VGLR_UniformSame(location, &v0, 4)) return;",
+    "glUniform1i":             "if (VGLR_UniformSame(location, &v0, 4)) return;",
+    "glUniform2f":             "{ const GLfloat t[2] = { v0, v1 }; if (VGLR_UniformSame(location, t, 8)) return; }",
+    "glUniform4f":             "{ const GLfloat t[4] = { v0, v1, v2, v3 }; if (VGLR_UniformSame(location, t, 16)) return; }",
+    "glUniform1iv":            "if (count == 1 && VGLR_UniformSame(location, value, 4)) return;",
+    "glUniform2fv":            "if (count == 1 && VGLR_UniformSame(location, value, 8)) return;",
+    "glUniform3fv":            "if (count == 1 && VGLR_UniformSame(location, value, 12)) return;",
+    "glUniformMatrix4fv":      "if (count == 1 && !transpose && VGLR_UniformSame(location, value, 64)) return;",
 }
 
 # name -> (pointer param, C expression for payload bytes; may use params)

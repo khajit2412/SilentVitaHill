@@ -96,9 +96,13 @@ static void VGLR_WakeProducer(void)
     }
 }
 
-/* Producer-side wait for a condition the render thread will make true. */
+static void VGLR_Publish(void);
+
+/* Producer-side wait for a condition the render thread will make true.
+ * Commands are published in batches, so hand over what is queued first. */
 #define VGLR_PRODUCER_WAIT_UNTIL(cond)              \
     do {                                            \
+        if (!(cond)) VGLR_Publish();                \
         while (!(cond))                             \
         {                                           \
             s_prodWaiting = 1;                      \
@@ -108,8 +112,17 @@ static void VGLR_WakeProducer(void)
         }                                           \
     } while (0)
 
+/* Publishing per command cost two barriers and, whenever the render thread
+ * had caught up and slept, a semaphore post: a kernel call for each of the
+ * ~15k commands of a shadowed frame. */
+#define VGLR_PUBLISH_BATCH 48
+static uint32_t s_unpublished;
+
 static void VGLR_Publish(void)
 {
+    s_unpublished = 0;
+    if (s_wr == s_wrLocal)
+        return;
     VGLR_Barrier();
     s_wr = s_wrLocal;
     VGLR_WakeConsumer();
@@ -157,7 +170,8 @@ static void VGLR_Commit(void)
 {
     s_wrLocal += s_pendingSize;
     s_pendingSize = 0;
-    VGLR_Publish();
+    if (++s_unpublished >= VGLR_PUBLISH_BATCH)
+        VGLR_Publish();
 }
 
 static size_t VGLR_ImageBytes(GLsizei w, GLsizei h, GLenum format, GLenum type)
@@ -300,6 +314,43 @@ static int VGLR_ShadowGetInt(GLenum pname, GLint* out)
     }
 }
 
+/* Redundant-uniform filter. Every texture bind re-sends the whole lit
+ * uniform set (~35 values), almost all unchanged; each costs a ring command
+ * here and, on the render thread, a dirty uniform buffer the next draw
+ * re-uploads. Values persist per program in GL, so a value already held by
+ * (program, location) is dropped. Cleared on link/delete (names get reused). */
+#define VGLR_UCACHE_SIZE 2048
+typedef struct { GLuint prog; GLint loc; uint32_t len; uint8_t data[64]; } VGLR_UEntry;
+static VGLR_UEntry s_ucache[VGLR_UCACHE_SIZE];
+
+static void VGLR_UniformCacheClear(void)
+{
+    memset(s_ucache, 0, sizeof(s_ucache));
+}
+
+static int VGLR_UniformSame(GLint loc, const void* data, uint32_t len)
+{
+    if (loc < 0 || len > sizeof(s_ucache[0].data))
+        return 0;
+    const GLuint prog = s_sh.program;
+    uint32_t h = ((uint32_t)prog * 2654435761u) ^ ((uint32_t)loc * 40503u);
+    for (int i = 0; i < 8; i++)
+    {
+        VGLR_UEntry* e = &s_ucache[(h + i) & (VGLR_UCACHE_SIZE - 1)];
+        if (e->len != 0 && (e->prog != prog || e->loc != loc))
+            continue;
+        if (e->len == len && memcmp(e->data, data, len) == 0)
+            return 1;
+        e->prog = prog; e->loc = loc; e->len = len;
+        memcpy(e->data, data, len);
+        return 0;
+    }
+    VGLR_UEntry* e = &s_ucache[h & (VGLR_UCACHE_SIZE - 1)];
+    e->prog = prog; e->loc = loc; e->len = len;
+    memcpy(e->data, data, len);
+    return 0;
+}
+
 #include "vita_glcmd_gen.inc"
 
 typedef struct
@@ -436,6 +487,7 @@ void VGLR_vglSwapBuffers(GLboolean has_commondialog)
     GLboolean* a = (GLboolean*)VGLR_Reserve(OP_SWAP, sizeof(GLboolean), 0);
     *a = has_commondialog;
     VGLR_Commit();
+    VGLR_Publish();
     s_framesSubmitted++;
     /* At most one frame queued behind the one being drawn. */
     VGLR_PRODUCER_WAIT_UNTIL(s_framesSubmitted - s_framesDone <= 1);

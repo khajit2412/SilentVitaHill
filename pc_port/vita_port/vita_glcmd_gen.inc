@@ -344,7 +344,7 @@ typedef struct {
 
 void VGLR_glDeleteProgram(GLuint prog)
 {
-    if (s_sh.program == prog) s_sh.program = 0;
+    if (s_sh.program == prog) s_sh.program = 0; VGLR_UniformCacheClear();
     if (!s_threaded) { glDeleteProgram(prog); return; }
     A_glDeleteProgram* a = (A_glDeleteProgram*)VGLR_Reserve(OP_glDeleteProgram, sizeof(A_glDeleteProgram), 0);
     a->prog = prog;
@@ -510,6 +510,7 @@ typedef struct {
 
 void VGLR_glLinkProgram(GLuint progr)
 {
+    VGLR_UniformCacheClear();
     if (!s_threaded) { glLinkProgram(progr); return; }
     A_glLinkProgram* a = (A_glLinkProgram*)VGLR_Reserve(OP_glLinkProgram, sizeof(A_glLinkProgram), 0);
     a->progr = progr;
@@ -650,6 +651,7 @@ typedef struct {
 
 void VGLR_glUniform1f(GLint location, GLfloat v0)
 {
+    if (VGLR_UniformSame(location, &v0, 4)) return;
     if (!s_threaded) { glUniform1f(location, v0); return; }
     A_glUniform1f* a = (A_glUniform1f*)VGLR_Reserve(OP_glUniform1f, sizeof(A_glUniform1f), 0);
     a->location = location;
@@ -664,6 +666,7 @@ typedef struct {
 
 void VGLR_glUniform1i(GLint location, GLint v0)
 {
+    if (VGLR_UniformSame(location, &v0, 4)) return;
     if (!s_threaded) { glUniform1i(location, v0); return; }
     A_glUniform1i* a = (A_glUniform1i*)VGLR_Reserve(OP_glUniform1i, sizeof(A_glUniform1i), 0);
     a->location = location;
@@ -679,6 +682,7 @@ typedef struct {
 
 void VGLR_glUniform2f(GLint location, GLfloat v0, GLfloat v1)
 {
+    { const GLfloat t[2] = { v0, v1 }; if (VGLR_UniformSame(location, t, 8)) return; }
     if (!s_threaded) { glUniform2f(location, v0, v1); return; }
     A_glUniform2f* a = (A_glUniform2f*)VGLR_Reserve(OP_glUniform2f, sizeof(A_glUniform2f), 0);
     a->location = location;
@@ -697,6 +701,7 @@ typedef struct {
 
 void VGLR_glUniform4f(GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3)
 {
+    { const GLfloat t[4] = { v0, v1, v2, v3 }; if (VGLR_UniformSame(location, t, 16)) return; }
     if (!s_threaded) { glUniform4f(location, v0, v1, v2, v3); return; }
     A_glUniform4f* a = (A_glUniform4f*)VGLR_Reserve(OP_glUniform4f, sizeof(A_glUniform4f), 0);
     a->location = location;
@@ -796,6 +801,7 @@ typedef struct {
 
 void VGLR_glUniform1iv(GLint location, GLsizei count, const GLint * value)
 {
+    if (count == 1 && VGLR_UniformSame(location, value, 4)) return;
     if (!s_threaded) { glUniform1iv(location, count, value); return; }
     const size_t pay = (size_t)count * 4;
     A_glUniform1iv* a = (A_glUniform1iv*)VGLR_Reserve(OP_glUniform1iv, sizeof(A_glUniform1iv), pay);
@@ -814,6 +820,7 @@ typedef struct {
 
 void VGLR_glUniform2fv(GLint location, GLsizei count, const GLfloat * value)
 {
+    if (count == 1 && VGLR_UniformSame(location, value, 8)) return;
     if (!s_threaded) { glUniform2fv(location, count, value); return; }
     const size_t pay = (size_t)count * 8;
     A_glUniform2fv* a = (A_glUniform2fv*)VGLR_Reserve(OP_glUniform2fv, sizeof(A_glUniform2fv), pay);
@@ -832,6 +839,7 @@ typedef struct {
 
 void VGLR_glUniform3fv(GLint location, GLsizei count, const GLfloat * value)
 {
+    if (count == 1 && VGLR_UniformSame(location, value, 12)) return;
     if (!s_threaded) { glUniform3fv(location, count, value); return; }
     const size_t pay = (size_t)count * 12;
     A_glUniform3fv* a = (A_glUniform3fv*)VGLR_Reserve(OP_glUniform3fv, sizeof(A_glUniform3fv), pay);
@@ -851,6 +859,7 @@ typedef struct {
 
 void VGLR_glUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat * value)
 {
+    if (count == 1 && !transpose && VGLR_UniformSame(location, value, 64)) return;
     if (!s_threaded) { glUniformMatrix4fv(location, count, transpose, value); return; }
     const size_t pay = (size_t)count * 64;
     A_glUniformMatrix4fv* a = (A_glUniformMatrix4fv*)VGLR_Reserve(OP_glUniformMatrix4fv, sizeof(A_glUniformMatrix4fv), pay);

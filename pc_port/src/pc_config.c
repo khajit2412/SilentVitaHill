@@ -35,8 +35,8 @@ s_PcConfig g_PcConfig = {
     .preloadChunks  = 1,
     .vsync          = 0,
     .refreshRate    = 0,
-#if defined(SH_IOS) || defined(__ANDROID__)
-    /* 60 on a phone. 30 is the PSX-accurate gameplay rate and stays the desktop
+#if defined(SH_IOS) || defined(__ANDROID__) || defined(SH_VITA)
+    /* 60 on a phone (and the Vita, where it shows performance headroom). 30 is the PSX-accurate gameplay rate and stays the desktop
      * default, but a phone panel runs at 60 or better and the port paces
      * everything off g_DeltaTime, so 30 only halves the motion for nothing. */
     .fpsCap         = 60,
@@ -148,7 +148,7 @@ s_PcConfig g_PcConfig = {
     .screenOrientation   = 0, /* lock landscape: what the port has always done */
     .touchLookSensitivity = 1.0f,
 #if defined(SH_VITA)
-    .renderScale         = 0.75f, /* 720x408 display mode: 960x544 left the GPU the bottleneck outdoors */
+    .renderScale         = 0.65f, /* 640x368 display mode: the flashlight/shadow cost is per pixel */
 #else
     .renderScale         = 1.0f,
 #endif
@@ -180,9 +180,17 @@ s_PcConfig g_PcConfig = {
     .adsr                = 1,    /* SPU ADSR envelopes on (BGM instrument fades) */
     .audioOutput         = 0,    /* auto: OpenAL detects the system speaker layout */
     .fpsFov              = 71.1f, /* first-person FOV; 71.1 = the game's own projection (H = gsScreenHeight = 224), so the default changes nothing */
+#if defined(SH_VITA)
+    .tpsFov              = 60.1f, /* tighter view: less geometry per frame on Vita */
+#else
     .tpsFov              = 71.1f, /* thirdperson FOV; 71.1 = the game's own projection, no-op */
+#endif
     .tpsAimZoom          = 100.0f, /* aim dolly = the original zoom; 200 = closest, 0 = none, <0 = pull back */
+#if defined(SH_VITA)
+    .otsFov              = 60.1f,
+#else
     .otsFov              = 71.1f, /* OTS FOV (separate from tpsFov); no-op default */
+#endif
     .otsAimZoom          = 100.0f, /* OTS aim dolly */
     .tpsRestX            = 0,     /* TPS rest offset: centred */
     .tpsRestY            = 0,
@@ -1583,6 +1591,34 @@ else if (strcmp(key, "enable_plugins") == 0)
         {
             g_PcConfig.flashlightMode = 3;
             PcConfig_SaveKeyValue("flashlight_mode", "3");
+        }
+
+        /* v9 (Vita only): fps_cap 30 -> 60, TPS/OTS FOV 71.1 -> 60.1. */
+        if (g_PcConfig.configVersion < 9)
+        {
+            if (g_PcConfig.fpsCap == 30)
+            {
+                g_PcConfig.fpsCap = 60;
+                PcConfig_SaveKeyValue("fps_cap", "60");
+            }
+            if (g_PcConfig.tpsFov > 71.05f && g_PcConfig.tpsFov < 71.15f)
+            {
+                g_PcConfig.tpsFov = 60.1f;
+                PcConfig_SaveKeyValue("tps_fov", "60.10");
+            }
+            if (g_PcConfig.otsFov > 71.05f && g_PcConfig.otsFov < 71.15f)
+            {
+                g_PcConfig.otsFov = 60.1f;
+                PcConfig_SaveKeyValue("ots_fov", "60.10");
+            }
+        }
+
+        /* v8 (Vita only): render_scale 0.75 -> 0.65 (720x408 -> 640x368). */
+        if (g_PcConfig.configVersion < 8 &&
+            g_PcConfig.renderScale > 0.745f && g_PcConfig.renderScale < 0.755f)
+        {
+            g_PcConfig.renderScale = 0.65f;
+            PcConfig_SaveKeyValue("render_scale", "0.65");
         }
 #endif
 

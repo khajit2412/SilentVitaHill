@@ -126,7 +126,23 @@ native_gpu.c. Its Vita-specific techniques and our status:
   Core 3 is the system core: optional bonus only, never required.
 - [GPUDRAIN] every 60th frame measures the GPU backlog at swap: tells GPU-bound from display/GC wait.
 
+## Next optimizations (research, 2026-09-27)
+1. Build vitaGL ourselves with CTR's flags: HAVE_SHADER_CACHE=1 NO_DEBUG=1 READBACKS_SPEEDHACK=1
+   CIRCULAR_POOL_SPEEDHACK=1, plus vglSetShaderCachePath (no compile hitches). Stock vdpm build today.
+2. Pin the SDL audio (software SPU) and "PsyX SPU spatial" threads to the helper core (core 2).
+3. Half precision for the flashlight/shadow maths: vitaGL strips mediump/lowp, but Cg half types
+   written directly should pass through. vglUseLowPrecision (CTR uses it) is global -- too risky here.
+4. Shadow map as a real depth texture via vglTexImageDepthBuffer (DF32M): depth-only pass, no RGBA
+   pack/unpack.
+5. Check sceGxm parameter-buffer peak (vitaGL debug build); vglSetParamBufferSize(32 MB) if near 16 MB.
+6. RAM headroom (heap 160 MB vs CTR 256 MB): resident_textures back on, cache room files in RAM.
+7. Optional: vglSwapResolution for dynamic resolution under GPU load.
+
 ## Later (after performance is fine-tuned)
+- Sharpening upscale: render_scale picks a smaller display mode and the Vita scaler stretches it
+  (bilinear, soft). If 640x368 looks too soft, render to a target and draw it to 960x544 with a
+  sharpening (FSR1/CAS-style) quad -- glBlitFramebuffer stretch does not work on vitaGL. ~1-2 ms.
+  Optionally keep HUD/text at native 960x544 while the 3D world renders small.
 - Performance / Quality preset: one options row replacing the separate flashlight + fps settings.
   Quality = Modern + Shadows, locked 30 fps. Performance = Classic flashlight (vertex-lit, the only
   style cheap enough), no shadows, 60 fps. Blocked on 60 fps itself: needs the OT-parse worker thread,
@@ -138,7 +154,7 @@ native_gpu.c. Its Vita-specific techniques and our status:
   through the port's TrueType glyph-atlas renderer (layout/colour work to keep the original look).
 - Ramp graphics back up once there is headroom. Turned down for speed on Vita so far:
   resident_textures 1 -> 0 (expanded chunk-texture pool: longer texture draw distance),
-  render_scale 1.0 -> 0.75 (960x544 -> 720x408), PSX dither (not in the ES2 shader path),
+  render_scale 1.0 -> 0.65 (960x544 -> 640x368, hardware display scaler upscales for free), PSX dither (not in the ES2 shader path),
   texture filtering compiled out (PSYX_NO_TEXFILTER), flashlight shadow map 512 (PC 2048) and
   its 16-tap PCF, lean no-flashlight shaders. Re-test each against the fps budget.
 - Optional CRT look, off by default: RF/composite filter + subtle scanlines as a toggle, tuned for
