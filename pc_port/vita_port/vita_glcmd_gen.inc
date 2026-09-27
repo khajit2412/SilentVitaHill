@@ -72,7 +72,7 @@ typedef struct {
 
 void VGLR_glActiveTexture(GLenum texture)
 {
-    s_sh.activeUnit = texture;
+    if (s_sh.activeUnit == texture) return; s_sh.activeUnit = texture;
     if (!s_threaded) { glActiveTexture(texture); return; }
     A_glActiveTexture* a = (A_glActiveTexture*)VGLR_Reserve(OP_glActiveTexture, sizeof(A_glActiveTexture), 0);
     a->texture = texture;
@@ -144,7 +144,7 @@ typedef struct {
 
 void VGLR_glBindTexture(GLenum target, GLuint texture)
 {
-    if (target == GL_TEXTURE_2D && s_sh.activeUnit - GL_TEXTURE0 < 32u) s_sh.tex2D[s_sh.activeUnit - GL_TEXTURE0] = texture;
+    if (target == GL_TEXTURE_2D && s_sh.activeUnit - GL_TEXTURE0 < 32u) { if (s_sh.tex2D[s_sh.activeUnit - GL_TEXTURE0] == texture) return; s_sh.tex2D[s_sh.activeUnit - GL_TEXTURE0] = texture; }
     if (!s_threaded) { glBindTexture(target, texture); return; }
     A_glBindTexture* a = (A_glBindTexture*)VGLR_Reserve(OP_glBindTexture, sizeof(A_glBindTexture), 0);
     a->target = target;

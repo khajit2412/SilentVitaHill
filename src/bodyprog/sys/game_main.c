@@ -3299,9 +3299,15 @@ void MainLoop(void) // 0x80032EE0
                 {
                     Uint32 dt = perfNowMs - s_perfLastMs;
                     extern int g_PsyX_FlashlightActive;
+                    extern int g_PsxPresentLastFrame;
                     s_perfAccumMs += dt;
-                    s_perfFlMs[g_PsyX_FlashlightActive ? 1 : 0] += dt;
-                    s_perfFlFrames[g_PsyX_FlashlightActive ? 1 : 0]++;
+                    /* Live gameplay only: menus, the inventory and frozen
+                     * frames keep the flashlight flag set but draw nothing. */
+                    if (g_PcWorldDrawnThisFrame && !g_PsxPresentLastFrame)
+                    {
+                        s_perfFlMs[g_PsyX_FlashlightActive ? 1 : 0] += dt;
+                        s_perfFlFrames[g_PsyX_FlashlightActive ? 1 : 0]++;
+                    }
                     if (dt > s_perfWorstMs)
                         s_perfWorstMs = dt;
 
@@ -3374,7 +3380,7 @@ void MainLoop(void) // 0x80032EE0
                                (unsigned long)s_perfWorstMs,
                                (double)s_perfVbAccum / s_perfFrames,
                                (unsigned long)s_perfFrames);
-                    SH_DBG("[PERF] flashlight on: %.1f fps over %lu frames; off: %.1f fps over %lu frames",
+                    SH_DBG("[PERF] gameplay only - flashlight on: %.1f fps over %lu frames; off: %.1f fps over %lu frames",
                            s_perfFlMs[1] ? 1000.0 * s_perfFlFrames[1] / (double)s_perfFlMs[1] : 0.0,
                            (unsigned long)s_perfFlFrames[1],
                            s_perfFlMs[0] ? 1000.0 * s_perfFlFrames[0] / (double)s_perfFlMs[0] : 0.0,

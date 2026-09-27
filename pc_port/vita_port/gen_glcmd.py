@@ -21,8 +21,10 @@ HOOKS = {
     "glUseProgram":            "s_sh.program = program;",
     "glBindVertexArray":       "s_sh.vao = array;",
     "glBindBuffer":            "if (target == GL_ARRAY_BUFFER) s_sh.arrayBuffer = buffer;",
-    "glActiveTexture":         "s_sh.activeUnit = texture;",
-    "glBindTexture":           "if (target == GL_TEXTURE_2D && s_sh.activeUnit - GL_TEXTURE0 < 32u) s_sh.tex2D[s_sh.activeUnit - GL_TEXTURE0] = texture;",
+    # Every shader bind re-asserts the shadow map and decode table on units 1/2;
+    # the shadow state knows the real binding, so repeats never reach the ring.
+    "glActiveTexture":         "if (s_sh.activeUnit == texture) return; s_sh.activeUnit = texture;",
+    "glBindTexture":           "if (target == GL_TEXTURE_2D && s_sh.activeUnit - GL_TEXTURE0 < 32u) { if (s_sh.tex2D[s_sh.activeUnit - GL_TEXTURE0] == texture) return; s_sh.tex2D[s_sh.activeUnit - GL_TEXTURE0] = texture; }",
     "glClearColor":            "s_sh.clear[0] = red; s_sh.clear[1] = green; s_sh.clear[2] = blue; s_sh.clear[3] = alpha;",
     "glScissor":               "s_sh.scissor[0] = x; s_sh.scissor[1] = y; s_sh.scissor[2] = width; s_sh.scissor[3] = height; s_sh.scissorValid = 1;",
     "glViewport":              "s_sh.viewport[0] = x; s_sh.viewport[1] = y; s_sh.viewport[2] = width; s_sh.viewport[3] = height; s_sh.viewportValid = 1;",

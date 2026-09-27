@@ -142,6 +142,26 @@ One big change per build, each behind a config switch, tested before the next.
    other addresses keep the hash.
 Measure each with the [PHASE]/[SUBMIT]/[GPUDRAIN]/[PERF] lines, PGXP on and off.
 
+### Status (2026-09-28)
+- Measured: core 0 is the limit (room ~22 fps, corridor ~17). World-chunks 7-26 ms, OT0-draw 6-23 ms.
+- Done: VRAM fix (pool textures PAL4/PAL8, 79 -> 41 MB); GTE register moves inline; RTPS/RTPT core in
+  locals; lighting-helper projections (H=16, offset -1024) skip PGXP/view-space bookkeeping (lighting
+  9.5 -> 4.8 ms); PGXP + view-space shadow tables merged into one 64-byte entry (step 5 part);
+  redundant texture-unit binds dropped in the recorder; LTO for psycross_static.
+- CTR uses the same PsyCross GTE code: it is fast because it has no PGXP/flashlight capture and a
+  restructured renderer. Our per-vertex costs are PGXP + view-space capture (~2 us/vertex).
+
+### Step 2 design (CTR NativeGpuFramePacket)
+- Double-buffer g_splits + the vertex array; DrawAllSplits hands the finished frame (splits, vertices,
+  and a snapshot of every global the split loop reads: fog, flashlight/beam, shadow matrix, PGXP szMax,
+  blend src, dither/filter flags, draw env) to the render thread as one job.
+- The render thread runs batch/reorder, the shadow pass and the split loop, calling vitaGL directly
+  (recorders go direct when sceKernelGetThreadId() == render thread).
+- Render caches (g_PreviousShader, blend/depth/stencil, uniform locations, palette cache, s_beam) become
+  render-thread-only. Any GR_* entry point reachable from the game thread mid-frame (LoadImage/VRAM
+  upload, clears, captures, hi-res uploads) must either record into the ring (ordered after the job)
+  or wait for the job; audit them before switching it on. Config switch vita_frame_packet.
+
 ## Next optimizations (research, 2026-09-27)
 1. Build vitaGL ourselves with CTR's flags: HAVE_SHADER_CACHE=1 NO_DEBUG=1 READBACKS_SPEEDHACK=1
    CIRCULAR_POOL_SPEEDHACK=1, plus vglSetShaderCachePath (no compile hitches). Stock vdpm build today.

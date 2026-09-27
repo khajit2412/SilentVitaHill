@@ -530,6 +530,14 @@ find_path(JPEG_INCLUDE_DIR jpeglib.h)
 target_link_libraries(SilentHillPC PRIVATE
     psycross_static
 )
+if(VITA)
+    # Link-time optimisation for the renderer/GTE/PGXP archive: lets the hot
+    # per-vertex paths inline across its files (GTE -> shadow stores -> view-
+    # space gate). The game objects stay out: the static map build rewrites
+    # their symbols with llvm-objcopy, which cannot read LTO bytecode.
+    set_property(TARGET psycross_static PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+    target_link_options(SilentHillPC PRIVATE -flto=auto -O3 -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard)
+endif()
 
 # Lua scripting (randomizer): link the vendored interpreter + flag its presence.
 if(SH_HAVE_LUA)
