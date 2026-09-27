@@ -3290,11 +3290,18 @@ void MainLoop(void) // 0x80032EE0
             {
                 static Uint32 s_perfLastMs = 0, s_perfAccumMs = 0, s_perfWorstMs = 0;
                 static u32    s_perfFrames = 0, s_perfVbAccum = 0;
+                /* Split by flashlight state: it toggles on Circle, so a 30 s
+                 * window usually mixes both and the average hides either. */
+                static Uint32 s_perfFlMs[2] = { 0, 0 };
+                static u32    s_perfFlFrames[2] = { 0, 0 };
                 Uint32        perfNowMs = SDL_GetTicks();
                 if (s_perfLastMs != 0)
                 {
                     Uint32 dt = perfNowMs - s_perfLastMs;
+                    extern int g_PsyX_FlashlightActive;
                     s_perfAccumMs += dt;
+                    s_perfFlMs[g_PsyX_FlashlightActive ? 1 : 0] += dt;
+                    s_perfFlFrames[g_PsyX_FlashlightActive ? 1 : 0]++;
                     if (dt > s_perfWorstMs)
                         s_perfWorstMs = dt;
 
@@ -3367,6 +3374,12 @@ void MainLoop(void) // 0x80032EE0
                                (unsigned long)s_perfWorstMs,
                                (double)s_perfVbAccum / s_perfFrames,
                                (unsigned long)s_perfFrames);
+                    SH_DBG("[PERF] flashlight on: %.1f fps over %lu frames; off: %.1f fps over %lu frames",
+                           s_perfFlMs[1] ? 1000.0 * s_perfFlFrames[1] / (double)s_perfFlMs[1] : 0.0,
+                           (unsigned long)s_perfFlFrames[1],
+                           s_perfFlMs[0] ? 1000.0 * s_perfFlFrames[0] / (double)s_perfFlMs[0] : 0.0,
+                           (unsigned long)s_perfFlFrames[0]);
+                        s_perfFlMs[0] = s_perfFlMs[1] = 0; s_perfFlFrames[0] = s_perfFlFrames[1] = 0;
                         s_perfFrames = 0; s_perfAccumMs = 0; s_perfWorstMs = 0; s_perfVbAccum = 0;
                     }
                 }

@@ -2047,3 +2047,14 @@ int main(int argc, char* argv[])
 
     return 0;
 }
+
+#ifdef SH_VITA
+/* Dynamic resolution switched the display mode (vita_glcmd.c): the per-poly
+ * visibility bounds divide by the config's window size, so keep it current. */
+void Pc_VitaResolutionChanged(int w, int h)
+{
+    g_PcConfig.windowWidth  = w;
+    g_PcConfig.windowHeight = h;
+    SH_LOG("Dynamic resolution: %dx%d", w, h);
+}
+#endif

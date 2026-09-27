@@ -122,6 +122,10 @@ static int        g_numEntries = 0;
 static int        g_initialized = 0;
 
 static int upload_rgba(GLuint* tex, const unsigned char* rgba, int w, int h, int nearest);
+#if defined(SH_VITA)
+static int upload_tim_paletted(GLuint* tex, const unsigned char* data, unsigned int size,
+                               int clutRow, int* outW, int* outH, int* outBpp, int* outClutRows);
+#endif
 static void bgr555_to_rgba(unsigned short cx, unsigned char* out);
 
 /* Force GL_NEAREST (point) sampling on the next upload(s), set by the font TIM
@@ -1007,6 +1011,40 @@ int HiresOverride_PoolSlotRegister(int slotId,
         unsigned char* rgba = NULL;
         int w = 0, h = 0, srcBpp = 0, timRows = 1;
         Uint64 t0 = SDL_GetPerformanceCounter();
+#if defined(SH_VITA)
+        {
+            PoolSlotEntry* palSlot = (r >= HIRES_POOL_MAX_ROWS)
+                ? ((slotId + 64 * (r / HIRES_POOL_MAX_ROWS) < HIRES_POOL_SLOT_MAX)
+                       ? &g_poolSlots[slotId + 64 * (r / HIRES_POOL_MAX_ROWS)] : NULL)
+                : s;
+            const int palIdx = r % HIRES_POOL_MAX_ROWS;
+            if (palSlot && upload_tim_paletted(&palSlot->glTexture[palIdx], data, size, r,
+                                               &w, &h, &srcBpp, &timRows) == 0)
+            {
+                tDecode += SDL_GetPerformanceCounter() - t0;
+                if (r == 0)
+                {
+                    rows = timRows;
+                    if (rows > HIRES_POOL_MAX_ROWS && slotId < HIRES_POOL_CHARA_SLOT_BASE)
+                        rows = HIRES_POOL_MAX_ROWS;
+                    hiW = w;
+                    hiH = h;
+                }
+                if (palSlot != s)
+                {
+                    palSlot->nativeW = nativePixelW;
+                    palSlot->nativeH = nativePixelH;
+                }
+                else
+                    doneRows = r + 1;
+                palSlot->rowW[palIdx] = (unsigned short)w;
+                palSlot->rowH[palIdx] = (unsigned short)h;
+                palSlot->rowHash[palIdx] = 0;
+                pack_credit(&palSlot->rowPackBytes[palIdx]);
+                continue;
+            }
+        }
+#endif
         int decodeFailed = decode_to_rgba(tag, data, size, &rgba, &w, &h, &srcBpp, r, &timRows) != 0;
         tDecode += SDL_GetPerformanceCounter() - t0;
         if (decodeFailed)
@@ -1114,6 +1152,96 @@ int HiresOverride_PoolSlotRegister(int slotId,
  * Upscaled replacements (non-nearest) get mipmaps so they don't shimmer at
  * distance the way a raw LINEAR-sampled 4x texture does; native-res decodes
  * stay NEAREST with no mips (PSX-exact). Returns 0 on success. */
+#if defined(SH_VITA)
+/* Vita: a native 4/8bpp TIM row goes up as a GL_PALETTE4/8 texture instead of
+ * expanded RGBA. The pool held ~290 RGBA row textures (one per CLUT row, 51 MB)
+ * and filled the 80 MB VRAM pool, pushing later textures into slower RAM. The
+ * palette carries exactly the colours bgr555_to_rgba would, so sampling is
+ * identical. Returns 0 on success, -1 to fall back to the RGBA path. */
+static int upload_tim_paletted(GLuint* tex, const unsigned char* data, unsigned int size,
+                               int clutRow, int* outW, int* outH, int* outBpp, int* outClutRows)
+{
+    if (size < 12 || data[0] != 0x10 || data[1] || data[2] || data[3])
+        return -1;
+    const unsigned int flags = (unsigned int)data[4] | ((unsigned int)data[5] << 8);
+    const int bppCode = (int)(flags & 7);
+    if (!((flags >> 3) & 1) || bppCode > 1)
+        return -1;
+    const int bpp = bppCode ? 8 : 4;
+    const unsigned char* p = data + 8;
+    const unsigned char* end = data + size;
+    if (p + 12 > end)
+        return -1;
+    const unsigned int clutLen = (unsigned int)p[0] | ((unsigned int)p[1] << 8) |
+                                 ((unsigned int)p[2] << 16) | ((unsigned int)p[3] << 24);
+    const int clutW = (int)((unsigned int)p[8] | ((unsigned int)p[9] << 8));
+    const int clutH = (int)((unsigned int)p[10] | ((unsigned int)p[11] << 8));
+    const unsigned char* clut = p + 12;
+    if (clutLen < 12 || p + clutLen > end || clutW <= 0)
+        return -1;
+    p += clutLen;
+    if (p + 12 > end)
+        return -1;
+    const int cellW = (int)((unsigned int)p[8] | ((unsigned int)p[9] << 8));
+    const int h = (int)((unsigned int)p[10] | ((unsigned int)p[11] << 8));
+    const unsigned char* pix = p + 12;
+    const int w = (bpp == 4) ? cellW * 4 : cellW * 2;
+    const int rowBytes = cellW * 2;
+    if (w <= 0 || h <= 0 || w > 4096 || h > 4096 || pix + (size_t)rowBytes * h > end)
+        return -1;
+    if (clutRow >= clutH)
+        clutRow = 0;
+    if (clut + ((size_t)clutRow + 1) * clutW * 2 > end)
+        return -1;
+    clut += (size_t)clutRow * clutW * 2;
+
+    const int entries = (bpp == 4) ? 16 : 256;
+    const size_t idxBytes = (bpp == 4) ? (size_t)rowBytes * h : (size_t)w * h;
+    unsigned char* buf = (unsigned char*)malloc((size_t)entries * 4 + idxBytes);
+    if (!buf)
+        return -1;
+    for (int i = 0; i < entries; i++)
+    {
+        /* parse_tim_to_rgba maps an index past the CLUT to entry 0. */
+        const int e = (i < clutW) ? i : 0;
+        bgr555_to_rgba((unsigned short)(clut[e * 2] | (clut[e * 2 + 1] << 8)), &buf[i * 4]);
+    }
+    unsigned char* idx = buf + entries * 4;
+    if (bpp == 8)
+        memcpy(idx, pix, idxBytes);
+    else
+        for (size_t b = 0; b < idxBytes; b++)
+            idx[b] = (unsigned char)((pix[b] << 4) | (pix[b] >> 4));
+
+    if (*tex == 0)
+        glGenTextures(1, tex);
+    if (*tex == 0)
+    {
+        free(buf);
+        return -1;
+    }
+    glBindTexture(GL_TEXTURE_2D, *tex);
+    glCompressedTexImage2D(GL_TEXTURE_2D, 0, bpp == 8 ? GL_PALETTE8_RGBA8_OES : GL_PALETTE4_RGBA8_OES,
+                           w, h, 0, (GLsizei)(entries * 4 + idxBytes), buf);
+    free(buf);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    {
+        extern void GR_MarkTextureNearest(unsigned int tex);
+        GR_MarkTextureNearest(*tex);
+    }
+    *outW = w;
+    *outH = h;
+    *outBpp = bpp;
+    if (outClutRows)
+        *outClutRows = (clutH > 0) ? clutH : 1;
+    return 0;
+}
+#endif
+
 static int upload_rgba(GLuint* tex, const unsigned char* rgba, int w, int h, int nearest)
 {
     if (s_forceNearestUpload) nearest = 1; /* font atlas: point-sample, kill gutterless-cell bleed */

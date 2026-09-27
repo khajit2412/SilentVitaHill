@@ -126,6 +126,22 @@ native_gpu.c. Its Vita-specific techniques and our status:
   Core 3 is the system core: optional bonus only, never required.
 - [GPUDRAIN] every 60th frame measures the GPU backlog at swap: tells GPU-bound from display/GC wait.
 
+## Renderer roadmap: adopt what others do better (agreed 2026-09-27; PGXP is a must-have)
+One big change per build, each behind a config switch, tested before the next.
+1. Draw order as depth (CTR native_gpu.c/native_renderer.c): per-primitive order counter in the
+   vertex, gl_Position.z = 1 - order*2/65535, depth test LEQUAL + write on. PowerVR HSR then shades
+   opaque pixels once (today 3-4x overdraw) and opaque batches can be regrouped by state; draw
+   opaque -> discard -> translucent (in order). Must coexist with PGXP depth modes.
+2. Per-frame packet to the render thread (CTR NativeGpuFramePacket): hand over vertices + split
+   list; the render thread runs the whole split loop. Replaces per-GL-call recording on core 0.
+3. Slim GrVertex: 68 bytes today vs CTR 22. Pack PGXP/view-space/flags; keep what PGXP needs.
+4. Flashlight cookie: projected beam texture in light space (as SH2/SH3 on PS2) instead of per-pixel
+   cone/falloff maths; reuses the shadow light coordinates.
+5. PGXP storage: direct-mapped arrays for the packet buffers and scratch memory (DuckStation keeps a
+   RAM-mirroring shadow; original PsyCross stores an index in the prim) instead of hash tables;
+   other addresses keep the hash.
+Measure each with the [PHASE]/[SUBMIT]/[GPUDRAIN]/[PERF] lines, PGXP on and off.
+
 ## Next optimizations (research, 2026-09-27)
 1. Build vitaGL ourselves with CTR's flags: HAVE_SHADER_CACHE=1 NO_DEBUG=1 READBACKS_SPEEDHACK=1
    CIRCULAR_POOL_SPEEDHACK=1, plus vglSetShaderCachePath (no compile hitches). Stock vdpm build today.

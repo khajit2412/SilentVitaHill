@@ -18,6 +18,7 @@
 #include "vita_glcmd_undef.h"
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/kernel/cpu.h>
+#include <psp2/kernel/processmgr.h>
 #include <SDL2/SDL.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -351,6 +352,138 @@ static int VGLR_UniformSame(GLint loc, const void* data, uint32_t len)
     return 0;
 }
 
+/* GPU memory inventory ([VRAMTEX] in VGLR_Report): what our own GL calls
+ * allocate, by texture size/format, so a full VRAM pool can be traced to a
+ * cache or target. vitaGL's own allocations (display buffers, the implicit depth
+ * buffer each FBO gets on first use) are estimated from the FBO attachments. */
+#define VGLR_TEXMAX 16384
+typedef struct { uint32_t bytes; uint16_t w, h; uint32_t fmt; uint8_t fbo; } VGLR_TexInfo;
+static VGLR_TexInfo s_texInfo[VGLR_TEXMAX];
+#define VGLR_BUFMAX 256
+static struct { GLuint name; uint32_t bytes; } s_bufInfo[VGLR_BUFMAX];
+static uint64_t s_rbBytes;
+
+static void VGLR_MemTex(GLint level, uint32_t fmt, GLsizei w, GLsizei h, size_t bytes)
+{
+    const uint32_t u = s_sh.activeUnit - GL_TEXTURE0;
+    if (u >= 32u)
+        return;
+    const GLuint t = s_sh.tex2D[u];
+    if (t == 0 || t >= VGLR_TEXMAX)
+        return;
+    if (level == 0)
+    {
+        s_texInfo[t].bytes = (uint32_t)bytes;
+        s_texInfo[t].w = (uint16_t)w;
+        s_texInfo[t].h = (uint16_t)h;
+        s_texInfo[t].fmt = fmt;
+    }
+    else
+        s_texInfo[t].bytes += (uint32_t)bytes;
+}
+
+static void VGLR_MemTexDelete(GLsizei n, const GLuint* names)
+{
+    for (GLsizei i = 0; i < n; i++)
+        if (names[i] < VGLR_TEXMAX)
+            memset(&s_texInfo[names[i]], 0, sizeof(s_texInfo[0]));
+}
+
+static void VGLR_MemTexFbo(GLuint t)
+{
+    if (t < VGLR_TEXMAX)
+        s_texInfo[t].fbo = 1;
+}
+
+static void VGLR_MemRb(GLsizei w, GLsizei h)
+{
+    s_rbBytes += (uint64_t)w * h * 5;
+}
+
+static void VGLR_MemBuf(GLuint name, size_t bytes)
+{
+    int freeSlot = -1;
+    for (int i = 0; i < VGLR_BUFMAX; i++)
+    {
+        if (s_bufInfo[i].name == name) { s_bufInfo[i].bytes = (uint32_t)bytes; return; }
+        if (freeSlot < 0 && s_bufInfo[i].name == 0) freeSlot = i;
+    }
+    if (freeSlot >= 0) { s_bufInfo[freeSlot].name = name; s_bufInfo[freeSlot].bytes = (uint32_t)bytes; }
+}
+
+static void VGLR_MemBufDelete(GLsizei n, const GLuint* names)
+{
+    for (GLsizei i = 0; i < n; i++)
+        for (int j = 0; j < VGLR_BUFMAX; j++)
+            if (s_bufInfo[j].name == names[i]) s_bufInfo[j].name = 0, s_bufInfo[j].bytes = 0;
+}
+
+static const char* VGLR_FmtName(uint32_t f)
+{
+    switch (f)
+    {
+    case GL_PALETTE8_RGBA8_OES: return "PAL8";
+    case GL_PALETTE4_RGBA8_OES: return "PAL4";
+    case GL_RGBA:               return "RGBA";
+    case GL_RGB:                return "RGB";
+    case GL_LUMINANCE_ALPHA:    return "LA";
+    case GL_LUMINANCE:          return "L";
+    default:                    return "other";
+    }
+}
+
+static void VGLR_MemInventory(void)
+{
+    enum { GROUPS = 32 };
+    struct { uint16_t w, h; uint32_t fmt; uint32_t count; uint64_t bytes; } g[GROUPS];
+    int ng = 0;
+    uint64_t total = 0, fboDepth = 0;
+    uint32_t count = 0, fbos = 0;
+
+    for (int t = 1; t < VGLR_TEXMAX; t++)
+    {
+        const VGLR_TexInfo* e = &s_texInfo[t];
+        if (!e->bytes)
+            continue;
+        count++;
+        total += e->bytes;
+        if (e->fbo) { fbos++; fboDepth += (uint64_t)e->w * e->h * 5; }
+        int k;
+        for (k = 0; k < ng; k++)
+            if (g[k].w == e->w && g[k].h == e->h && g[k].fmt == e->fmt)
+                break;
+        if (k == ng)
+        {
+            if (ng == GROUPS) continue;
+            g[ng].w = e->w; g[ng].h = e->h; g[ng].fmt = e->fmt; g[ng].count = 0; g[ng].bytes = 0;
+            ng++;
+        }
+        g[k].count++;
+        g[k].bytes += e->bytes;
+    }
+    uint64_t bufs = 0;
+    for (int i = 0; i < VGLR_BUFMAX; i++)
+        bufs += s_bufInfo[i].bytes;
+
+    if (!g_ShDebugLog)
+        return;
+    fprintf(g_ShDebugLog, "[VRAMTEX] %u textures %.1f MB, %u FBO targets (+%.1f MB implicit depth est.), buffers %.1f MB, renderbuffers %.1f MB; largest:",
+            count, total / 1048576.0, fbos, fboDepth / 1048576.0, bufs / 1048576.0, s_rbBytes / 1048576.0);
+    for (int n = 0; n < 6; n++)
+    {
+        int best = -1;
+        for (int k = 0; k < ng; k++)
+            if (g[k].count && (best < 0 || g[k].bytes > g[best].bytes))
+                best = k;
+        if (best < 0)
+            break;
+        fprintf(g_ShDebugLog, " %ux%u %s x%u=%.1fMB", g[best].w, g[best].h, VGLR_FmtName(g[best].fmt),
+                g[best].count, g[best].bytes / 1048576.0);
+        g[best].count = 0;
+    }
+    fprintf(g_ShDebugLog, "\n");
+}
+
 #include "vita_glcmd_gen.inc"
 
 typedef struct
@@ -379,6 +512,13 @@ static void VGLR_RunSync(void (*fn)(void*), void* arg, const char* name)
     a->done = &done;
     VGLR_Commit();
     VGLR_PRODUCER_WAIT_UNTIL(done);
+}
+
+/* Runs fn on the render thread, in order with the recorded GL calls, and
+ * waits for it: for vitaGL entry points the recorder does not wrap. */
+void VGLR_Call(void (*fn)(void*), void* arg)
+{
+    VGLR_RunSync(fn, arg, "VGLR_Call");
 }
 
 /* ---- special cases ---------------------------------------------------------- */
@@ -477,6 +617,92 @@ void VGLR_vglBufferData(GLenum target, const GLvoid* data)
     }
 }
 
+/* ---- dynamic resolution ------------------------------------------------------
+ * render_scale picks the largest display mode; while the render thread / GPU
+ * holds the game thread back at the frame pace, drop one mode (720x408 ->
+ * 640x368) and come back once it has been idle for a while. vitaGL applies a
+ * resolution change at the next swap with a full GPU finish, so switches are
+ * rare and back off when they oscillate. Config key vita_dynamic_res (default 1). */
+extern int g_vitaScreenW, g_vitaScreenH;
+extern void Vita_ApplySurfaceSize(int w, int h);
+#define DYN_WINDOW      30
+#define DYN_DROP_US     4000
+#define DYN_RAISE_US    500
+static int      s_dyn = -1, s_dynLow;
+static int      s_dynHiW, s_dynHiH, s_dynLoW, s_dynLoH;
+static int      s_dynPendW, s_dynPendH;
+static uint32_t s_dynFrames, s_dynCalm, s_dynSince, s_dynHold = 300;
+static uint64_t s_dynWaitUs;
+
+static void T_SwapRes(void* p)
+{
+    const int* wh = (const int*)p;
+    vglSwapResolution(wh[0], wh[1]);
+}
+
+static void VGLR_DynInit(void)
+{
+    extern const char* Pc_ModConfig_Value(const char* key);
+    const char* cfg = Pc_ModConfig_Value("vita_dynamic_res");
+    s_dyn = !(cfg && cfg[0] == '0');
+    s_dynHiW = g_vitaScreenW; s_dynHiH = g_vitaScreenH;
+    if (s_dynHiW >= 960)      { s_dynLoW = 720; s_dynLoH = 408; }
+    else if (s_dynHiW >= 720) { s_dynLoW = 640; s_dynLoH = 368; }
+    else                      s_dyn = 0;
+    if (g_ShDebugLog)
+        fprintf(g_ShDebugLog, "[DYNRES] %s %dx%d <-> %dx%d\n", s_dyn ? "on" : "off",
+                s_dynHiW, s_dynHiH, s_dynLoW, s_dynLoH);
+}
+
+/* Menus and the inventory draw next to nothing, so the GPU idles and the
+ * controller would raise the resolution there and drop it again on the way
+ * back, each switch a visible flick. Only live gameplay frames count. */
+extern int g_PcWorldDrawnThisFrame;
+extern int g_PsxPresentLastFrame;
+static uint32_t s_dynHot;
+
+static int VGLR_DynGameplay(void)
+{
+    return g_PcWorldDrawnThisFrame && !g_PsxPresentLastFrame;
+}
+
+static void VGLR_DynUpdate(uint64_t waitUs)
+{
+    if (!VGLR_DynGameplay())
+    {
+        s_dynFrames = 0;
+        s_dynWaitUs = 0;
+        return;
+    }
+    s_dynWaitUs += waitUs;
+    s_dynSince++;
+    if (++s_dynFrames < DYN_WINDOW)
+        return;
+    const uint64_t avg = s_dynWaitUs / s_dynFrames;
+    s_dynFrames = 0;
+    s_dynWaitUs = 0;
+    if (s_dynSince < s_dynHold)
+        return;
+    s_dynHot = (avg > DYN_DROP_US) ? s_dynHot + 1 : 0;
+    if (!s_dynLow && s_dynHot >= 2)
+    {
+        /* Dropping again soon after a raise means the raise was wrong. */
+        if (s_dynSince < s_dynHold * 3 && s_dynHold < 3600)
+            s_dynHold *= 2;
+        s_dynLow = 1; s_dynPendW = s_dynLoW; s_dynPendH = s_dynLoH;
+    }
+    else if (s_dynLow)
+    {
+        s_dynCalm = (avg < DYN_RAISE_US) ? s_dynCalm + 1 : 0;
+        if (s_dynCalm >= 10)
+        {
+            s_dynLow = 0; s_dynPendW = s_dynHiW; s_dynPendH = s_dynHiH;
+        }
+    }
+    if (s_dynPendW && g_ShDebugLog)
+        fprintf(g_ShDebugLog, "[DYNRES] -> %dx%d (wait %.1f ms/frame)\n", s_dynPendW, s_dynPendH, avg / 1000.0);
+}
+
 void VGLR_vglSwapBuffers(GLboolean has_commondialog)
 {
     if (!s_threaded)
@@ -484,13 +710,44 @@ void VGLR_vglSwapBuffers(GLboolean has_commondialog)
         vglSwapBuffers(has_commondialog);
         return;
     }
+    if (s_dyn < 0)
+        VGLR_DynInit();
+
+    /* Queued ahead of this frame's swap so the next frame starts at the new size. */
+    int applied = 0, wh[2] = { s_dynPendW, s_dynPendH };
+    if (s_dynPendW && !VGLR_DynGameplay())
+    {
+        /* Decided in gameplay but a menu opened: undo the decision. */
+        s_dynLow = !s_dynLow;
+        s_dynPendW = 0;
+    }
+    if (s_dynPendW)
+    {
+        VGLR_RunSync(T_SwapRes, wh, "vglSwapResolution");
+        s_dynPendW = 0;
+        s_dynSince = 0;
+        s_dynCalm = 0;
+        applied = 1;
+    }
+
     GLboolean* a = (GLboolean*)VGLR_Reserve(OP_SWAP, sizeof(GLboolean), 0);
     *a = has_commondialog;
     VGLR_Commit();
     VGLR_Publish();
     s_framesSubmitted++;
     /* At most one frame queued behind the one being drawn. */
+    const uint64_t t0 = sceKernelGetProcessTimeWide();
     VGLR_PRODUCER_WAIT_UNTIL(s_framesSubmitted - s_framesDone <= 1);
+    const uint64_t waited = sceKernelGetProcessTimeWide() - t0;
+
+    if (applied)
+    {
+        g_vitaScreenW = wh[0];
+        g_vitaScreenH = wh[1];
+        Vita_ApplySurfaceSize(wh[0], wh[1]);
+    }
+    else if (s_dyn > 0)
+        VGLR_DynUpdate(waited);
 }
 
 /* ---- render thread ------------------------------------------------------------ */
@@ -626,8 +883,26 @@ void VGLR_Start(void (*init)(void*))
 }
 
 /* Called every 300 frames from the frame report. */
+static void T_MemReport(void* p)
+{
+    size_t* m = (size_t*)p;
+    m[0] = vglMemFree(VGL_MEM_RAM);  m[1] = vglMemTotal(VGL_MEM_RAM);
+    m[2] = vglMemFree(VGL_MEM_VRAM); m[3] = vglMemTotal(VGL_MEM_VRAM);
+}
+
 void VGLR_Report(double frames)
 {
+    {
+        extern int g_cdcStats[2];
+        size_t m[4];
+        VGLR_RunSync(T_MemReport, m, "vglMemFree");
+        if (g_ShDebugLog)
+            fprintf(g_ShDebugLog, "[MEM] vitaGL RAM %u/%u MB used, VRAM %u/%u MB used; disc cache hits=%d misses=%d\n",
+                    (unsigned)((m[1] - m[0]) >> 20), (unsigned)(m[1] >> 20),
+                    (unsigned)((m[3] - m[2]) >> 20), (unsigned)(m[3] >> 20),
+                    g_cdcStats[0], g_cdcStats[1]);
+        VGLR_MemInventory();
+    }
     if (!s_threaded || !g_ShDebugLog)
         return;
     fprintf(g_ShDebugLog, "[GLTHREAD] waits/frame=%.2f last: %s %s %s %s\n",

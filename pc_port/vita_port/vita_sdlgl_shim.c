@@ -6,6 +6,7 @@
 #include <string.h>
 #include <vitashark.h>
 #include <psp2/kernel/cpu.h>
+#include <psp2/kernel/processmgr.h>
 
 extern FILE* g_ShDebugLog;
 
@@ -295,6 +296,12 @@ static void VitaGL_InitOnRenderThread(void* unused)
     /* O3 + fast math. Precision and int shortcuts stay off: the CLUT/VRAM
      * decode does exact index arithmetic in the fragment shader. */
     vglSetupRuntimeShaderCompiler(SHARK_OPT_FAST, GL_TRUE, GL_FALSE, GL_FALSE);
+    /* Compiled shaders persist on the card (vitaGL built with HAVE_SHADER_CACHE,
+     * build_vitagl.sh): no compile hitch the second time a variant is used. */
+    vglSetShaderCachePath("ux0:data/silenthill/shader_cache");
+    /* Shadowed frames draw the scene twice; a parameter buffer that overflows
+     * makes the GPU render the frame in partial passes. Default is 16 MB. */
+    vglSetParamBufferSize(32 * 1024 * 1024);
     /* Its frees run beside the game and render threads (cores 0 and 1). */
     vglSetupGarbageCollector(0x10000100, VGLR_HelperCoreMask());
     vglInitExtended(0, VITA_SCREEN_W, VITA_SCREEN_H,
@@ -362,3 +369,8 @@ void* VitaGL_GetProcAddress(const char* name)
     return vglGetProcAddress(name);
 }
 #endif
+
+unsigned long long Pc_ProfNowUs(void)
+{
+    return sceKernelGetProcessTimeWide();
+}

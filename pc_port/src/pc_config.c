@@ -148,7 +148,7 @@ s_PcConfig g_PcConfig = {
     .screenOrientation   = 0, /* lock landscape: what the port has always done */
     .touchLookSensitivity = 1.0f,
 #if defined(SH_VITA)
-    .renderScale         = 0.65f, /* 640x368 display mode: the flashlight/shadow cost is per pixel */
+    .renderScale         = 0.75f, /* 720x408 display mode; dynamic resolution drops to 640x368 under GPU load */
 #else
     .renderScale         = 1.0f,
 #endif
@@ -1619,6 +1619,15 @@ else if (strcmp(key, "enable_plugins") == 0)
         {
             g_PcConfig.renderScale = 0.65f;
             PcConfig_SaveKeyValue("render_scale", "0.65");
+        }
+
+        /* v10 (Vita only): render_scale 0.65 -> 0.75; dynamic resolution
+         * (vita_dynamic_res) now takes it to 640x368 only when the GPU is behind. */
+        if (g_PcConfig.configVersion < 10 &&
+            g_PcConfig.renderScale > 0.645f && g_PcConfig.renderScale < 0.655f)
+        {
+            g_PcConfig.renderScale = 0.75f;
+            PcConfig_SaveKeyValue("render_scale", "0.75");
         }
 #endif
 

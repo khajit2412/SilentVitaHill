@@ -74,6 +74,7 @@ void VitaGL_Scissor(GLint x, GLint y, GLsizei w, GLsizei h);
  * into vitaGL on its own thread. */
 void VGLR_Start(void (*init)(void*));
 int  VGLR_HelperCoreMask(void);
+void VGLR_Call(void (*fn)(void*), void* arg);
 void VGLR_Report(double frames);
 #include "vita_glcmd_protos.h"
 

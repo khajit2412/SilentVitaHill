@@ -470,6 +470,7 @@ typedef struct {
 
 void VGLR_glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level)
 {
+    VGLR_MemTexFbo(texture);
     if (!s_threaded) { glFramebufferTexture2D(target, attachment, textarget, texture, level); return; }
     A_glFramebufferTexture2D* a = (A_glFramebufferTexture2D*)VGLR_Reserve(OP_glFramebufferTexture2D, sizeof(A_glFramebufferTexture2D), 0);
     a->target = target;
@@ -552,6 +553,7 @@ typedef struct {
 
 void VGLR_glRenderbufferStorage(GLenum target, GLenum internalformat, GLsizei width, GLsizei height)
 {
+    VGLR_MemRb(width, height);
     if (!s_threaded) { glRenderbufferStorage(target, internalformat, width, height); return; }
     A_glRenderbufferStorage* a = (A_glRenderbufferStorage*)VGLR_Reserve(OP_glRenderbufferStorage, sizeof(A_glRenderbufferStorage), 0);
     a->target = target;
@@ -878,7 +880,7 @@ typedef struct {
 
 void VGLR_glDeleteTextures(GLsizei n, const GLuint * textures)
 {
-    VGLR_Shadow_DeleteTextures(n, textures);
+    VGLR_Shadow_DeleteTextures(n, textures); VGLR_MemTexDelete(n, textures);
     if (!s_threaded) { glDeleteTextures(n, textures); return; }
     const size_t pay = (size_t)n * 4;
     A_glDeleteTextures* a = (A_glDeleteTextures*)VGLR_Reserve(OP_glDeleteTextures, sizeof(A_glDeleteTextures), pay);
@@ -895,7 +897,7 @@ typedef struct {
 
 void VGLR_glDeleteBuffers(GLsizei n, const GLuint * gl_buffers)
 {
-    VGLR_Shadow_DeleteNames(n, gl_buffers, &s_sh.arrayBuffer);
+    VGLR_Shadow_DeleteNames(n, gl_buffers, &s_sh.arrayBuffer); VGLR_MemBufDelete(n, gl_buffers);
     if (!s_threaded) { glDeleteBuffers(n, gl_buffers); return; }
     const size_t pay = (size_t)n * 4;
     A_glDeleteBuffers* a = (A_glDeleteBuffers*)VGLR_Reserve(OP_glDeleteBuffers, sizeof(A_glDeleteBuffers), pay);
@@ -964,6 +966,7 @@ typedef struct {
 
 void VGLR_glBufferData(GLenum target, GLsizei size, const GLvoid * data, GLenum usage)
 {
+    if (target == GL_ARRAY_BUFFER) VGLR_MemBuf(s_sh.arrayBuffer, (size_t)size);
     if (!s_threaded) { glBufferData(target, size, data, usage); return; }
     const size_t pay = (data ? (size_t)size : 0);
     A_glBufferData* a = (A_glBufferData*)VGLR_Reserve(OP_glBufferData, sizeof(A_glBufferData), pay);
@@ -1008,6 +1011,7 @@ typedef struct {
 
 void VGLR_glCompressedTexImage2D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLint border, GLsizei imageSize, const void * data)
 {
+    VGLR_MemTex(level, (uint32_t)internalformat, width, height, (size_t)imageSize);
     if (!s_threaded) { glCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, data); return; }
     const size_t pay = (data ? (size_t)imageSize : 0);
     A_glCompressedTexImage2D* a = (A_glCompressedTexImage2D*)VGLR_Reserve(OP_glCompressedTexImage2D, sizeof(A_glCompressedTexImage2D), pay);
@@ -1037,6 +1041,7 @@ typedef struct {
 
 void VGLR_glTexImage2D(GLenum target, GLint level, GLint internalFormat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const GLvoid * data)
 {
+    VGLR_MemTex(level, (uint32_t)internalFormat, width, height, VGLR_ImageBytes(width, height, format, type));
     if (!s_threaded) { glTexImage2D(target, level, internalFormat, width, height, border, format, type, data); return; }
     const size_t pay = (data ? VGLR_ImageBytes(width, height, format, type) : 0);
     A_glTexImage2D* a = (A_glTexImage2D*)VGLR_Reserve(OP_glTexImage2D, sizeof(A_glTexImage2D), pay);

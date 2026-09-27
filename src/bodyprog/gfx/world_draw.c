@@ -481,6 +481,7 @@ void Gfx_InGameDraw(bool arg0) // 0x8003C878
     Gfx_WorldObjectsDraw(&g_WorldGfxWork);
 
 #ifdef SH_PC_PORT
+    { extern void Pc_MlTrace(const char*); Pc_MlTrace("World-chunkload"); }
     /* On PC, CdRead is synchronous via PsyCross. The PSX while-loop
      * blocked rendering until the player's cell chunk was loaded; the
      * old PC replacement flushed the queue BEFORE Ipd_CloseRangeChunksInit
@@ -512,8 +513,12 @@ void Gfx_InGameDraw(bool arg0) // 0x8003C878
     }
 #endif
 
+#ifdef SH_PC_PORT
+    { extern void Pc_MlTrace(const char*); Pc_MlTrace("World-chunks"); }
+#endif
     Ipd_ChunkCheckDraw(&g_OrderingTable0[g_ActiveBufferIdx], arg0);
 #ifdef SH_PC_PORT
+    { extern void Pc_MlTrace(const char*); Pc_MlTrace("World-2dfx"); }
     /* Bullet-hole decals ride the world OT here so GsWSMATRIX matches the
      * chunk geometry they sit on (pc_decals.c). */
     { extern void Pc_DecalsDraw(GsOT* ot); Pc_DecalsDraw(&g_OrderingTable0[g_ActiveBufferIdx]); }
