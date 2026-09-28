@@ -41,6 +41,45 @@ typedef struct
 } CmdHdr;
 
 static int               s_threaded = 0;
+
+/* Frame jobs (vita_frame_packet): DrawAllSplits hands a whole flush to the
+ * render thread, which runs the renderer's draw code itself and calls vitaGL
+ * directly instead of recording. The recorders therefore ask which thread
+ * they run on: TPIDRURO (the per-thread TLS base) is one register read; the
+ * thread id is the fallback if the two threads ever report the same value. */
+static uint32_t          s_renderTls;
+static SceUID            s_renderTid = -1;
+static int               s_tlsUnique = 0;
+static volatile uint32_t s_jobsSubmitted, s_jobsDone;
+static int               s_jobsOn = 0;
+
+static inline uint32_t VGLR_Tls(void)
+{
+    uint32_t v;
+    __asm__ volatile("mrc p15, 0, %0, c13, c0, 3" : "=r"(v));
+    return v;
+}
+
+static inline int VGLR_OnRender(void)
+{
+    return s_tlsUnique ? (VGLR_Tls() == s_renderTls) : (sceKernelGetThreadId() == s_renderTid);
+}
+
+static inline int VGLR_Direct(void)
+{
+    return !s_threaded || VGLR_OnRender();
+}
+
+int VGLR_OnRenderThread(void)
+{
+    return s_threaded && VGLR_OnRender();
+}
+
+static void VGLR_JobFenceWait(void);
+
+/* A game-thread GL call waits for pending frame jobs before it touches the
+ * recorder's state filters (bind / uniform / query shadows) the job is using. */
+#define VGLR_GAME_FENCE() do { if (s_jobsDone != s_jobsSubmitted && !VGLR_OnRender()) VGLR_JobFenceWait(); } while (0)
 static uint8_t*          s_ring;
 static volatile uint32_t s_wr;          /* published write position (monotonic) */
 static volatile uint32_t s_rd;          /* consumer read position (monotonic) */
@@ -70,6 +109,9 @@ static unsigned    s_syncLastN;
 #define OP_CALL               1
 #define OP_SCRATCH_BUFFERDATA 2
 #define OP_SWAP               3
+#define OP_JOB                4
+
+typedef struct { void (*fn)(void*); } A_Job;
 
 static void VGLR_RunSync(void (*fn)(void*), void* arg, const char* name);
 
@@ -133,6 +175,12 @@ static void VGLR_Commit(void);
 
 static void* VGLR_Reserve(uint16_t op, size_t argsSize, size_t payload)
 {
+    /* Anything the game thread records while a frame job is still running
+     * would read or change renderer state under it: wait for the job first.
+     * The swap and further jobs queue behind it in order and need no wait. */
+    if (s_jobsDone != s_jobsSubmitted && op != OP_SWAP && op != OP_JOB)
+        VGLR_JobFenceWait();
+
     /* A scratch upload left uncommitted (nothing called vglBufferData on it)
      * must not be overwritten by the next command. */
     if (s_scratchPayload)
@@ -497,7 +545,7 @@ static void VGLR_RunSync(void (*fn)(void*), void* arg, const char* name)
 {
     volatile int done = 0;
 
-    if (!s_threaded)
+    if (VGLR_Direct())
     {
         fn(arg);
         return;
@@ -547,6 +595,7 @@ static GLboolean VGLR_Query(GLenum pname, void* data, int kind, const char* name
 
 void VGLR_glGetIntegerv(GLenum pname, GLint* data)
 {
+    VGLR_GAME_FENCE();
     if (s_threaded && VGLR_ShadowGetInt(pname, data))
         return;
     VGLR_Query(pname, data, 0, "glGetIntegerv");
@@ -554,6 +603,7 @@ void VGLR_glGetIntegerv(GLenum pname, GLint* data)
 
 void VGLR_glGetFloatv(GLenum pname, GLfloat* data)
 {
+    VGLR_GAME_FENCE();
     if (s_threaded && pname == GL_COLOR_CLEAR_VALUE)
     {
         memcpy(data, s_sh.clear, sizeof(s_sh.clear));
@@ -564,6 +614,7 @@ void VGLR_glGetFloatv(GLenum pname, GLfloat* data)
 
 void VGLR_glGetBooleanv(GLenum pname, GLboolean* data)
 {
+    VGLR_GAME_FENCE();
     /* Nothing here calls glColorMask, so the mask is the default. */
     if (s_threaded && pname == GL_COLOR_WRITEMASK)
     {
@@ -575,6 +626,7 @@ void VGLR_glGetBooleanv(GLenum pname, GLboolean* data)
 
 GLboolean VGLR_glIsEnabled(GLenum cap)
 {
+    VGLR_GAME_FENCE();
     const int i = VGLR_CapIndex(cap);
     if (s_threaded && i >= 0)
         return s_sh.caps[i] ? GL_TRUE : GL_FALSE;
@@ -585,14 +637,14 @@ GLenum VGLR_glGetError(void)
 {
     /* Waiting on the render thread to report per-frame diagnostics would undo
      * the overlap this whole file exists for. */
-    if (!s_threaded)
+    if (VGLR_Direct())
         return glGetError();
     return GL_NO_ERROR;
 }
 
 void* VGLR_vglAllocFromScratch(size_t size)
 {
-    if (!s_threaded)
+    if (VGLR_Direct())
         return vglAllocFromScratch(size);
     A_Scratch* a = (A_Scratch*)VGLR_Reserve(OP_SCRATCH_BUFFERDATA, sizeof(A_Scratch), size);
     a->target = 0;
@@ -603,7 +655,7 @@ void* VGLR_vglAllocFromScratch(size_t size)
 
 void VGLR_vglBufferData(GLenum target, const GLvoid* data)
 {
-    if (!s_threaded)
+    if (VGLR_Direct())
     {
         vglBufferData(target, data);
         return;
@@ -771,11 +823,52 @@ void VGLR_vglSwapBuffers(GLboolean has_commondialog)
         VGLR_DynUpdate(waited);
 }
 
+/* ---- frame jobs ----------------------------------------------------------------- */
+
+static void VGLR_JobFenceWait(void)
+{
+    VGLR_PRODUCER_WAIT_UNTIL(s_jobsDone == s_jobsSubmitted);
+}
+
+int VGLR_JobsEnabled(void)
+{
+    return s_threaded && s_jobsOn;
+}
+
+/* Waits until every submitted frame job has run. No-op on the render thread. */
+void VGLR_JobFence(void)
+{
+    if (!s_threaded || VGLR_OnRender() || s_jobsDone == s_jobsSubmitted)
+        return;
+    VGLR_JobFenceWait();
+}
+
+/* Reserves a job of `bytes` payload in the ring and returns the payload for the
+ * caller to fill; VGLR_JobEnd hands it over. NULL = run it inline instead. */
+void* VGLR_JobBegin(void (*fn)(void*), size_t bytes)
+{
+    if (!VGLR_JobsEnabled() || VGLR_OnRender() || bytes > VGLR_RING_SIZE / 4)
+        return NULL;
+    A_Job* a = (A_Job*)VGLR_Reserve(OP_JOB, sizeof(A_Job), bytes);
+    a->fn = fn;
+    return (uint8_t*)a + VGLR_ALIGN(sizeof(A_Job));
+}
+
+void VGLR_JobEnd(void)
+{
+    s_jobsSubmitted++;
+    VGLR_Commit();
+    VGLR_Publish();
+}
+
 /* ---- render thread ------------------------------------------------------------ */
 
 static int VGLR_ThreadMain(SceSize args, void* argp)
 {
     (void)args; (void)argp;
+    s_renderTls = VGLR_Tls();
+    VGLR_Barrier();
+    s_renderTid = sceKernelGetThreadId();
     for (;;)
     {
         while (s_rd == s_wr)
@@ -815,6 +908,14 @@ static int VGLR_ThreadMain(SceSize args, void* argp)
                     memcpy(gpu, body + VGLR_ALIGN(sizeof(A_Scratch)), a->bytes);
                     vglBufferData(a->target, gpu);
                 }
+                break;
+            }
+            case OP_JOB:
+            {
+                const A_Job* a = (const A_Job*)body;
+                a->fn((void*)(body + VGLR_ALIGN(sizeof(A_Job))));
+                VGLR_Barrier();
+                s_jobsDone++;
                 break;
             }
             case OP_SWAP:
@@ -898,9 +999,20 @@ void VGLR_Start(void (*init)(void*))
     /* The caller is the game thread: core 0, leaving core 1 to this one. */
     sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_0);
 
+    while (s_renderTid < 0)
+        sceKernelDelayThread(100);
+    VGLR_Barrier();
+    s_tlsUnique = s_renderTls != VGLR_Tls();
+
     s_threaded = 1;
     VGLR_RunSync(init, NULL, "init");
     if (g_ShDebugLog) fprintf(g_ShDebugLog, "[GLTHREAD] on - vitaGL runs on its own thread (core 1)\n");
+
+    cfg = Pc_ModConfig_Value("vita_frame_packet");
+    s_jobsOn = !(cfg && cfg[0] == '0');
+    if (g_ShDebugLog)
+        fprintf(g_ShDebugLog, "[FRAMEJOB] %s (thread check: %s)\n", s_jobsOn ? "on - draw loop runs on the render thread" : "off (config)",
+                s_tlsUnique ? "TPIDRURO" : "thread id");
 }
 
 /* Called every 300 frames from the frame report. */

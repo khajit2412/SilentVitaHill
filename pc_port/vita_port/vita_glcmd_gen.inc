@@ -72,8 +72,9 @@ typedef struct {
 
 void VGLR_glActiveTexture(GLenum texture)
 {
+    VGLR_GAME_FENCE();
     if (s_sh.activeUnit == texture) return; s_sh.activeUnit = texture;
-    if (!s_threaded) { glActiveTexture(texture); return; }
+    if (VGLR_Direct()) { glActiveTexture(texture); return; }
     A_glActiveTexture* a = (A_glActiveTexture*)VGLR_Reserve(OP_glActiveTexture, sizeof(A_glActiveTexture), 0);
     a->texture = texture;
     VGLR_Commit();
@@ -86,7 +87,8 @@ typedef struct {
 
 void VGLR_glAttachShader(GLuint prog, GLuint shad)
 {
-    if (!s_threaded) { glAttachShader(prog, shad); return; }
+    VGLR_GAME_FENCE();
+    if (VGLR_Direct()) { glAttachShader(prog, shad); return; }
     A_glAttachShader* a = (A_glAttachShader*)VGLR_Reserve(OP_glAttachShader, sizeof(A_glAttachShader), 0);
     a->prog = prog;
     a->shad = shad;
@@ -100,8 +102,9 @@ typedef struct {
 
 void VGLR_glBindBuffer(GLenum target, GLuint buffer)
 {
+    VGLR_GAME_FENCE();
     if (target == GL_ARRAY_BUFFER) s_sh.arrayBuffer = buffer;
-    if (!s_threaded) { glBindBuffer(target, buffer); return; }
+    if (VGLR_Direct()) { glBindBuffer(target, buffer); return; }
     A_glBindBuffer* a = (A_glBindBuffer*)VGLR_Reserve(OP_glBindBuffer, sizeof(A_glBindBuffer), 0);
     a->target = target;
     a->buffer = buffer;
@@ -115,8 +118,9 @@ typedef struct {
 
 void VGLR_glBindFramebuffer(GLenum target, GLuint framebuffer)
 {
+    VGLR_GAME_FENCE();
     VGLR_Shadow_BindFramebuffer(target, framebuffer);
-    if (!s_threaded) { glBindFramebuffer(target, framebuffer); return; }
+    if (VGLR_Direct()) { glBindFramebuffer(target, framebuffer); return; }
     A_glBindFramebuffer* a = (A_glBindFramebuffer*)VGLR_Reserve(OP_glBindFramebuffer, sizeof(A_glBindFramebuffer), 0);
     a->target = target;
     a->framebuffer = framebuffer;
@@ -130,7 +134,8 @@ typedef struct {
 
 void VGLR_glBindRenderbuffer(GLenum target, GLuint renderbuffer)
 {
-    if (!s_threaded) { glBindRenderbuffer(target, renderbuffer); return; }
+    VGLR_GAME_FENCE();
+    if (VGLR_Direct()) { glBindRenderbuffer(target, renderbuffer); return; }
     A_glBindRenderbuffer* a = (A_glBindRenderbuffer*)VGLR_Reserve(OP_glBindRenderbuffer, sizeof(A_glBindRenderbuffer), 0);
     a->target = target;
     a->renderbuffer = renderbuffer;
@@ -144,8 +149,9 @@ typedef struct {
 
 void VGLR_glBindTexture(GLenum target, GLuint texture)
 {
+    VGLR_GAME_FENCE();
     if (target == GL_TEXTURE_2D && s_sh.activeUnit - GL_TEXTURE0 < 32u) { if (s_sh.tex2D[s_sh.activeUnit - GL_TEXTURE0] == texture) return; s_sh.tex2D[s_sh.activeUnit - GL_TEXTURE0] = texture; }
-    if (!s_threaded) { glBindTexture(target, texture); return; }
+    if (VGLR_Direct()) { glBindTexture(target, texture); return; }
     A_glBindTexture* a = (A_glBindTexture*)VGLR_Reserve(OP_glBindTexture, sizeof(A_glBindTexture), 0);
     a->target = target;
     a->texture = texture;
@@ -158,8 +164,9 @@ typedef struct {
 
 void VGLR_glBindVertexArray(GLuint array)
 {
+    VGLR_GAME_FENCE();
     s_sh.vao = array;
-    if (!s_threaded) { glBindVertexArray(array); return; }
+    if (VGLR_Direct()) { glBindVertexArray(array); return; }
     A_glBindVertexArray* a = (A_glBindVertexArray*)VGLR_Reserve(OP_glBindVertexArray, sizeof(A_glBindVertexArray), 0);
     a->array = array;
     VGLR_Commit();
@@ -171,8 +178,9 @@ typedef struct {
 
 void VGLR_glBlendEquation(GLenum mode)
 {
+    VGLR_GAME_FENCE();
     s_sh.blendEq[0] = s_sh.blendEq[1] = mode;
-    if (!s_threaded) { glBlendEquation(mode); return; }
+    if (VGLR_Direct()) { glBlendEquation(mode); return; }
     A_glBlendEquation* a = (A_glBlendEquation*)VGLR_Reserve(OP_glBlendEquation, sizeof(A_glBlendEquation), 0);
     a->mode = mode;
     VGLR_Commit();
@@ -185,8 +193,9 @@ typedef struct {
 
 void VGLR_glBlendEquationSeparate(GLenum modeRGB, GLenum modeAlpha)
 {
+    VGLR_GAME_FENCE();
     s_sh.blendEq[0] = modeRGB; s_sh.blendEq[1] = modeAlpha;
-    if (!s_threaded) { glBlendEquationSeparate(modeRGB, modeAlpha); return; }
+    if (VGLR_Direct()) { glBlendEquationSeparate(modeRGB, modeAlpha); return; }
     A_glBlendEquationSeparate* a = (A_glBlendEquationSeparate*)VGLR_Reserve(OP_glBlendEquationSeparate, sizeof(A_glBlendEquationSeparate), 0);
     a->modeRGB = modeRGB;
     a->modeAlpha = modeAlpha;
@@ -200,8 +209,9 @@ typedef struct {
 
 void VGLR_glBlendFunc(GLenum sfactor, GLenum dfactor)
 {
+    VGLR_GAME_FENCE();
     s_sh.blend[0] = s_sh.blend[2] = sfactor; s_sh.blend[1] = s_sh.blend[3] = dfactor;
-    if (!s_threaded) { glBlendFunc(sfactor, dfactor); return; }
+    if (VGLR_Direct()) { glBlendFunc(sfactor, dfactor); return; }
     A_glBlendFunc* a = (A_glBlendFunc*)VGLR_Reserve(OP_glBlendFunc, sizeof(A_glBlendFunc), 0);
     a->sfactor = sfactor;
     a->dfactor = dfactor;
@@ -217,8 +227,9 @@ typedef struct {
 
 void VGLR_glBlendFuncSeparate(GLenum srcRGB, GLenum dstRGB, GLenum srcAlpha, GLenum dstAlpha)
 {
+    VGLR_GAME_FENCE();
     s_sh.blend[0] = srcRGB; s_sh.blend[1] = dstRGB; s_sh.blend[2] = srcAlpha; s_sh.blend[3] = dstAlpha;
-    if (!s_threaded) { glBlendFuncSeparate(srcRGB, dstRGB, srcAlpha, dstAlpha); return; }
+    if (VGLR_Direct()) { glBlendFuncSeparate(srcRGB, dstRGB, srcAlpha, dstAlpha); return; }
     A_glBlendFuncSeparate* a = (A_glBlendFuncSeparate*)VGLR_Reserve(OP_glBlendFuncSeparate, sizeof(A_glBlendFuncSeparate), 0);
     a->srcRGB = srcRGB;
     a->dstRGB = dstRGB;
@@ -242,7 +253,8 @@ typedef struct {
 
 void VGLR_glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter)
 {
-    if (!s_threaded) { glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter); return; }
+    VGLR_GAME_FENCE();
+    if (VGLR_Direct()) { glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter); return; }
     A_glBlitFramebuffer* a = (A_glBlitFramebuffer*)VGLR_Reserve(OP_glBlitFramebuffer, sizeof(A_glBlitFramebuffer), 0);
     a->srcX0 = srcX0;
     a->srcY0 = srcY0;
@@ -263,7 +275,8 @@ typedef struct {
 
 void VGLR_glClear(GLbitfield mask)
 {
-    if (!s_threaded) { glClear(mask); return; }
+    VGLR_GAME_FENCE();
+    if (VGLR_Direct()) { glClear(mask); return; }
     A_glClear* a = (A_glClear*)VGLR_Reserve(OP_glClear, sizeof(A_glClear), 0);
     a->mask = mask;
     VGLR_Commit();
@@ -278,8 +291,9 @@ typedef struct {
 
 void VGLR_glClearColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha)
 {
+    VGLR_GAME_FENCE();
     s_sh.clear[0] = red; s_sh.clear[1] = green; s_sh.clear[2] = blue; s_sh.clear[3] = alpha;
-    if (!s_threaded) { glClearColor(red, green, blue, alpha); return; }
+    if (VGLR_Direct()) { glClearColor(red, green, blue, alpha); return; }
     A_glClearColor* a = (A_glClearColor*)VGLR_Reserve(OP_glClearColor, sizeof(A_glClearColor), 0);
     a->red = red;
     a->green = green;
@@ -294,7 +308,8 @@ typedef struct {
 
 void VGLR_glClearDepthf(GLclampf depth)
 {
-    if (!s_threaded) { glClearDepthf(depth); return; }
+    VGLR_GAME_FENCE();
+    if (VGLR_Direct()) { glClearDepthf(depth); return; }
     A_glClearDepthf* a = (A_glClearDepthf*)VGLR_Reserve(OP_glClearDepthf, sizeof(A_glClearDepthf), 0);
     a->depth = depth;
     VGLR_Commit();
@@ -306,7 +321,8 @@ typedef struct {
 
 void VGLR_glCompileShader(GLuint shader)
 {
-    if (!s_threaded) { glCompileShader(shader); return; }
+    VGLR_GAME_FENCE();
+    if (VGLR_Direct()) { glCompileShader(shader); return; }
     A_glCompileShader* a = (A_glCompileShader*)VGLR_Reserve(OP_glCompileShader, sizeof(A_glCompileShader), 0);
     a->shader = shader;
     VGLR_Commit();
@@ -325,7 +341,8 @@ typedef struct {
 
 void VGLR_glCopyTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y, GLsizei width, GLsizei height)
 {
-    if (!s_threaded) { glCopyTexSubImage2D(target, level, xoffset, yoffset, x, y, width, height); return; }
+    VGLR_GAME_FENCE();
+    if (VGLR_Direct()) { glCopyTexSubImage2D(target, level, xoffset, yoffset, x, y, width, height); return; }
     A_glCopyTexSubImage2D* a = (A_glCopyTexSubImage2D*)VGLR_Reserve(OP_glCopyTexSubImage2D, sizeof(A_glCopyTexSubImage2D), 0);
     a->target = target;
     a->level = level;
@@ -344,8 +361,9 @@ typedef struct {
 
 void VGLR_glDeleteProgram(GLuint prog)
 {
+    VGLR_GAME_FENCE();
     if (s_sh.program == prog) s_sh.program = 0; VGLR_UniformCacheClear();
-    if (!s_threaded) { glDeleteProgram(prog); return; }
+    if (VGLR_Direct()) { glDeleteProgram(prog); return; }
     A_glDeleteProgram* a = (A_glDeleteProgram*)VGLR_Reserve(OP_glDeleteProgram, sizeof(A_glDeleteProgram), 0);
     a->prog = prog;
     VGLR_Commit();
@@ -357,7 +375,8 @@ typedef struct {
 
 void VGLR_glDeleteShader(GLuint shad)
 {
-    if (!s_threaded) { glDeleteShader(shad); return; }
+    VGLR_GAME_FENCE();
+    if (VGLR_Direct()) { glDeleteShader(shad); return; }
     A_glDeleteShader* a = (A_glDeleteShader*)VGLR_Reserve(OP_glDeleteShader, sizeof(A_glDeleteShader), 0);
     a->shad = shad;
     VGLR_Commit();
@@ -369,8 +388,9 @@ typedef struct {
 
 void VGLR_glDepthFunc(GLenum func)
 {
+    VGLR_GAME_FENCE();
     s_sh.depthFunc = func;
-    if (!s_threaded) { glDepthFunc(func); return; }
+    if (VGLR_Direct()) { glDepthFunc(func); return; }
     A_glDepthFunc* a = (A_glDepthFunc*)VGLR_Reserve(OP_glDepthFunc, sizeof(A_glDepthFunc), 0);
     a->func = func;
     VGLR_Commit();
@@ -382,7 +402,8 @@ typedef struct {
 
 void VGLR_glDepthMask(GLboolean flag)
 {
-    if (!s_threaded) { glDepthMask(flag); return; }
+    VGLR_GAME_FENCE();
+    if (VGLR_Direct()) { glDepthMask(flag); return; }
     A_glDepthMask* a = (A_glDepthMask*)VGLR_Reserve(OP_glDepthMask, sizeof(A_glDepthMask), 0);
     a->flag = flag;
     VGLR_Commit();
@@ -394,8 +415,9 @@ typedef struct {
 
 void VGLR_glDisable(GLenum cap)
 {
+    VGLR_GAME_FENCE();
     VGLR_Shadow_Cap(cap, 0);
-    if (!s_threaded) { glDisable(cap); return; }
+    if (VGLR_Direct()) { glDisable(cap); return; }
     A_glDisable* a = (A_glDisable*)VGLR_Reserve(OP_glDisable, sizeof(A_glDisable), 0);
     a->cap = cap;
     VGLR_Commit();
@@ -409,7 +431,8 @@ typedef struct {
 
 void VGLR_glDrawArrays(GLenum mode, GLint first, GLsizei count)
 {
-    if (!s_threaded) { glDrawArrays(mode, first, count); return; }
+    VGLR_GAME_FENCE();
+    if (VGLR_Direct()) { glDrawArrays(mode, first, count); return; }
     A_glDrawArrays* a = (A_glDrawArrays*)VGLR_Reserve(OP_glDrawArrays, sizeof(A_glDrawArrays), 0);
     a->mode = mode;
     a->first = first;
@@ -423,8 +446,9 @@ typedef struct {
 
 void VGLR_glEnable(GLenum cap)
 {
+    VGLR_GAME_FENCE();
     VGLR_Shadow_Cap(cap, 1);
-    if (!s_threaded) { glEnable(cap); return; }
+    if (VGLR_Direct()) { glEnable(cap); return; }
     A_glEnable* a = (A_glEnable*)VGLR_Reserve(OP_glEnable, sizeof(A_glEnable), 0);
     a->cap = cap;
     VGLR_Commit();
@@ -436,7 +460,8 @@ typedef struct {
 
 void VGLR_glEnableVertexAttribArray(GLuint index)
 {
-    if (!s_threaded) { glEnableVertexAttribArray(index); return; }
+    VGLR_GAME_FENCE();
+    if (VGLR_Direct()) { glEnableVertexAttribArray(index); return; }
     A_glEnableVertexAttribArray* a = (A_glEnableVertexAttribArray*)VGLR_Reserve(OP_glEnableVertexAttribArray, sizeof(A_glEnableVertexAttribArray), 0);
     a->index = index;
     VGLR_Commit();
@@ -451,7 +476,8 @@ typedef struct {
 
 void VGLR_glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer)
 {
-    if (!s_threaded) { glFramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer); return; }
+    VGLR_GAME_FENCE();
+    if (VGLR_Direct()) { glFramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer); return; }
     A_glFramebufferRenderbuffer* a = (A_glFramebufferRenderbuffer*)VGLR_Reserve(OP_glFramebufferRenderbuffer, sizeof(A_glFramebufferRenderbuffer), 0);
     a->target = target;
     a->attachment = attachment;
@@ -470,8 +496,9 @@ typedef struct {
 
 void VGLR_glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level)
 {
+    VGLR_GAME_FENCE();
     VGLR_MemTexFbo(texture);
-    if (!s_threaded) { glFramebufferTexture2D(target, attachment, textarget, texture, level); return; }
+    if (VGLR_Direct()) { glFramebufferTexture2D(target, attachment, textarget, texture, level); return; }
     A_glFramebufferTexture2D* a = (A_glFramebufferTexture2D*)VGLR_Reserve(OP_glFramebufferTexture2D, sizeof(A_glFramebufferTexture2D), 0);
     a->target = target;
     a->attachment = attachment;
@@ -487,7 +514,8 @@ typedef struct {
 
 void VGLR_glGenerateMipmap(GLenum target)
 {
-    if (!s_threaded) { glGenerateMipmap(target); return; }
+    VGLR_GAME_FENCE();
+    if (VGLR_Direct()) { glGenerateMipmap(target); return; }
     A_glGenerateMipmap* a = (A_glGenerateMipmap*)VGLR_Reserve(OP_glGenerateMipmap, sizeof(A_glGenerateMipmap), 0);
     a->target = target;
     VGLR_Commit();
@@ -499,7 +527,8 @@ typedef struct {
 
 void VGLR_glLineWidth(GLfloat width)
 {
-    if (!s_threaded) { glLineWidth(width); return; }
+    VGLR_GAME_FENCE();
+    if (VGLR_Direct()) { glLineWidth(width); return; }
     A_glLineWidth* a = (A_glLineWidth*)VGLR_Reserve(OP_glLineWidth, sizeof(A_glLineWidth), 0);
     a->width = width;
     VGLR_Commit();
@@ -511,8 +540,9 @@ typedef struct {
 
 void VGLR_glLinkProgram(GLuint progr)
 {
+    VGLR_GAME_FENCE();
     VGLR_UniformCacheClear();
-    if (!s_threaded) { glLinkProgram(progr); return; }
+    if (VGLR_Direct()) { glLinkProgram(progr); return; }
     A_glLinkProgram* a = (A_glLinkProgram*)VGLR_Reserve(OP_glLinkProgram, sizeof(A_glLinkProgram), 0);
     a->progr = progr;
     VGLR_Commit();
@@ -525,7 +555,8 @@ typedef struct {
 
 void VGLR_glPolygonOffset(GLfloat factor, GLfloat units)
 {
-    if (!s_threaded) { glPolygonOffset(factor, units); return; }
+    VGLR_GAME_FENCE();
+    if (VGLR_Direct()) { glPolygonOffset(factor, units); return; }
     A_glPolygonOffset* a = (A_glPolygonOffset*)VGLR_Reserve(OP_glPolygonOffset, sizeof(A_glPolygonOffset), 0);
     a->factor = factor;
     a->units = units;
@@ -538,7 +569,8 @@ typedef struct {
 
 void VGLR_glReadBuffer(GLenum mode)
 {
-    if (!s_threaded) { glReadBuffer(mode); return; }
+    VGLR_GAME_FENCE();
+    if (VGLR_Direct()) { glReadBuffer(mode); return; }
     A_glReadBuffer* a = (A_glReadBuffer*)VGLR_Reserve(OP_glReadBuffer, sizeof(A_glReadBuffer), 0);
     a->mode = mode;
     VGLR_Commit();
@@ -553,8 +585,9 @@ typedef struct {
 
 void VGLR_glRenderbufferStorage(GLenum target, GLenum internalformat, GLsizei width, GLsizei height)
 {
+    VGLR_GAME_FENCE();
     VGLR_MemRb(width, height);
-    if (!s_threaded) { glRenderbufferStorage(target, internalformat, width, height); return; }
+    if (VGLR_Direct()) { glRenderbufferStorage(target, internalformat, width, height); return; }
     A_glRenderbufferStorage* a = (A_glRenderbufferStorage*)VGLR_Reserve(OP_glRenderbufferStorage, sizeof(A_glRenderbufferStorage), 0);
     a->target = target;
     a->internalformat = internalformat;
@@ -572,8 +605,9 @@ typedef struct {
 
 void VGLR_glScissor(GLint x, GLint y, GLsizei width, GLsizei height)
 {
+    VGLR_GAME_FENCE();
     s_sh.scissor[0] = x; s_sh.scissor[1] = y; s_sh.scissor[2] = width; s_sh.scissor[3] = height; s_sh.scissorValid = 1;
-    if (!s_threaded) { glScissor(x, y, width, height); return; }
+    if (VGLR_Direct()) { glScissor(x, y, width, height); return; }
     A_glScissor* a = (A_glScissor*)VGLR_Reserve(OP_glScissor, sizeof(A_glScissor), 0);
     a->x = x;
     a->y = y;
@@ -590,7 +624,8 @@ typedef struct {
 
 void VGLR_glStencilFunc(GLenum func, GLint ref, GLuint mask)
 {
-    if (!s_threaded) { glStencilFunc(func, ref, mask); return; }
+    VGLR_GAME_FENCE();
+    if (VGLR_Direct()) { glStencilFunc(func, ref, mask); return; }
     A_glStencilFunc* a = (A_glStencilFunc*)VGLR_Reserve(OP_glStencilFunc, sizeof(A_glStencilFunc), 0);
     a->func = func;
     a->ref = ref;
@@ -606,7 +641,8 @@ typedef struct {
 
 void VGLR_glStencilOp(GLenum sfail, GLenum dpfail, GLenum dppass)
 {
-    if (!s_threaded) { glStencilOp(sfail, dpfail, dppass); return; }
+    VGLR_GAME_FENCE();
+    if (VGLR_Direct()) { glStencilOp(sfail, dpfail, dppass); return; }
     A_glStencilOp* a = (A_glStencilOp*)VGLR_Reserve(OP_glStencilOp, sizeof(A_glStencilOp), 0);
     a->sfail = sfail;
     a->dpfail = dpfail;
@@ -622,7 +658,8 @@ typedef struct {
 
 void VGLR_glTexParameterf(GLenum target, GLenum pname, GLfloat param)
 {
-    if (!s_threaded) { glTexParameterf(target, pname, param); return; }
+    VGLR_GAME_FENCE();
+    if (VGLR_Direct()) { glTexParameterf(target, pname, param); return; }
     A_glTexParameterf* a = (A_glTexParameterf*)VGLR_Reserve(OP_glTexParameterf, sizeof(A_glTexParameterf), 0);
     a->target = target;
     a->pname = pname;
@@ -638,7 +675,8 @@ typedef struct {
 
 void VGLR_glTexParameteri(GLenum target, GLenum pname, GLint param)
 {
-    if (!s_threaded) { glTexParameteri(target, pname, param); return; }
+    VGLR_GAME_FENCE();
+    if (VGLR_Direct()) { glTexParameteri(target, pname, param); return; }
     A_glTexParameteri* a = (A_glTexParameteri*)VGLR_Reserve(OP_glTexParameteri, sizeof(A_glTexParameteri), 0);
     a->target = target;
     a->pname = pname;
@@ -653,8 +691,9 @@ typedef struct {
 
 void VGLR_glUniform1f(GLint location, GLfloat v0)
 {
+    VGLR_GAME_FENCE();
     if (VGLR_UniformSame(location, &v0, 4)) return;
-    if (!s_threaded) { glUniform1f(location, v0); return; }
+    if (VGLR_Direct()) { glUniform1f(location, v0); return; }
     A_glUniform1f* a = (A_glUniform1f*)VGLR_Reserve(OP_glUniform1f, sizeof(A_glUniform1f), 0);
     a->location = location;
     a->v0 = v0;
@@ -668,8 +707,9 @@ typedef struct {
 
 void VGLR_glUniform1i(GLint location, GLint v0)
 {
+    VGLR_GAME_FENCE();
     if (VGLR_UniformSame(location, &v0, 4)) return;
-    if (!s_threaded) { glUniform1i(location, v0); return; }
+    if (VGLR_Direct()) { glUniform1i(location, v0); return; }
     A_glUniform1i* a = (A_glUniform1i*)VGLR_Reserve(OP_glUniform1i, sizeof(A_glUniform1i), 0);
     a->location = location;
     a->v0 = v0;
@@ -684,8 +724,9 @@ typedef struct {
 
 void VGLR_glUniform2f(GLint location, GLfloat v0, GLfloat v1)
 {
+    VGLR_GAME_FENCE();
     { const GLfloat t[2] = { v0, v1 }; if (VGLR_UniformSame(location, t, 8)) return; }
-    if (!s_threaded) { glUniform2f(location, v0, v1); return; }
+    if (VGLR_Direct()) { glUniform2f(location, v0, v1); return; }
     A_glUniform2f* a = (A_glUniform2f*)VGLR_Reserve(OP_glUniform2f, sizeof(A_glUniform2f), 0);
     a->location = location;
     a->v0 = v0;
@@ -703,8 +744,9 @@ typedef struct {
 
 void VGLR_glUniform4f(GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3)
 {
+    VGLR_GAME_FENCE();
     { const GLfloat t[4] = { v0, v1, v2, v3 }; if (VGLR_UniformSame(location, t, 16)) return; }
-    if (!s_threaded) { glUniform4f(location, v0, v1, v2, v3); return; }
+    if (VGLR_Direct()) { glUniform4f(location, v0, v1, v2, v3); return; }
     A_glUniform4f* a = (A_glUniform4f*)VGLR_Reserve(OP_glUniform4f, sizeof(A_glUniform4f), 0);
     a->location = location;
     a->v0 = v0;
@@ -720,8 +762,9 @@ typedef struct {
 
 void VGLR_glUseProgram(GLuint program)
 {
+    VGLR_GAME_FENCE();
     s_sh.program = program;
-    if (!s_threaded) { glUseProgram(program); return; }
+    if (VGLR_Direct()) { glUseProgram(program); return; }
     A_glUseProgram* a = (A_glUseProgram*)VGLR_Reserve(OP_glUseProgram, sizeof(A_glUseProgram), 0);
     a->program = program;
     VGLR_Commit();
@@ -736,8 +779,9 @@ typedef struct {
 
 void VGLR_glViewport(GLint x, GLint y, GLsizei width, GLsizei height)
 {
+    VGLR_GAME_FENCE();
     s_sh.viewport[0] = x; s_sh.viewport[1] = y; s_sh.viewport[2] = width; s_sh.viewport[3] = height; s_sh.viewportValid = 1;
-    if (!s_threaded) { glViewport(x, y, width, height); return; }
+    if (VGLR_Direct()) { glViewport(x, y, width, height); return; }
     A_glViewport* a = (A_glViewport*)VGLR_Reserve(OP_glViewport, sizeof(A_glViewport), 0);
     a->x = x;
     a->y = y;
@@ -757,7 +801,8 @@ typedef struct {
 
 void VGLR_glVertexAttribPointer(GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const void * pointer)
 {
-    if (!s_threaded) { glVertexAttribPointer(index, size, type, normalized, stride, pointer); return; }
+    VGLR_GAME_FENCE();
+    if (VGLR_Direct()) { glVertexAttribPointer(index, size, type, normalized, stride, pointer); return; }
     A_glVertexAttribPointer* a = (A_glVertexAttribPointer*)VGLR_Reserve(OP_glVertexAttribPointer, sizeof(A_glVertexAttribPointer), 0);
     a->index = index;
     a->size = size;
@@ -774,7 +819,8 @@ typedef struct {
 
 void VGLR_vglWaitVblankStart(GLboolean enable)
 {
-    if (!s_threaded) { vglWaitVblankStart(enable); return; }
+    VGLR_GAME_FENCE();
+    if (VGLR_Direct()) { vglWaitVblankStart(enable); return; }
     A_vglWaitVblankStart* a = (A_vglWaitVblankStart*)VGLR_Reserve(OP_vglWaitVblankStart, sizeof(A_vglWaitVblankStart), 0);
     a->enable = enable;
     VGLR_Commit();
@@ -787,8 +833,9 @@ typedef struct {
 
 void VGLR_glPixelStorei(GLenum pname, GLint param)
 {
+    VGLR_GAME_FENCE();
     VGLR_TrackPixelStore(pname, param);
-    if (!s_threaded) { glPixelStorei(pname, param); return; }
+    if (VGLR_Direct()) { glPixelStorei(pname, param); return; }
     A_glPixelStorei* a = (A_glPixelStorei*)VGLR_Reserve(OP_glPixelStorei, sizeof(A_glPixelStorei), 0);
     a->pname = pname;
     a->param = param;
@@ -803,8 +850,9 @@ typedef struct {
 
 void VGLR_glUniform1iv(GLint location, GLsizei count, const GLint * value)
 {
+    VGLR_GAME_FENCE();
     if (count == 1 && VGLR_UniformSame(location, value, 4)) return;
-    if (!s_threaded) { glUniform1iv(location, count, value); return; }
+    if (VGLR_Direct()) { glUniform1iv(location, count, value); return; }
     const size_t pay = (size_t)count * 4;
     A_glUniform1iv* a = (A_glUniform1iv*)VGLR_Reserve(OP_glUniform1iv, sizeof(A_glUniform1iv), pay);
     a->location = location;
@@ -822,8 +870,9 @@ typedef struct {
 
 void VGLR_glUniform2fv(GLint location, GLsizei count, const GLfloat * value)
 {
+    VGLR_GAME_FENCE();
     if (count == 1 && VGLR_UniformSame(location, value, 8)) return;
-    if (!s_threaded) { glUniform2fv(location, count, value); return; }
+    if (VGLR_Direct()) { glUniform2fv(location, count, value); return; }
     const size_t pay = (size_t)count * 8;
     A_glUniform2fv* a = (A_glUniform2fv*)VGLR_Reserve(OP_glUniform2fv, sizeof(A_glUniform2fv), pay);
     a->location = location;
@@ -841,8 +890,9 @@ typedef struct {
 
 void VGLR_glUniform3fv(GLint location, GLsizei count, const GLfloat * value)
 {
+    VGLR_GAME_FENCE();
     if (count == 1 && VGLR_UniformSame(location, value, 12)) return;
-    if (!s_threaded) { glUniform3fv(location, count, value); return; }
+    if (VGLR_Direct()) { glUniform3fv(location, count, value); return; }
     const size_t pay = (size_t)count * 12;
     A_glUniform3fv* a = (A_glUniform3fv*)VGLR_Reserve(OP_glUniform3fv, sizeof(A_glUniform3fv), pay);
     a->location = location;
@@ -861,8 +911,9 @@ typedef struct {
 
 void VGLR_glUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat * value)
 {
+    VGLR_GAME_FENCE();
     if (count == 1 && !transpose && VGLR_UniformSame(location, value, 64)) return;
-    if (!s_threaded) { glUniformMatrix4fv(location, count, transpose, value); return; }
+    if (VGLR_Direct()) { glUniformMatrix4fv(location, count, transpose, value); return; }
     const size_t pay = (size_t)count * 64;
     A_glUniformMatrix4fv* a = (A_glUniformMatrix4fv*)VGLR_Reserve(OP_glUniformMatrix4fv, sizeof(A_glUniformMatrix4fv), pay);
     a->location = location;
@@ -880,8 +931,9 @@ typedef struct {
 
 void VGLR_glDeleteTextures(GLsizei n, const GLuint * textures)
 {
+    VGLR_GAME_FENCE();
     VGLR_Shadow_DeleteTextures(n, textures); VGLR_MemTexDelete(n, textures);
-    if (!s_threaded) { glDeleteTextures(n, textures); return; }
+    if (VGLR_Direct()) { glDeleteTextures(n, textures); return; }
     const size_t pay = (size_t)n * 4;
     A_glDeleteTextures* a = (A_glDeleteTextures*)VGLR_Reserve(OP_glDeleteTextures, sizeof(A_glDeleteTextures), pay);
     a->n = n;
@@ -897,8 +949,9 @@ typedef struct {
 
 void VGLR_glDeleteBuffers(GLsizei n, const GLuint * gl_buffers)
 {
+    VGLR_GAME_FENCE();
     VGLR_Shadow_DeleteNames(n, gl_buffers, &s_sh.arrayBuffer); VGLR_MemBufDelete(n, gl_buffers);
-    if (!s_threaded) { glDeleteBuffers(n, gl_buffers); return; }
+    if (VGLR_Direct()) { glDeleteBuffers(n, gl_buffers); return; }
     const size_t pay = (size_t)n * 4;
     A_glDeleteBuffers* a = (A_glDeleteBuffers*)VGLR_Reserve(OP_glDeleteBuffers, sizeof(A_glDeleteBuffers), pay);
     a->n = n;
@@ -914,8 +967,9 @@ typedef struct {
 
 void VGLR_glDeleteVertexArrays(GLsizei n, const GLuint * gl_arrays)
 {
+    VGLR_GAME_FENCE();
     VGLR_Shadow_DeleteNames(n, gl_arrays, &s_sh.vao);
-    if (!s_threaded) { glDeleteVertexArrays(n, gl_arrays); return; }
+    if (VGLR_Direct()) { glDeleteVertexArrays(n, gl_arrays); return; }
     const size_t pay = (size_t)n * 4;
     A_glDeleteVertexArrays* a = (A_glDeleteVertexArrays*)VGLR_Reserve(OP_glDeleteVertexArrays, sizeof(A_glDeleteVertexArrays), pay);
     a->n = n;
@@ -931,8 +985,9 @@ typedef struct {
 
 void VGLR_glDeleteFramebuffers(GLsizei n, const GLuint * framebuffers)
 {
+    VGLR_GAME_FENCE();
     VGLR_Shadow_DeleteNames(n, framebuffers, &s_sh.drawFbo); VGLR_Shadow_DeleteNames(n, framebuffers, &s_sh.readFbo);
-    if (!s_threaded) { glDeleteFramebuffers(n, framebuffers); return; }
+    if (VGLR_Direct()) { glDeleteFramebuffers(n, framebuffers); return; }
     const size_t pay = (size_t)n * 4;
     A_glDeleteFramebuffers* a = (A_glDeleteFramebuffers*)VGLR_Reserve(OP_glDeleteFramebuffers, sizeof(A_glDeleteFramebuffers), pay);
     a->n = n;
@@ -948,7 +1003,8 @@ typedef struct {
 
 void VGLR_glDeleteRenderbuffers(GLsizei n, const GLuint * renderbuffers)
 {
-    if (!s_threaded) { glDeleteRenderbuffers(n, renderbuffers); return; }
+    VGLR_GAME_FENCE();
+    if (VGLR_Direct()) { glDeleteRenderbuffers(n, renderbuffers); return; }
     const size_t pay = (size_t)n * 4;
     A_glDeleteRenderbuffers* a = (A_glDeleteRenderbuffers*)VGLR_Reserve(OP_glDeleteRenderbuffers, sizeof(A_glDeleteRenderbuffers), pay);
     a->n = n;
@@ -966,8 +1022,9 @@ typedef struct {
 
 void VGLR_glBufferData(GLenum target, GLsizei size, const GLvoid * data, GLenum usage)
 {
+    VGLR_GAME_FENCE();
     if (target == GL_ARRAY_BUFFER) VGLR_MemBuf(s_sh.arrayBuffer, (size_t)size);
-    if (!s_threaded) { glBufferData(target, size, data, usage); return; }
+    if (VGLR_Direct()) { glBufferData(target, size, data, usage); return; }
     const size_t pay = (data ? (size_t)size : 0);
     A_glBufferData* a = (A_glBufferData*)VGLR_Reserve(OP_glBufferData, sizeof(A_glBufferData), pay);
     a->target = target;
@@ -987,7 +1044,8 @@ typedef struct {
 
 void VGLR_glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void * data)
 {
-    if (!s_threaded) { glBufferSubData(target, offset, size, data); return; }
+    VGLR_GAME_FENCE();
+    if (VGLR_Direct()) { glBufferSubData(target, offset, size, data); return; }
     const size_t pay = (data ? (size_t)size : 0);
     A_glBufferSubData* a = (A_glBufferSubData*)VGLR_Reserve(OP_glBufferSubData, sizeof(A_glBufferSubData), pay);
     a->target = target;
@@ -1011,8 +1069,9 @@ typedef struct {
 
 void VGLR_glCompressedTexImage2D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLint border, GLsizei imageSize, const void * data)
 {
+    VGLR_GAME_FENCE();
     VGLR_MemTex(level, (uint32_t)internalformat, width, height, (size_t)imageSize);
-    if (!s_threaded) { glCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, data); return; }
+    if (VGLR_Direct()) { glCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, data); return; }
     const size_t pay = (data ? (size_t)imageSize : 0);
     A_glCompressedTexImage2D* a = (A_glCompressedTexImage2D*)VGLR_Reserve(OP_glCompressedTexImage2D, sizeof(A_glCompressedTexImage2D), pay);
     a->target = target;
@@ -1041,8 +1100,9 @@ typedef struct {
 
 void VGLR_glTexImage2D(GLenum target, GLint level, GLint internalFormat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const GLvoid * data)
 {
+    VGLR_GAME_FENCE();
     VGLR_MemTex(level, (uint32_t)internalFormat, width, height, VGLR_ImageBytes(width, height, format, type));
-    if (!s_threaded) { glTexImage2D(target, level, internalFormat, width, height, border, format, type, data); return; }
+    if (VGLR_Direct()) { glTexImage2D(target, level, internalFormat, width, height, border, format, type, data); return; }
     const size_t pay = (data ? VGLR_ImageBytes(width, height, format, type) : 0);
     A_glTexImage2D* a = (A_glTexImage2D*)VGLR_Reserve(OP_glTexImage2D, sizeof(A_glTexImage2D), pay);
     a->target = target;
@@ -1072,7 +1132,8 @@ typedef struct {
 
 void VGLR_glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid * pixels)
 {
-    if (!s_threaded) { glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixels); return; }
+    VGLR_GAME_FENCE();
+    if (VGLR_Direct()) { glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixels); return; }
     const size_t pay = (pixels ? VGLR_ImageBytes(width, height, format, type) : 0);
     A_glTexSubImage2D* a = (A_glTexSubImage2D*)VGLR_Reserve(OP_glTexSubImage2D, sizeof(A_glTexSubImage2D), pay);
     a->target = target;

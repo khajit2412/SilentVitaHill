@@ -181,6 +181,15 @@ Measure each with the [PHASE]/[SUBMIT]/[GPUDRAIN]/[PERF] lines, PGXP on and off.
     render thread (compare TPIDRURO with the render thread's value). The s_sh bind filter is
     invalidated at submit.
   - Frames with GPU_SPLIT_MODERN or FBCAPTURE splits run synchronously (game data / feedback state).
+- Implemented (2026-09-28, untested on device): frame jobs behind vita_frame_packet (default on,
+  0 = inline). The game thread batches the splits, resolves palettes and makes the shadow-map
+  decision, then VGLR_JobBegin/End copies a snapshot (GR_RSnap: ~50 game-written globals, read
+  through RS()), the split list and the vertices into the ring. The render thread runs
+  DrawSplitsExec (upload, shadow pass, split loop) with the recorders going direct (VGLR_Direct:
+  TPIDRURO compare, thread id fallback). Every game-thread recorder waits for pending jobs first
+  (VGLR_GAME_FENCE), as do GR_BeginScene / GR_Clear / GR_UpdateVRAM / readback / direct VRAM
+  upload / shader compile / feedback store. Modern-mesh and FBCAPTURE flushes run inline.
+  [FRAMEJOB] reports flushes per frame on each path; [SUBMIT] then measures render-thread time.
 - Done first (2026-09-28): per-program uniform signature (GR_VitaUniformsCurrent). ~30 uniform calls
   per draw are skipped when a program's inputs are unchanged. It targets most of the ~15k recorded
   commands a frame; measure [SUBMIT] splitLoop against the 3.5 ms before.

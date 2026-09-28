@@ -149,9 +149,10 @@ def main():
         # recorder
         out.append(decl(ret, n, params) + "\n{")
         call = ', '.join(p for t, p in params)
+        out.append("    VGLR_GAME_FENCE();")
         if n in HOOKS:
             out.append("    " + HOOKS[n])
-        out.append(f"    if (!s_threaded) {{ {n}({call}); return; }}")
+        out.append(f"    if (VGLR_Direct()) {{ {n}({call}); return; }}")
         if n in PAYLOAD:
             ptr, expr = PAYLOAD[n]
             out.append(f"    const size_t pay = {expr};")
