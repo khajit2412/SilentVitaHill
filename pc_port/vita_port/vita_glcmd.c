@@ -676,6 +676,27 @@ static void VGLR_DynUpdate(uint64_t waitUs)
     }
     s_dynWaitUs += waitUs;
     s_dynSince++;
+    {
+        /* Shadowed flashlight is the heaviest GPU load there is: go to the
+         * lower mode once it has been on for ~2 s instead of waiting for the
+         * queue to back up (each of those waits was a burst of hitches). */
+        extern int g_PsyX_FlashlightActive, g_PsyX_UseFlashlightShadows, g_PsyX_UsePerPixelFlashlight;
+        static uint32_t s_flOn;
+        const int heavy = g_PsyX_FlashlightActive && g_PsyX_UseFlashlightShadows && g_PsyX_UsePerPixelFlashlight;
+        s_flOn = heavy ? s_flOn + 1 : 0;
+        if (heavy && !s_dynLow && s_flOn == 60 && s_dynSince >= DYN_WINDOW)
+        {
+            s_dynLow = 1; s_dynPendW = s_dynLoW; s_dynPendH = s_dynLoH;
+            s_dynFrames = 0; s_dynWaitUs = 0;
+            if (g_ShDebugLog)
+                fprintf(g_ShDebugLog, "[DYNRES] -> %dx%d (shadowed flashlight)\n", s_dynPendW, s_dynPendH);
+            return;
+        }
+        if (heavy && s_dynLow)
+        {
+            s_dynCalm = 0;	/* stay low while the shadowed flashlight is on */
+        }
+    }
     if (++s_dynFrames < DYN_WINDOW)
         return;
     const uint64_t avg = s_dynWaitUs / s_dynFrames;

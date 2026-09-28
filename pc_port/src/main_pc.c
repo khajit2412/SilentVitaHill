@@ -67,6 +67,7 @@ void        Ios_EnsureModFolders(void);
 #include "sh_log.h"
 #include "psx_memory.h"
 #include "pc_config.h"
+#include "pc_mod_registry.h"
 #include "hires_override.h" /* HiresOverride_ClampBudgetToVram */
 #include "pc_audio_config.h"
 #include "pc_discord.h"
@@ -1728,6 +1729,16 @@ int main(int argc, char* argv[])
      * (declared in PsyX/PsyX_public.h, defined in PsyX_render.cpp) */
     g_PsxUsePgxp = g_PcConfig.usePgxp ? 1 : 0;
     SH_LOG("PGXP: %s", g_PsxUsePgxp ? "ON (perspective-correct, WIP)" : "off (affine)");
+#ifdef SH_VITA
+    {
+        extern int g_vitaShadowQuality;
+        const char* v = Pc_ModConfig_Value("vita_shadow_quality");
+        if (v)
+            g_vitaShadowQuality = atoi(v);
+        if (g_vitaShadowQuality != 128 && g_vitaShadowQuality != 512)
+            g_vitaShadowQuality = 256;
+    }
+#endif
 
     /* [ITEMDEPTH] one-shot item-model depth probe. Diagnostic only — the probe
      * reads state and never writes rendering state. */

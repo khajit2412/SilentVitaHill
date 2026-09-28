@@ -302,6 +302,14 @@ static void VitaGL_InitOnRenderThread(void* unused)
     /* Shadowed frames draw the scene twice; a parameter buffer that overflows
      * makes the GPU render the frame in partial passes. Default is 16 MB. */
     vglSetParamBufferSize(32 * 1024 * 1024);
+    {
+        /* Triple buffering stays the default: with two display buffers and no
+         * vsync wait the panel showed buffers still being drawn (flicker in
+         * every mode). vita_triple_buffer = 0 tries double buffering. */
+        extern const char* Pc_ModConfig_Value(const char* key);
+        const char* tb = Pc_ModConfig_Value("vita_triple_buffer");
+        vglUseTripleBuffering((tb && tb[0] == '0') ? GL_FALSE : GL_TRUE);
+    }
     /* Its frees run beside the game and render threads (cores 0 and 1). */
     vglSetupGarbageCollector(0x10000100, VGLR_HelperCoreMask());
     vglInitExtended(0, VITA_SCREEN_W, VITA_SCREEN_H,

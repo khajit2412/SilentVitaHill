@@ -217,6 +217,12 @@ static const char* const LBL_VSYNC[] = { "Off", "On" };
 static const char* const LBL_FILT[]  = { "Off", "Dither", "Bilinear", "Trilinear",
                                          "Aniso_2x", "Aniso_4x", "Aniso_8x", "Aniso_16x" };
 static const char* const LBL_ONOFF[] = { "Off", "On" };
+#if defined(SH_VITA)
+/* Flashlight shadow map resolution. */
+extern int g_vitaShadowQuality;
+static const int VAL_SHQ[] = { 256, 512, 128 };
+static const char* const LBL_SHQ[] = { "Normal", "Fine", "Soft" };
+#endif
 static const char* const LBL_AA[]    = { "Off", "2x", "4x", "8x" };
 static const char* const LBL_POST[]  = { "Off", "CRT", "Scanlines", "Vignette", "Color_Grade", "Film_Grain", "Sharpen", "PSX_Retro", "Cinematic" };
 static const char* const LBL_TONE[]  = { "Off", "Reinhard", "ACES", "Filmic" };
@@ -252,6 +258,9 @@ static const s_PcOpt PCOPT_G[] = {
     { "VSync",          &g_PcConfig.vsync,              "vsync",                VAL_VSYNC, 2, LBL_VSYNC, NULL,                          1, PCK_VSYNC   },
     { "Texture_Filter", &g_PcConfig.psxDither,          "psx_dither",           VAL_FILT,  8, LBL_FILT,  NULL,                          1, PCK_FILTER },
     { "PGXP",           &g_PcConfig.usePgxp,            "use_pgxp",             VAL_ONOFF, 2, LBL_ONOFF, &g_PsxUsePgxp,                 1, PCK_INT    },
+#if defined(SH_VITA)
+    { "Shadow_Quality", &g_vitaShadowQuality,          "vita_shadow_quality",  VAL_SHQ,   3, LBL_SHQ,   NULL,                          1, PCK_INT    },
+#endif
     { "Antialiasing",   &g_PcConfig.msaaSamples,        "msaa",                 VAL_AA,    4, LBL_AA,    NULL,                          0, PCK_INT    },
     { "Post_Process",   &g_PcConfig.postProcess,        "post_process",         VAL_POST,  9, LBL_POST,  &g_cfg_postProcess,            1, PCK_INT    },
     { "Tone_Mapping",   &g_PcConfig.tonemap,            "tonemap",              VAL_TONE,  4, LBL_TONE,  &g_cfg_tonemap,                1, PCK_INT    },

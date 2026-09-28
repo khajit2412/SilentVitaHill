@@ -2279,9 +2279,6 @@ void func_80057344(s_ModelInfo* modelInfo, GsOT_TAG* otTag, bool arg2, MATRIX* m
 
     for (curMeshHdr = modelHdr->meshHdrs; curMeshHdr < &modelHdr->meshHdrs[modelHdr->meshCount]; curMeshHdr++)
     {
-#ifdef SH_VITA
-        unsigned long long tA = Pc_ProfNowUs(), tB, tC, tD;
-#endif
         if (vertOffset != 0 || normalOffset != 0)
         {
             func_8005759C(curMeshHdr, scratchData, vertOffset, normalOffset);
@@ -2290,9 +2287,6 @@ void func_80057344(s_ModelInfo* modelInfo, GsOT_TAG* otTag, bool arg2, MATRIX* m
         {
             func_800574D4(curMeshHdr, scratchData);
         }
-#ifdef SH_VITA
-        tB = Pc_ProfNowUs();
-#endif
 
         switch (g_WorldEnvWork.field_0)
         {
@@ -2308,21 +2302,9 @@ void func_80057344(s_ModelInfo* modelInfo, GsOT_TAG* otTag, bool arg2, MATRIX* m
                 break;
         }
 
-#ifdef SH_VITA
-        g_vitaProfUnlit[3] += Pc_ProfNowUs() - tB;
-#endif
         func_80057B7C(curMeshHdr, vertOffset, scratchData, mat);
-#ifdef SH_VITA
-        tC = Pc_ProfNowUs();
-#endif
 
         Gfx_MeshDraw(curMeshHdr, scratchData, otTag, arg2);
-#ifdef SH_VITA
-        tD = Pc_ProfNowUs();
-        g_vitaProfUnlit[0] += tB - tA;
-        g_vitaProfUnlit[1] += tC - tB;
-        g_vitaProfUnlit[2] += tD - tC;
-#endif
     }
 
 }

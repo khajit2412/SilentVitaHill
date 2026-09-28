@@ -2853,6 +2853,18 @@ void MainLoop(void) // 0x80032EE0
                                      (g_SysWork.sysState == SysState_Gameplay ||
                                       g_SysWork.sysState == SysState_GamePaused) &&
                                      ScreenFade_IsNone()) ? 1 : 0;
+            {
+                /* [SHADOWGATE]: which term closes the gate, logged on each flip. */
+                static int s_prevAllowed = -1, s_gateLogs = 0;
+                if (g_PsyX_ShadowsAllowed != s_prevAllowed && s_gateLogs < 60)
+                {
+                    s_gateLogs++;
+                    SH_DBG("[SHADOWGATE] allowed=%d gameState=%d sysState=%d fadeNone=%d",
+                           g_PsyX_ShadowsAllowed, (int)g_GameWork.gameState,
+                           (int)g_SysWork.sysState, ScreenFade_IsNone() ? 1 : 0);
+                }
+                s_prevAllowed = g_PsyX_ShadowsAllowed;
+            }
         }
 
         /* Release the freeze-frame the instant the world item-pickup ends
@@ -3308,6 +3320,26 @@ void MainLoop(void) // 0x80032EE0
                         s_perfFlMs[g_PsyX_FlashlightActive ? 1 : 0] += dt;
                         s_perfFlFrames[g_PsyX_FlashlightActive ? 1 : 0]++;
                     }
+#ifdef SH_VITA
+                    {
+                        /* [HITCH]: a long live-gameplay frame and what it did, so a
+                         * stutter can be told apart from disc reads or uploads. */
+                        extern int g_cdcStats[2];
+                        extern unsigned g_PsyX_VramUploads;
+                        static int s_hitchCdMiss = 0, s_hitchLogs = 0;
+                        static unsigned s_hitchVram = 0;
+                        if (dt >= 70 && g_PcWorldDrawnThisFrame && !g_PsxPresentLastFrame && s_hitchLogs < 200)
+                        {
+                            s_hitchLogs++;
+                            SH_DBG("[HITCH] %lu ms: disc sectors read=%d, vram uploads=%u, flashlight=%d",
+                                   (unsigned long)dt, g_cdcStats[1] - s_hitchCdMiss,
+                                   g_PsyX_VramUploads >= s_hitchVram ? g_PsyX_VramUploads - s_hitchVram : g_PsyX_VramUploads,
+                                   g_PsyX_FlashlightActive);
+                        }
+                        s_hitchCdMiss = g_cdcStats[1];
+                        s_hitchVram = g_PsyX_VramUploads;
+                    }
+#endif
                     if (dt > s_perfWorstMs)
                         s_perfWorstMs = dt;
 
