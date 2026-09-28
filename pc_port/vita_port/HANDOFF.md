@@ -161,6 +161,29 @@ Measure each with the [PHASE]/[SUBMIT]/[GPUDRAIN]/[PERF] lines, PGXP on and off.
   render-thread-only. Any GR_* entry point reachable from the game thread mid-frame (LoadImage/VRAM
   upload, clears, captures, hi-res uploads) must either record into the ring (ordered after the job)
   or wait for the job; audit them before switching it on. Config switch vita_frame_packet.
+- Audit (2026-09-28):
+  - Frame order: game logic N+1 (~20 ms, no GL) follows EndScene N. BeginScene only comes at N+1's
+    first DrawOTag. So a job holding frame N's upload + shadow pass + split loop (~6 ms) finishes
+    inside that window. A fence (wait for jobs) at every game-thread GL entry point then costs
+    nothing in steady state: GR_BeginScene / GR_Clear / GR_ClearVRAM / GR_UpdateVRAM (when dirty) /
+    GR_CopyVRAM / readbacks / palette-texture builds (cache misses only) / hi-res uploads / fbstore
+    and freeze capture (only when they do work) / the dev console hook.
+  - Keep Vita_BatchSplits and palette resolution (GR_VitaPaletteTexture reads the CPU VRAM mirror) on
+    the game thread; store palTex/palOpaque in the split. Keep the shadow-map decision
+    (ShadowCasterHash, GR_ShadowMapCurrent, GR_BuildShadowMatrix) there too.
+  - Snapshot: the draw loop reads ~65 game-written globals.
+    - GR_SetTextureShader: fog, flashlight, dither/filter, PGXP szMax/far-W, present-last-frame,
+      shadow matrix/near/far.
+    - GR_SetOffscreenState (375 lines): widescreen/Hor+, g_PcUiRect/HudRect, g_PsxUIOrthoPass,
+      g_PsxWorld*, cutscene scale, activeDispEnv.
+    Plan: stage A moves those reads onto a RenderSnap filled at DrawAllSplits (no threading, must
+    look identical). Stage B runs the job on the render thread. The VGLR wrappers go direct on the
+    render thread (compare TPIDRURO with the render thread's value). The s_sh bind filter is
+    invalidated at submit.
+  - Frames with GPU_SPLIT_MODERN or FBCAPTURE splits run synchronously (game data / feedback state).
+- Done first (2026-09-28): per-program uniform signature (GR_VitaUniformsCurrent). ~30 uniform calls
+  per draw are skipped when a program's inputs are unchanged. It targets most of the ~15k recorded
+  commands a frame; measure [SUBMIT] splitLoop against the 3.5 ms before.
 
 ## Next optimizations (research, 2026-09-27)
 1. Build vitaGL ourselves with CTR's flags: HAVE_SHADER_CACHE=1 NO_DEBUG=1 READBACKS_SPEEDHACK=1
