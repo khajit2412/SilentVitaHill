@@ -1667,6 +1667,14 @@ bool func_800CC6E8(s_800E34FC* arg0, s_800E330C* arg1, s32 mapId) // 0x800CC6E8
     return false;
 }
 
+/* The PSX stack puts sp30 32 bytes past sp10 and the original indexes it
+ * through &sp10; other compilers lay the stack out differently. */
+#ifdef SH_PC_PORT
+#define HULL_PT(i) sp30[i]
+#else
+#define HULL_PT(i) dVecPtr[(i) + 8]
+#endif
+
 s32 func_800CC8FC(VECTOR3* arg0, s32* arg1, s_func_800CC8FC* arg2) // 0x800CC8FC
 {
     SVECTOR            sp10;
@@ -1826,8 +1834,8 @@ s32 func_800CC8FC(VECTOR3* arg0, s32* arg1, s_func_800CC8FC* arg2) // 0x800CC8FC
 
         j = 0;
 
-        while ((ptr[ptr[j].field_5].field_0.vx - ptr[j].field_0.vx) * (dVecPtr[i + 8].vy - ptr[j].field_0.vy) >
-               (ptr[ptr[j].field_5].field_0.vy - ptr[j].field_0.vy) * (dVecPtr[i + 8].vx - ptr[j].field_0.vx))
+        while ((ptr[ptr[j].field_5].field_0.vx - ptr[j].field_0.vx) * (HULL_PT(i).vy - ptr[j].field_0.vy) >
+               (ptr[ptr[j].field_5].field_0.vy - ptr[j].field_0.vy) * (HULL_PT(i).vx - ptr[j].field_0.vx))
         {
             j = ptr[j].field_5;
         }
@@ -1836,8 +1844,8 @@ s32 func_800CC8FC(VECTOR3* arg0, s32* arg1, s_func_800CC8FC* arg2) // 0x800CC8FC
 
         j = 0;
 
-        while ((ptr[j].field_0.vx - ptr[ptr[j].field_4].field_0.vx) * (dVecPtr[i + 8].vy - ptr[ptr[j].field_4].field_0.vy) >
-               (ptr[j].field_0.vy - ptr[ptr[j].field_4].field_0.vy) * (dVecPtr[i + 8].vx - ptr[ptr[j].field_4].field_0.vx))
+        while ((ptr[j].field_0.vx - ptr[ptr[j].field_4].field_0.vx) * (HULL_PT(i).vy - ptr[ptr[j].field_4].field_0.vy) >
+               (ptr[j].field_0.vy - ptr[ptr[j].field_4].field_0.vy) * (HULL_PT(i).vx - ptr[ptr[j].field_4].field_0.vx))
         {
             j = ptr[j].field_5;
         }

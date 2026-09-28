@@ -482,16 +482,16 @@ void Pc_FlashlightModeApply(int mode, int persist)
     shadows = (mode == 1 || mode == 3);
 
     /* Each per-pixel style has its own calibrated intensity/size defaults
-     * (Modern 2.10/2.40, Vita 1.00/0.70; Classic+Shadows 1.20/3.00). Swap only when the
+     * (Modern 2.10/2.40, Vita 1.00/1.20; Classic+Shadows 1.20/3.00). Swap only when the
      * current value IS the other style's default — a customized value is a
      * user choice and follows them across styles. */
     if (pp)
     {
 #if defined(SH_VITA)
-        /* Vita Modern is tuned on device to a smaller, dimmer cone (1.00/0.70):
+        /* Vita Modern is tuned on device to a smaller, dimmer cone (1.00/1.20):
          * it looks right on the small screen and fewer triangles need the lit
          * shader. The old Modern defaults (2.10/2.40) migrate to it. */
-        const float modernInt = 1.00f, modernSize = 0.70f;
+        const float modernInt = 1.00f, modernSize = 1.20f;
         const float legacyInt = 2.10f, legacySize = 2.40f;
 #else
         const float modernInt = 2.10f, modernSize = 2.40f;
@@ -1628,6 +1628,15 @@ else if (strcmp(key, "enable_plugins") == 0)
         {
             g_PcConfig.renderScale = 0.75f;
             PcConfig_SaveKeyValue("render_scale", "0.75");
+        }
+
+        /* v11 (Vita only): Modern beam size 0.70 -> 1.20 (the soft shadows
+         * hold up at the wider cone). */
+        if (g_PcConfig.configVersion < 11 &&
+            g_PcConfig.flashlightSize > 0.695f && g_PcConfig.flashlightSize < 0.705f)
+        {
+            g_PcConfig.flashlightSize = 1.20f;
+            PcConfig_SaveKeyValue("flashlight_size", "1.20");
         }
 #endif
 

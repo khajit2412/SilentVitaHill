@@ -220,6 +220,9 @@ static const char* const LBL_ONOFF[] = { "Off", "On" };
 #if defined(SH_VITA)
 /* Flashlight shadow map resolution. */
 extern int g_vitaShadowQuality;
+extern int g_vitaShadowSoft;
+extern float g_vitaShadowSoftBlur;
+extern float g_vitaShadowSoftK;
 static const int VAL_SHQ[] = { 256, 512, 128 };
 static const char* const LBL_SHQ[] = { "Normal", "Fine", "Soft" };
 #endif
@@ -260,10 +263,16 @@ static const s_PcOpt PCOPT_G[] = {
     { "PGXP",           &g_PcConfig.usePgxp,            "use_pgxp",             VAL_ONOFF, 2, LBL_ONOFF, &g_PsxUsePgxp,                 1, PCK_INT    },
 #if defined(SH_VITA)
     { "Shadow_Quality", &g_vitaShadowQuality,          "vita_shadow_quality",  VAL_SHQ,   3, LBL_SHQ,   NULL,                          1, PCK_INT    },
-#endif
+    /* Antialiasing, Post_Process and Tone_Mapping have no effect on the Vita's
+     * GLES2 renderer; the soft-shadow rows take their places. */
+    { "Soft_Shadows",   &g_vitaShadowSoft,             "vita_shadow_soft",     VAL_ONOFF, 2, LBL_ONOFF, NULL,                          1, PCK_INT    },
+    { "Soft_Blur",      NULL, "vita_shadow_soft_blur", NULL, 0, NULL, NULL, 1, PCK_SLIDER, &g_vitaShadowSoftBlur, NULL, 0.0f, 4.0f, 0.25f },
+    { "Soft_Sharpness", NULL, "vita_shadow_soft_k",    NULL, 0, NULL, NULL, 1, PCK_SLIDER, &g_vitaShadowSoftK,    NULL, 10.0f, 80.0f, 5.0f },
+#else
     { "Antialiasing",   &g_PcConfig.msaaSamples,        "msaa",                 VAL_AA,    4, LBL_AA,    NULL,                          0, PCK_INT    },
     { "Post_Process",   &g_PcConfig.postProcess,        "post_process",         VAL_POST,  9, LBL_POST,  &g_cfg_postProcess,            1, PCK_INT    },
     { "Tone_Mapping",   &g_PcConfig.tonemap,            "tonemap",              VAL_TONE,  4, LBL_TONE,  &g_cfg_tonemap,                1, PCK_INT    },
+#endif
     /* New-Game start map. Moved here from the Camera page, which had run to 12
      * rows (the practical maximum) while this page had room to spare. */
     { "Map",            NULL,                           "map",                  NULL,      0, NULL,      NULL,                          1, PCK_MAP    },
@@ -1283,6 +1292,28 @@ static void PcOpt_ResetEntry(const s_PcOpt* e)
     if (e->kind == PCK_RES || e->kind == PCK_WINMODE ||
         e->kind == PCK_NEXT || e->kind == PCK_PREV || e->kind == PCK_BACK ||
         e->kind == PCK_MAP) return;
+
+#if defined(SH_VITA)
+    /* These live outside g_PcConfig, so the offset lookup below cannot find
+     * their defaults. */
+    if (e->field == &g_vitaShadowQuality || e->field == &g_vitaShadowSoft) {
+        *e->field = (e->field == &g_vitaShadowQuality) ? 256 : 1;
+        snprintf(buf, sizeof(buf), "%d", *e->field);
+        PcConfig_SaveKeyValue(e->key, buf);
+        return;
+    }
+    if (e->ffield == &g_vitaShadowSoftBlur || e->ffield == &g_vitaShadowSoftK) {
+        *e->ffield = (e->ffield == &g_vitaShadowSoftK) ? 80.0f : 1.0f;
+        snprintf(buf, sizeof(buf), "%.3f", *e->ffield);
+        PcConfig_SaveKeyValue(e->key, buf);
+        return;
+    }
+#endif
+    if ((e->kind == PCK_SLIDER ? (const void*)e->ffield : (const void*)e->field) != NULL) {
+        const char* p = (e->kind == PCK_SLIDER) ? (const char*)e->ffield : (const char*)e->field;
+        if (p < (const char*)&g_PcConfig || p >= (const char*)(&g_PcConfig + 1))
+            return;
+    }
 
     if (e->kind == PCK_SLIDER && e->ffield != NULL) {
         float dv = *(const float*)((const char*)d + ((const char*)e->ffield - (const char*)&g_PcConfig));

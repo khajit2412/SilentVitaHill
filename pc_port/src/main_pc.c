@@ -1737,6 +1737,16 @@ int main(int argc, char* argv[])
             g_vitaShadowQuality = atoi(v);
         if (g_vitaShadowQuality != 128 && g_vitaShadowQuality != 512)
             g_vitaShadowQuality = 256;
+        {
+            extern int g_vitaShadowSoft;
+            extern float g_vitaShadowSoftBlur, g_vitaShadowSoftK;
+            if ((v = Pc_ModConfig_Value("vita_shadow_soft")) != NULL)
+                g_vitaShadowSoft = atoi(v) != 0;
+            if ((v = Pc_ModConfig_Value("vita_shadow_soft_blur")) != NULL)
+                g_vitaShadowSoftBlur = (float)atof(v);
+            if ((v = Pc_ModConfig_Value("vita_shadow_soft_k")) != NULL)
+                g_vitaShadowSoftK = (float)atof(v);
+        }
     }
 #endif
 

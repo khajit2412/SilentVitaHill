@@ -193,11 +193,16 @@ Measure each with the [PHASE]/[SUBMIT]/[GPUDRAIN]/[PERF] lines, PGXP on and off.
   render_scale 1.0 -> 0.65 (960x544 -> 640x368, hardware display scaler upscales for free), PSX dither (not in the ES2 shader path),
   texture filtering compiled out (PSYX_NO_TEXFILTER), flashlight shadow map 512 (PC 2048) and
   its 16-tap PCF, lean no-flashlight shaders. Re-test each against the fps budget.
-- Optional CRT look, off by default: RF/composite filter + subtle scanlines as a toggle, tuned for
-  the Vita screen. Needs a GLSL ES 1.00 port of the PC post-process pass (PSYX_HAS_POSTPROCESS is 0
-  on ES2), the scene rendered to a target first, and scanlines matched to the PSX line count or
-  drawn at 960x544 output (720x408 is not a multiple of 240). Pair it with restoring the PSX dither,
-  which the ES2 shader path currently skips, so the composite blur has something to blend.
+- MUST HAVE (user, 2026-09-28): Post_Process + Tone_Mapping on Vita, all PC effects (CRT,
+  Scanlines, Vignette, Color_Grade, Film_Grain, Sharpen, PSX_Retro, Cinematic). Needs a GLSL ES 1.00
+  port of the PC post-process pass (PSYX_HAS_POSTPROCESS is 0 on ES2) and the scene rendered to a
+  target first; share that target with the sharpening upscale above (one extra fullscreen pass for
+  both). Then put the two rows back on the Vita Graphics page (options.c, SH_VITA block; they were
+  swapped out for the soft-shadow rows only because they did nothing yet -- the page ceiling is 11
+  rows, so something else may have to move, e.g. Map to another page). CRT tuning for the Vita
+  screen: scanlines matched to the PSX line count or drawn at 960x544 output (720x408 is not a
+  multiple of 240); pair it with restoring the PSX dither, which the ES2 shader path currently skips,
+  so the composite blur has something to blend.
 
 ## Known issues
 - Glass/blood/muzzle "triangles" (fixed): gte_stsxy3_g3 stored SXY0-2 at the 64-bit PC byte offsets
@@ -226,7 +231,7 @@ vitaGL has no depth textures, CLAMP_TO_BORDER or glDrawBuffers, so the shadow pr
 an RGBA8 colour texture (window depth packed in the fragment shader, unpacked by the receiver's
 shFetch) with a D24S8 renderbuffer for the depth test, CLAMP_TO_EDGE, NEAREST. The desktop
 glPolygonOffset(1.5, 1.0) is applied to the packed value in the shader. Vita defaults:
-flashlight_mode = 3 (Modern+Shadows), flashlight intensity 1.00 / size 0.70 (tuned on device),
+flashlight_mode = 3 (Modern+Shadows), flashlight intensity 1.00 / size 1.20 (tuned on device; 0.70 before the soft shadows),
 shadow_map_size = 256 (soft blob shadows). flashlight_mode 0/2 turns them off.
 Cost control, all Vita-only:
 - Beam-only lighting: triangles outside the cone/range (bounding sphere test, GR_VitaBeamClass) draw
@@ -238,6 +243,18 @@ Cost control, all Vita-only:
   map; the pass is skipped when the caster hash and light matrix match the map already drawn.
 - Measured before the corner early-out: Modern without shadows ~27 fps in rooms, Modern+Shadows
   ~18-23 fps (GPU-bound).
+- Soft shadows (default, config vita_shadow_soft = 1): exponential shadow map. The pass writes linear
+  light depth into an RGBA16F target (vitaGL builds half-float fragment outputs for it), two separable
+  5-tap passes blur it in log space (exp(K z) averaged), and the receiver does one bilinear fetch +
+  exp: no PCF taps and no slope derivatives. PC options (Graphics page, all live): Soft_Shadows
+  (vita_shadow_soft; Off = the PCF path with its vita_shadow_depth_texture / slope switches),
+  Soft_Sharpness (vita_shadow_soft_k, 10-80, default 80: edge sharpness vs light leaking near contact
+  points), Soft_Blur (vita_shadow_soft_blur, 0-4 texels, default 1). They replace Antialiasing,
+  Post_Process and Tone_Mapping on Vita, which do nothing on its GLES2 renderer yet (post-process on
+  Vita is a must-have, see Later).
+  After the blur the frame VAO is g_glVertexArray[g_curVertexBuffer ^ 1] (GR_BindVertexBuffer
+  advances the index after binding); rebinding the other one drew stale vertices: a grey screen.
+  The facing gate (vita_shadow_facing) stays off: derivatives inside that branch read 0 on SGX.
 
 ## Disabled on Vita (optional PC extras)
 MSAA, grey-frame PBO debug probe, depth-bits query.
