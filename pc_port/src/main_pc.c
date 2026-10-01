@@ -1755,6 +1755,11 @@ int main(int argc, char* argv[])
             if ((v = Pc_ModConfig_Value("vita_shadow_soft_k")) != NULL)
                 g_vitaShadowSoftK = (float)atof(v);
         }
+        {
+            extern int g_vitaPalMinArea;
+            if ((v = Pc_ModConfig_Value("vita_pal_min_area")) != NULL)
+                g_vitaPalMinArea = atoi(v);
+        }
     }
 #endif
 
