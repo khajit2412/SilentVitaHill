@@ -682,6 +682,23 @@ static void T_SwapRes(void* p)
     vglSwapResolution(wh[0], wh[1]);
 }
 
+/* vitaGL rebuilds its glClear quad inside the swap that applies a new mode,
+ * in the units of whatever framebuffer is bound then: with a 512-wide
+ * offscreen target bound it covered x -1..0.875 and the right 1/16 of the
+ * screen was never cleared again (stale frames along the right edge). A
+ * full-target clear is -1..1 whatever the size. */
+typedef struct { float x, y, z, w; } VGLR_Vec4;
+extern VGLR_Vec4* clear_vertices;
+
+static void T_FixClearQuad(void* p)
+{
+    (void)p;
+    clear_vertices->x = -1.0f;
+    clear_vertices->y = 1.0f;
+    clear_vertices->z = 1.0f;
+    clear_vertices->w = -1.0f;
+}
+
 static int VGLR_ResolutionHeight(int w)
 {
     return w >= 960 ? 544 : w >= 720 ? 408 : w >= 640 ? 368 : w >= 480 ? 272 : 0;
@@ -713,6 +730,13 @@ void VGLR_vglSwapBuffers(GLboolean has_commondialog)
     /* At most one frame queued behind the one being drawn. */
     VGLR_PRODUCER_WAIT_UNTIL(s_framesSubmitted - s_framesDone <= 1);
 
+    {
+        /* The first swap applies the startup switch away from 960x544. */
+        static int s_firstSwap = 1;
+        if (applied || s_firstSwap)
+            VGLR_RunSync(T_FixClearQuad, NULL, "clearQuad");
+        s_firstSwap = 0;
+    }
     if (applied)
     {
         g_vitaScreenW = wh[0];

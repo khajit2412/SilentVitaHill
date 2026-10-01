@@ -3306,6 +3306,9 @@ void MainLoop(void) // 0x80032EE0
                  * window usually mixes both and the average hides either. */
                 static Uint32 s_perfFlMs[2] = { 0, 0 };
                 static u32    s_perfFlFrames[2] = { 0, 0 };
+                /* Gameplay frame-time histogram (1 ms buckets): the average hides
+                 * the dips the player sees, and menus at 60 fps inflate it. */
+                static u16    s_perfHist[201];
                 Uint32        perfNowMs = SDL_GetTicks();
                 if (s_perfLastMs != 0)
                 {
@@ -3319,6 +3322,8 @@ void MainLoop(void) // 0x80032EE0
                     {
                         s_perfFlMs[g_PsyX_FlashlightActive ? 1 : 0] += dt;
                         s_perfFlFrames[g_PsyX_FlashlightActive ? 1 : 0]++;
+                        if (s_perfHist[dt > 200 ? 200 : dt] < 0xFFFF)
+                            s_perfHist[dt > 200 ? 200 : dt]++;
                     }
 #ifdef SH_VITA
                     {
@@ -3417,6 +3422,32 @@ void MainLoop(void) // 0x80032EE0
                            (unsigned long)s_perfFlFrames[1],
                            s_perfFlMs[0] ? 1000.0 * s_perfFlFrames[0] / (double)s_perfFlMs[0] : 0.0,
                            (unsigned long)s_perfFlFrames[0]);
+                    {
+                        /* Frame times at the 50th / 90th / 99th percentile of live
+                         * gameplay frames, as fps: median, 10% low, 1% low. */
+                        u32 total = 0, acc = 0, i, over33 = 0;
+                        u32 p50 = 0, p90 = 0, p99 = 0;
+                        for (i = 0; i <= 200; i++)
+                        {
+                            total += s_perfHist[i];
+                            if (i > 34)
+                                over33 += s_perfHist[i];
+                        }
+                        if (total)
+                        {
+                            for (i = 0; i <= 200; i++)
+                            {
+                                acc += s_perfHist[i];
+                                if (!p50 && acc * 2 >= total) p50 = i ? i : 1;
+                                if (!p90 && acc * 10 >= total * 9) p90 = i ? i : 1;
+                                if (!p99 && acc * 100 >= total * 99) p99 = i ? i : 1;
+                            }
+                            SH_DBG("[FPS] gameplay %lu frames: median %.1f fps, 10%% low %.1f fps, 1%% low %.1f fps, %.0f%% of frames below 30 fps",
+                                   (unsigned long)total, 1000.0 / p50, 1000.0 / p90, 1000.0 / p99,
+                                   100.0 * over33 / total);
+                        }
+                        memset(s_perfHist, 0, sizeof(s_perfHist));
+                    }
                         s_perfFlMs[0] = s_perfFlMs[1] = 0; s_perfFlFrames[0] = s_perfFlFrames[1] = 0;
                         s_perfFrames = 0; s_perfAccumMs = 0; s_perfWorstMs = 0; s_perfVbAccum = 0;
                     }
