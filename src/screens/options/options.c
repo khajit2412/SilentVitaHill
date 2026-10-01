@@ -220,6 +220,9 @@ static const char* const LBL_ONOFF[] = { "Off", "On" };
 #if defined(SH_VITA)
 /* Flashlight shadow map resolution. */
 extern int g_vitaShadowQuality;
+extern int g_vitaResolution;
+static const int VAL_VRES[] = { 960, 720, 640, 480 };
+static const char* const LBL_VRES[] = { "960x544", "720x408", "640x368", "480x272" };
 extern int g_vitaShadowSoft;
 extern float g_vitaShadowSoftBlur;
 extern float g_vitaShadowSoftK;
@@ -262,6 +265,7 @@ static const s_PcOpt PCOPT_G[] = {
     { "Texture_Filter", &g_PcConfig.psxDither,          "psx_dither",           VAL_FILT,  8, LBL_FILT,  NULL,                          1, PCK_FILTER },
     { "PGXP",           &g_PcConfig.usePgxp,            "use_pgxp",             VAL_ONOFF, 2, LBL_ONOFF, &g_PsxUsePgxp,                 1, PCK_INT    },
 #if defined(SH_VITA)
+    { "Resolution",     &g_vitaResolution,             "vita_resolution",      VAL_VRES,  4, LBL_VRES,  NULL,                          1, PCK_INT    },
     { "Shadow_Quality", &g_vitaShadowQuality,          "vita_shadow_quality",  VAL_SHQ,   3, LBL_SHQ,   NULL,                          1, PCK_INT    },
     /* Antialiasing, Post_Process and Tone_Mapping have no effect on the Vita's
      * GLES2 renderer; the soft-shadow rows take their places. */
@@ -1296,8 +1300,8 @@ static void PcOpt_ResetEntry(const s_PcOpt* e)
 #if defined(SH_VITA)
     /* These live outside g_PcConfig, so the offset lookup below cannot find
      * their defaults. */
-    if (e->field == &g_vitaShadowQuality || e->field == &g_vitaShadowSoft) {
-        *e->field = (e->field == &g_vitaShadowQuality) ? 256 : 1;
+    if (e->field == &g_vitaShadowQuality || e->field == &g_vitaShadowSoft || e->field == &g_vitaResolution) {
+        *e->field = (e->field == &g_vitaShadowQuality) ? 256 : (e->field == &g_vitaResolution) ? 720 : 1;
         snprintf(buf, sizeof(buf), "%d", *e->field);
         PcConfig_SaveKeyValue(e->key, buf);
         return;

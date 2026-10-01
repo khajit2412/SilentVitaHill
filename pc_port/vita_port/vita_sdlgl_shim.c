@@ -32,6 +32,9 @@ int _newlib_heap_size_user = 160 * 1024 * 1024;
 static int s_vglReady = 0;
 
 int g_vitaScreenW = 960, g_vitaScreenH = 544;
+/* PC options Resolution (config vita_resolution): the display-mode width the
+ * player picked. The swap applies a change (VGLR_vglSwapBuffers). */
+int g_vitaResolution = 0;
 
 /* render_scale as a display mode instead of an offscreen target: the Vita
  * scales these framebuffers to the panel for free, where the target needed a
@@ -45,6 +48,7 @@ static void VitaGL_PickDisplayMode(void)
     else if (s >= 0.70f) { g_vitaScreenW = 720; g_vitaScreenH = 408; }
     else if (s >= 0.60f) { g_vitaScreenW = 640; g_vitaScreenH = 368; }
     else                 { g_vitaScreenW = 480; g_vitaScreenH = 272; }
+    g_vitaResolution = g_vitaScreenW;
 }
 
 #undef glBindFramebuffer

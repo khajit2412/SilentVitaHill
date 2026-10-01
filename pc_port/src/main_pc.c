@@ -1560,6 +1560,14 @@ int main(int argc, char* argv[])
         extern int   g_cfg_lowEnd;
         g_cfg_renderScale = g_PcConfig.renderScale;
         g_cfg_lowEnd      = g_PcConfig.lowEndMode;
+#ifdef SH_VITA
+        {
+            const char* v = Pc_ModConfig_Value("vita_resolution");
+            const int w = v ? atoi(v) : 0;
+            if (w == 960 || w == 720 || w == 640 || w == 480)
+                g_cfg_renderScale = (float)w / 960.0f + 0.001f;
+        }
+#endif
     }
     SH_LOG("MSAA: %dx", g_cfg_msaaSamples);
 

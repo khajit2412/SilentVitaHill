@@ -669,22 +669,12 @@ void VGLR_vglBufferData(GLenum target, const GLvoid* data)
     }
 }
 
-/* ---- dynamic resolution ------------------------------------------------------
- * render_scale picks the largest display mode; while the render thread / GPU
- * holds the game thread back at the frame pace, drop one mode (720x408 ->
- * 640x368) and come back once it has been idle for a while. vitaGL applies a
- * resolution change at the next swap with a full GPU finish, so switches are
- * rare and back off when they oscillate. Config key vita_dynamic_res (default 1). */
-extern int g_vitaScreenW, g_vitaScreenH;
+/* ---- resolution ------------------------------------------------------------------
+ * The PC options Resolution row sets g_vitaResolution; vitaGL switches display
+ * mode at the next swap (with a full GPU finish), so the change is applied
+ * here, between frames. */
+extern int g_vitaScreenW, g_vitaScreenH, g_vitaResolution;
 extern void Vita_ApplySurfaceSize(int w, int h);
-#define DYN_WINDOW      30
-#define DYN_DROP_US     4000
-#define DYN_RAISE_US    500
-static int      s_dyn = -1, s_dynLow;
-static int      s_dynHiW, s_dynHiH, s_dynLoW, s_dynLoH;
-static int      s_dynPendW, s_dynPendH;
-static uint32_t s_dynFrames, s_dynCalm, s_dynSince, s_dynHold = 300;
-static uint64_t s_dynWaitUs;
 
 static void T_SwapRes(void* p)
 {
@@ -692,88 +682,9 @@ static void T_SwapRes(void* p)
     vglSwapResolution(wh[0], wh[1]);
 }
 
-static void VGLR_DynInit(void)
+static int VGLR_ResolutionHeight(int w)
 {
-    extern const char* Pc_ModConfig_Value(const char* key);
-    const char* cfg = Pc_ModConfig_Value("vita_dynamic_res");
-    s_dyn = !(cfg && cfg[0] == '0');
-    s_dynHiW = g_vitaScreenW; s_dynHiH = g_vitaScreenH;
-    if (s_dynHiW >= 960)      { s_dynLoW = 720; s_dynLoH = 408; }
-    else if (s_dynHiW >= 720) { s_dynLoW = 640; s_dynLoH = 368; }
-    else                      s_dyn = 0;
-    if (g_ShDebugLog)
-        fprintf(g_ShDebugLog, "[DYNRES] %s %dx%d <-> %dx%d\n", s_dyn ? "on" : "off",
-                s_dynHiW, s_dynHiH, s_dynLoW, s_dynLoH);
-}
-
-/* Menus and the inventory draw next to nothing, so the GPU idles and the
- * controller would raise the resolution there and drop it again on the way
- * back, each switch a visible flick. Only live gameplay frames count. */
-extern int g_PcWorldDrawnThisFrame;
-extern int g_PsxPresentLastFrame;
-static uint32_t s_dynHot;
-
-static int VGLR_DynGameplay(void)
-{
-    return g_PcWorldDrawnThisFrame && !g_PsxPresentLastFrame;
-}
-
-static void VGLR_DynUpdate(uint64_t waitUs)
-{
-    if (!VGLR_DynGameplay())
-    {
-        s_dynFrames = 0;
-        s_dynWaitUs = 0;
-        return;
-    }
-    s_dynWaitUs += waitUs;
-    s_dynSince++;
-    {
-        /* Shadowed flashlight is the heaviest GPU load there is: go to the
-         * lower mode once it has been on for ~2 s instead of waiting for the
-         * queue to back up (each of those waits was a burst of hitches). */
-        extern int g_PsyX_FlashlightActive, g_PsyX_UseFlashlightShadows, g_PsyX_UsePerPixelFlashlight;
-        static uint32_t s_flOn;
-        const int heavy = g_PsyX_FlashlightActive && g_PsyX_UseFlashlightShadows && g_PsyX_UsePerPixelFlashlight;
-        s_flOn = heavy ? s_flOn + 1 : 0;
-        if (heavy && !s_dynLow && s_flOn == 60 && s_dynSince >= DYN_WINDOW)
-        {
-            s_dynLow = 1; s_dynPendW = s_dynLoW; s_dynPendH = s_dynLoH;
-            s_dynFrames = 0; s_dynWaitUs = 0;
-            if (g_ShDebugLog)
-                fprintf(g_ShDebugLog, "[DYNRES] -> %dx%d (shadowed flashlight)\n", s_dynPendW, s_dynPendH);
-            return;
-        }
-        if (heavy && s_dynLow)
-        {
-            s_dynCalm = 0;	/* stay low while the shadowed flashlight is on */
-        }
-    }
-    if (++s_dynFrames < DYN_WINDOW)
-        return;
-    const uint64_t avg = s_dynWaitUs / s_dynFrames;
-    s_dynFrames = 0;
-    s_dynWaitUs = 0;
-    if (s_dynSince < s_dynHold)
-        return;
-    s_dynHot = (avg > DYN_DROP_US) ? s_dynHot + 1 : 0;
-    if (!s_dynLow && s_dynHot >= 2)
-    {
-        /* Dropping again soon after a raise means the raise was wrong. */
-        if (s_dynSince < s_dynHold * 3 && s_dynHold < 3600)
-            s_dynHold *= 2;
-        s_dynLow = 1; s_dynPendW = s_dynLoW; s_dynPendH = s_dynLoH;
-    }
-    else if (s_dynLow)
-    {
-        s_dynCalm = (avg < DYN_RAISE_US) ? s_dynCalm + 1 : 0;
-        if (s_dynCalm >= 10)
-        {
-            s_dynLow = 0; s_dynPendW = s_dynHiW; s_dynPendH = s_dynHiH;
-        }
-    }
-    if (s_dynPendW && g_ShDebugLog)
-        fprintf(g_ShDebugLog, "[DYNRES] -> %dx%d (wait %.1f ms/frame)\n", s_dynPendW, s_dynPendH, avg / 1000.0);
+    return w >= 960 ? 544 : w >= 720 ? 408 : w >= 640 ? 368 : w >= 480 ? 272 : 0;
 }
 
 void VGLR_vglSwapBuffers(GLboolean has_commondialog)
@@ -783,24 +694,15 @@ void VGLR_vglSwapBuffers(GLboolean has_commondialog)
         vglSwapBuffers(has_commondialog);
         return;
     }
-    if (s_dyn < 0)
-        VGLR_DynInit();
 
     /* Queued ahead of this frame's swap so the next frame starts at the new size. */
-    int applied = 0, wh[2] = { s_dynPendW, s_dynPendH };
-    if (s_dynPendW && !VGLR_DynGameplay())
-    {
-        /* Decided in gameplay but a menu opened: undo the decision. */
-        s_dynLow = !s_dynLow;
-        s_dynPendW = 0;
-    }
-    if (s_dynPendW)
+    int applied = 0, wh[2] = { g_vitaResolution, VGLR_ResolutionHeight(g_vitaResolution) };
+    if (wh[1] && wh[0] != g_vitaScreenW)
     {
         VGLR_RunSync(T_SwapRes, wh, "vglSwapResolution");
-        s_dynPendW = 0;
-        s_dynSince = 0;
-        s_dynCalm = 0;
         applied = 1;
+        if (g_ShDebugLog)
+            fprintf(g_ShDebugLog, "[RESOLUTION] -> %dx%d\n", wh[0], wh[1]);
     }
 
     GLboolean* a = (GLboolean*)VGLR_Reserve(OP_SWAP, sizeof(GLboolean), 0);
@@ -809,9 +711,7 @@ void VGLR_vglSwapBuffers(GLboolean has_commondialog)
     VGLR_Publish();
     s_framesSubmitted++;
     /* At most one frame queued behind the one being drawn. */
-    const uint64_t t0 = sceKernelGetProcessTimeWide();
     VGLR_PRODUCER_WAIT_UNTIL(s_framesSubmitted - s_framesDone <= 1);
-    const uint64_t waited = sceKernelGetProcessTimeWide() - t0;
 
     if (applied)
     {
@@ -819,8 +719,6 @@ void VGLR_vglSwapBuffers(GLboolean has_commondialog)
         g_vitaScreenH = wh[1];
         Vita_ApplySurfaceSize(wh[0], wh[1]);
     }
-    else if (s_dyn > 0)
-        VGLR_DynUpdate(waited);
 }
 
 /* ---- frame jobs ----------------------------------------------------------------- */

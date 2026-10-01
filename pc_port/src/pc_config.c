@@ -148,7 +148,7 @@ s_PcConfig g_PcConfig = {
     .screenOrientation   = 0, /* lock landscape: what the port has always done */
     .touchLookSensitivity = 1.0f,
 #if defined(SH_VITA)
-    .renderScale         = 0.75f, /* 720x408 display mode; dynamic resolution drops to 640x368 under GPU load */
+    .renderScale         = 0.75f, /* 720x408 display mode; PC options Resolution (vita_resolution) overrides it */
 #else
     .renderScale         = 1.0f,
 #endif

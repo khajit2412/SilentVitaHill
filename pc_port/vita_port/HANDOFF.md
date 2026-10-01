@@ -190,6 +190,13 @@ Measure each with the [PHASE]/[SUBMIT]/[GPUDRAIN]/[PERF] lines, PGXP on and off.
   (VGLR_GAME_FENCE), as do GR_BeginScene / GR_Clear / GR_UpdateVRAM / readback / direct VRAM
   upload / shader compile / feedback store. Modern-mesh and FBCAPTURE flushes run inline.
   [FRAMEJOB] reports flushes per frame on each path; [SUBMIT] then measures render-thread time.
+- 2026-10-01: dynamic resolution removed; PC options Resolution (vita_resolution: 960/720/640/480)
+  switches display mode live at the next swap ([RESOLUTION] log line).
+- Measured with frame jobs on (log 20261001_180701, school exterior, 18.6 fps): game thread ~38 ms
+  (unlit world transform 17.7 ms: 12k GTE ops incl. 5.7k RTPS, parse 5.3, batch 4.4, logic 5.6),
+  render thread ~16 ms (481 draws 10.7, shadow pass 4.6), GPU backlog 85 ms. Next: GPU-side world
+  transform (static meshes in VBOs, vertex shader transform = free PGXP precision), caster culling /
+  one-draw shadow pass, fewer splits.
 - Done first (2026-09-28): per-program uniform signature (GR_VitaUniformsCurrent). ~30 uniform calls
   per draw are skipped when a program's inputs are unchanged. It targets most of the ~15k recorded
   commands a frame; measure [SUBMIT] splitLoop against the 3.5 ms before.
