@@ -316,8 +316,13 @@ static void VitaGL_InitOnRenderThread(void* unused)
     }
     /* Its frees run beside the game and render threads (cores 0 and 1). */
     vglSetupGarbageCollector(0x10000100, VGLR_HelperCoreMask());
-    vglInitExtended(0, VITA_SCREEN_W, VITA_SCREEN_H,
-                    16 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
+    /* vglSwapResolution reallocates only the colour buffers: the display depth
+     * buffer keeps its first size, and a larger mode later wrote past it (the
+     * crash going 720x408 -> 960x544 in the options). Allocate for the largest
+     * mode and switch to the chosen one at the first swap. */
+    vglInitExtended(0, 960, 544, 16 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
+    if (VITA_SCREEN_W != 960)
+        vglSwapResolution(VITA_SCREEN_W, VITA_SCREEN_H);
     shark_install_log_cb(VitaGL_SharkLog);
     /* Off until the config says otherwise (GR_UpdateSwapIntervalState):
      * the game paces itself to 30 fps. */
