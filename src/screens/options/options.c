@@ -1301,7 +1301,7 @@ static void PcOpt_ResetEntry(const s_PcOpt* e)
     /* These live outside g_PcConfig, so the offset lookup below cannot find
      * their defaults. */
     if (e->field == &g_vitaShadowQuality || e->field == &g_vitaShadowSoft || e->field == &g_vitaResolution) {
-        *e->field = (e->field == &g_vitaShadowQuality) ? 256 : (e->field == &g_vitaResolution) ? 720 : 1;
+        *e->field = (e->field == &g_vitaShadowQuality) ? 256 : (e->field == &g_vitaResolution) ? 480 : 1;
         snprintf(buf, sizeof(buf), "%d", *e->field);
         PcConfig_SaveKeyValue(e->key, buf);
         return;

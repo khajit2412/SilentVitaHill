@@ -148,7 +148,7 @@ s_PcConfig g_PcConfig = {
     .screenOrientation   = 0, /* lock landscape: what the port has always done */
     .touchLookSensitivity = 1.0f,
 #if defined(SH_VITA)
-    .renderScale         = 0.75f, /* 720x408 display mode; PC options Resolution (vita_resolution) overrides it */
+    .renderScale         = 0.50f, /* 480x272 display mode; PC options Resolution (vita_resolution) overrides it */
 #else
     .renderScale         = 1.0f,
 #endif
@@ -1637,6 +1637,16 @@ else if (strcmp(key, "enable_plugins") == 0)
         {
             g_PcConfig.flashlightSize = 1.20f;
             PcConfig_SaveKeyValue("flashlight_size", "1.20");
+        }
+
+        /* v12 (Vita only): default resolution 480x272. */
+        if (g_PcConfig.configVersion < 12)
+        {
+            extern void Pc_ModConfig_Store(const char* k, const char* v);
+            g_PcConfig.renderScale = 0.50f;
+            PcConfig_SaveKeyValue("render_scale", "0.50");
+            Pc_ModConfig_Store("vita_resolution", "480");
+            PcConfig_SaveKeyValue("vita_resolution", "480");
         }
 #endif
 
