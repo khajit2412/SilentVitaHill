@@ -457,13 +457,11 @@ void SH_DebugLogInit(void)
              * diagnosis but it flushes every SH_DBG to disk, which halves
              * framerate under heavy per-frame logging (combat + map churn). */
             static char s_logBuf[64 * 1024];
-#ifdef SH_VITA
-            /* Vita has no crash handler to flush the buffer (pc_crash.c), so a
-             * crash left a 0-byte log. newlib honours _IOLBF. */
-            setvbuf(g_ShDebugLog, s_logBuf, _IOLBF, sizeof(s_logBuf));
-#else
+            /* Vita: line buffering wrote every SH_DBG to the memory card on its
+             * own (a hitch per burst of per-frame diagnostics). With no crash
+             * handler there, Sh_LogPeriodicFlush at the end of every frame
+             * bounds a crash's loss to about a second instead. */
             setvbuf(g_ShDebugLog, s_logBuf, _IOFBF, sizeof(s_logBuf));
-#endif
         }
     }
 }

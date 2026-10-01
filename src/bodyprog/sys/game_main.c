@@ -4581,6 +4581,9 @@ void MainLoop(void) // 0x80032EE0
          * cache at the top of the next frame. */
         TexPackLazy_Pump();
         ML_TRACE("frame-done");
+#ifdef SH_VITA
+        { extern void Sh_LogPeriodicFlush(void); Sh_LogPeriodicFlush(); }
+#endif
         if (g_SH_PostFireTrace > 0) {
             g_SH_PostFireTrace--;
         }
