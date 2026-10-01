@@ -959,12 +959,27 @@ static void T_MemReport(void* p)
     m[2] = vglMemFree(VGL_MEM_VRAM); m[3] = vglMemTotal(VGL_MEM_VRAM);
 }
 
+static void T_MemReportJob(void* payload)
+{
+    T_MemReport(*(size_t**)payload);
+}
+
 void VGLR_Report(double frames)
 {
     {
         extern int g_cdcStats[2];
-        size_t m[4];
-        VGLR_RunSync(T_MemReport, m, "vglMemFree");
+        /* Asked of the render thread without waiting: this report prints the
+         * figures the previous one queued (a sync here stalled the game thread
+         * behind everything already queued, every 300 frames). */
+        static size_t m[4];
+        void* job = VGLR_JobBegin(T_MemReportJob, sizeof(size_t*));
+        if (job)
+        {
+            *(size_t**)job = m;
+            VGLR_JobEnd();
+        }
+        else
+            VGLR_RunSync(T_MemReport, m, "vglMemFree");
         if (g_ShDebugLog)
             fprintf(g_ShDebugLog, "[MEM] vitaGL RAM %u/%u MB used, VRAM %u/%u MB used; disc cache hits=%d misses=%d\n",
                     (unsigned)((m[1] - m[0]) >> 20), (unsigned)(m[1] >> 20),
