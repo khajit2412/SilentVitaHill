@@ -197,6 +197,15 @@ Measure each with the [PHASE]/[SUBMIT]/[GPUDRAIN]/[PERF] lines, PGXP on and off.
   render thread ~16 ms (481 draws 10.7, shadow pass 4.6), GPU backlog 85 ms. Next: GPU-side world
   transform (static meshes in VBOs, vertex shader transform = free PGXP precision), caster culling /
   one-draw shadow pass, fewer splits.
+- 2026-10-01 (untested): world-mesh fast transform (vita_fast_mesh, default 1). func_80057B7C's RTPT
+  loop runs as PGXP_FastMeshRTPT: integer results identical to GTE_RotTransPers; PGXP / view-space
+  shadows written directly with the exact camera transform fetched once per mesh. The lighting
+  pass (func_80057658) uses PsyX_LightRtps (same integer RTPS, no dispatch). Shadow pass: casters
+  culled to the light frustum and drawn with one call; map refresh at most every 2nd frame
+  (vita_shadow_rate). Palette splits < 4096 PSX px use the shared VRAM texture (vita_pal_min_area).
+  A true GPU transform of world meshes (static VBOs, vertex-shader transform) is still open. It needs
+  Gfx_MeshDraw's per-face culling / fog / light / OT ordering redone for the GPU and the coplanar
+  decal ordering solved without OT order.
 - Done first (2026-09-28): per-program uniform signature (GR_VitaUniformsCurrent). ~30 uniform calls
   per draw are skipped when a program's inputs are unchanged. It targets most of the ~15k recorded
   commands a frame; measure [SUBMIT] splitLoop against the 3.5 ms before.

@@ -2376,6 +2376,11 @@ void func_8005759C(s_MeshHeader* meshHdr, s_GteScratchData* scratchData, s32 ver
     }
 }
 
+#ifdef SH_VITA
+/* Exact RTPS for the lighting pass below (PsyX_GTE.cpp): same integer
+ * results, without the generic GTE dispatch. */
+extern void PsyX_LightRtps(const MATRIX* m, void* sxyOut, void* dpOut);
+#endif
 void func_80057658(s_MeshHeader* meshHdr, s32 offset, s_GteScratchData* scratchData, SVECTOR3* arg3, SVECTOR* arg4) // 0x80057658
 {
     s32       geomOffsetX;
@@ -2434,20 +2439,31 @@ void func_80057658(s_MeshHeader* meshHdr, s32 offset, s_GteScratchData* scratchD
         mat->m[2][2] = scratchData->field_18C[*var_t0] - scratchData->field_3AC.vz;
         gte_SetRotMatrix_Row2(mat->m);
 
+#ifdef SH_VITA
+        PsyX_LightRtps(mat, screenPos, depthP);
+#else
         gte_ldv0(temp_t8);
         gte_rtps();
         gte_stsxy(screenPos);
         gte_stdp(depthP);
+#endif
 
         while (++var_t0 < end)
         {
+#ifdef SH_VITA
+            s32 nextXy, nextDp;
+#endif
             mat->m[2][0] = scratchData->screenXy_0[*var_t0].vx - scratchData->field_3AC.vx;
             mat->m[2][1] = scratchData->screenXy_0[*var_t0].vy - scratchData->field_3AC.vy;
             mat->m[2][2] = scratchData->field_18C[*var_t0] - scratchData->field_3AC.vz;
 
             gte_SetRotMatrix_Row2(mat->m);
+#ifdef SH_VITA
+            PsyX_LightRtps(mat, &nextXy, &nextDp);
+#else
             gte_ldv0(temp_t8);
             gte_rtps();
+#endif
 
             scratchData->screenPos_3A4.vx += 1024;
             scratchData->screenPos_3A4.vy += 1024;
@@ -2475,8 +2491,13 @@ void func_80057658(s_MeshHeader* meshHdr, s32 offset, s_GteScratchData* scratchD
 
             *(var_t0 - 1) = var_a1;
 
+#ifdef SH_VITA
+            *(s32*)screenPos = nextXy;
+            *depthP = nextDp;
+#else
             gte_stsxy(screenPos);
             gte_stdp(depthP);
+#endif
         }
 
         scratchData->screenPos_3A4.vx += 1024;
@@ -2577,6 +2598,25 @@ void func_80057B7C(s_MeshHeader* meshHdr, s32 offset, s_GteScratchData* scratchD
 
     SetRotMatrix(mat);
     SetTransMatrix(mat);
+
+#ifdef SH_VITA
+    {
+        extern int PGXP_FastMeshRTPT(void* xy, short* z, int count);
+        const int n = PGXP_FastMeshRTPT(&scratchData->screenXy_0[offset], &scratchData->field_18C[offset], meshHdr->vertexCount);
+        if (n > 0)
+        {
+            if (g_WorldEnvWork.isFogEnabled)
+            {
+                const s16* z = &scratchData->field_18C[offset];
+                u8* fog = &scratchData->field_252[offset];
+                int i;
+                for (i = 0; i < n; i++)
+                    fog[i] = PC_FOG_VTX_RAMP(z[i]);
+            }
+            return;
+        }
+    }
+#endif
 
     screenXy = &scratchData->screenXy_0[offset];
 
