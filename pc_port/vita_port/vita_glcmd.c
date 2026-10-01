@@ -52,6 +52,10 @@ static SceUID            s_renderTid = -1;
 static int               s_tlsUnique = 0;
 static volatile uint32_t s_jobsSubmitted, s_jobsDone;
 static int               s_jobsOn = 0;
+/* [FRAMEJOB] game-thread waits on unfinished jobs, and the swap's wait for
+ * the render thread: where the two threads still serialize. */
+static uint32_t s_fenceN;
+static uint64_t s_fenceUs, s_swapWaitUs;
 
 static inline uint32_t VGLR_Tls(void)
 {
@@ -728,7 +732,11 @@ void VGLR_vglSwapBuffers(GLboolean has_commondialog)
     VGLR_Publish();
     s_framesSubmitted++;
     /* At most one frame queued behind the one being drawn. */
-    VGLR_PRODUCER_WAIT_UNTIL(s_framesSubmitted - s_framesDone <= 1);
+    {
+        const uint64_t t0 = sceKernelGetProcessTimeWide();
+        VGLR_PRODUCER_WAIT_UNTIL(s_framesSubmitted - s_framesDone <= 1);
+        s_swapWaitUs += sceKernelGetProcessTimeWide() - t0;
+    }
 
     {
         /* The first swap applies the startup switch away from 960x544. */
@@ -747,9 +755,15 @@ void VGLR_vglSwapBuffers(GLboolean has_commondialog)
 
 /* ---- frame jobs ----------------------------------------------------------------- */
 
+
 static void VGLR_JobFenceWait(void)
 {
+    if (s_jobsDone == s_jobsSubmitted)
+        return;
+    const uint64_t t0 = sceKernelGetProcessTimeWide();
     VGLR_PRODUCER_WAIT_UNTIL(s_jobsDone == s_jobsSubmitted);
+    s_fenceUs += sceKernelGetProcessTimeWide() - t0;
+    s_fenceN++;
 }
 
 int VGLR_JobsEnabled(void)
@@ -965,5 +979,10 @@ void VGLR_Report(double frames)
             s_syncLast[0] ? s_syncLast[0] : "-", s_syncLast[1] ? s_syncLast[1] : "-",
             s_syncLast[2] ? s_syncLast[2] : "-", s_syncLast[3] ? s_syncLast[3] : "-");
     g_vglrSyncCount = 0;
+    fprintf(g_ShDebugLog, "[FRAMEJOB] game thread waited for jobs %.2f times/frame, %.2f ms/frame; swap waited %.2f ms/frame\n",
+            s_fenceN / frames, s_fenceUs / frames / 1000.0, s_swapWaitUs / frames / 1000.0);
+    s_fenceN = 0;
+    s_fenceUs = 0;
+    s_swapWaitUs = 0;
 }
 #endif
