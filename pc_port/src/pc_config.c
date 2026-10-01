@@ -80,7 +80,11 @@ s_PcConfig g_PcConfig = {
     .bulletDecals = 0, /* 1=bullet-hole decals at player gunshot impacts (gamedata/decal.png); off by default */
     .globalCharaPool = 1, /* 1=all chara assets resident PC-side + chara_global.dll AI backfill (SPAWN anything anywhere) */
     .wholeMapExteriors = 0, /* EXPERIMENTAL: texture+draw every exterior chunk (whole town visible; heavy with fog weakened) */
+#ifdef SH_VITA
+    .usePgxp        = 1, /* PGXP on by default on Vita */
+#else
     .usePgxp        = 0, /* 0=affine textures (PSX look), 1=PGXP perspective correct (WIP) */
+#endif
     .itemDepthProbe = 0, /* 1=one-shot [ITEMDEPTH] depth dump per item-screen entry (diagnostic) */
     .charaPrimProbe = 0, /* 0=off, else e_CharaId to trace: one-shot [CHARAPRIM] per-model submit/reject dump */
     .psxPolySizeCull = 1, /* 1=PSX GPU parity: cull triangles with screen bbox >1023x511 (hardware never drew them) */
@@ -1647,6 +1651,13 @@ else if (strcmp(key, "enable_plugins") == 0)
             PcConfig_SaveKeyValue("render_scale", "0.50");
             Pc_ModConfig_Store("vita_resolution", "480");
             PcConfig_SaveKeyValue("vita_resolution", "480");
+        }
+
+        /* v13 (Vita only): PGXP on by default. */
+        if (g_PcConfig.configVersion < 13)
+        {
+            g_PcConfig.usePgxp = 1;
+            PcConfig_SaveKeyValue("use_pgxp", "1");
         }
 #endif
 
