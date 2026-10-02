@@ -1551,6 +1551,15 @@ int main(int argc, char* argv[])
      * If the driver can't honor it, PsyCross retries without MSAA and clears
      * g_cfg_msaaSamples back to 0. */
     g_cfg_msaaSamples = g_PcConfig.msaaSamples;
+#ifdef SH_VITA
+    {
+        /* vitaGL multisamples the display at init (vita_sdlgl_shim.c); the
+         * renderer's own MSAA path is desktop GL only. */
+        extern int g_vitaMsaa;
+        g_vitaMsaa = (g_PcConfig.msaaSamples >= 4) ? 4 : (g_PcConfig.msaaSamples >= 2) ? 2 : 0;
+        g_cfg_msaaSamples = 0;
+    }
+#endif
     {
         /* Seeded before the window exists so the very first frame already
          * renders at the requested size. */

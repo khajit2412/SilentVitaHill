@@ -35,6 +35,8 @@ int g_vitaScreenW = 960, g_vitaScreenH = 544;
 /* PC options Resolution (config vita_resolution): the display-mode width the
  * player picked. The swap applies a change (VGLR_vglSwapBuffers). */
 int g_vitaResolution = 0;
+/* PC options Antialiasing (config msaa): 0, 2 or 4 display samples. */
+int g_vitaMsaa = 0;
 
 /* render_scale as a display mode instead of an offscreen target: the Vita
  * scales these framebuffers to the panel for free, where the target needed a
@@ -320,7 +322,8 @@ static void VitaGL_InitOnRenderThread(void* unused)
      * buffer keeps its first size, and a larger mode later wrote past it (the
      * crash going 720x408 -> 960x544 in the options). Allocate for the largest
      * mode and switch to the chosen one at the first swap. */
-    vglInitExtended(0, 960, 544, 16 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
+    vglInitExtended(0, 960, 544, 16 * 1024 * 1024,
+                    g_vitaMsaa >= 4 ? SCE_GXM_MULTISAMPLE_4X : g_vitaMsaa >= 2 ? SCE_GXM_MULTISAMPLE_2X : SCE_GXM_MULTISAMPLE_NONE);
     if (VITA_SCREEN_W != 960)
         vglSwapResolution(VITA_SCREEN_W, VITA_SCREEN_H);
     shark_install_log_cb(VitaGL_SharkLog);

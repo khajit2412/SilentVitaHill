@@ -222,6 +222,9 @@ static const char* const LBL_ONOFF[] = { "Off", "On" };
 extern int g_vitaShadowQuality;
 extern int g_vitaResolution;
 static const int VAL_VRES[] = { 960, 720, 640, 480 };
+/* Display multisampling, applied when vitaGL starts (next launch). */
+static const int VAL_VAA[] = { 0, 2, 4 };
+static const char* const LBL_VAA[] = { "Off", "2x", "4x" };
 static const char* const LBL_VRES[] = { "960x544", "720x408", "640x368", "480x272" };
 extern int g_vitaShadowSoft;
 extern float g_vitaShadowSoftBlur;
@@ -266,9 +269,10 @@ static const s_PcOpt PCOPT_G[] = {
     { "PGXP",           &g_PcConfig.usePgxp,            "use_pgxp",             VAL_ONOFF, 2, LBL_ONOFF, &g_PsxUsePgxp,                 1, PCK_INT    },
 #if defined(SH_VITA)
     { "Resolution",     &g_vitaResolution,             "vita_resolution",      VAL_VRES,  4, LBL_VRES,  NULL,                          1, PCK_INT    },
+    { "Antialiasing",   &g_PcConfig.msaaSamples,        "msaa",                 VAL_VAA,   3, LBL_VAA,   NULL,                          0, PCK_INT    },
     { "Shadow_Quality", &g_vitaShadowQuality,          "vita_shadow_quality",  VAL_SHQ,   3, LBL_SHQ,   NULL,                          1, PCK_INT    },
-    /* Antialiasing, Post_Process and Tone_Mapping have no effect on the Vita's
-     * GLES2 renderer; the soft-shadow rows take their places. */
+    /* Post_Process and Tone_Mapping have no effect on the Vita's GLES2
+     * renderer yet; the soft-shadow rows take their places. */
     { "Soft_Shadows",   &g_vitaShadowSoft,             "vita_shadow_soft",     VAL_ONOFF, 2, LBL_ONOFF, NULL,                          1, PCK_INT    },
     { "Soft_Blur",      NULL, "vita_shadow_soft_blur", NULL, 0, NULL, NULL, 1, PCK_SLIDER, &g_vitaShadowSoftBlur, NULL, 0.0f, 4.0f, 0.25f },
     { "Soft_Sharpness", NULL, "vita_shadow_soft_k",    NULL, 0, NULL, NULL, 1, PCK_SLIDER, &g_vitaShadowSoftK,    NULL, 10.0f, 80.0f, 5.0f },
