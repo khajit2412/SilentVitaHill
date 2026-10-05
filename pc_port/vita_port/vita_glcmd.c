@@ -83,7 +83,8 @@ static void VGLR_JobFenceWait(void);
 
 /* A game-thread GL call waits for pending frame jobs before it touches the
  * recorder's state filters (bind / uniform / query shadows) the job is using. */
-#define VGLR_GAME_FENCE() do { if (s_jobsDone != s_jobsSubmitted && !VGLR_OnRender()) VGLR_JobFenceWait(); } while (0)
+#define VGLR_GAME_FENCE() do { if (s_jobsDone != s_jobsSubmitted && !VGLR_OnRender()) VGLR_JobFenceWaitAt(__func__, __builtin_return_address(0)); } while (0)
+static void VGLR_JobFenceWaitAt(const char* who, void* ra);
 static uint8_t*          s_ring;
 static volatile uint32_t s_wr;          /* published write position (monotonic) */
 static volatile uint32_t s_rd;          /* consumer read position (monotonic) */
@@ -557,6 +558,8 @@ static void VGLR_RunSync(void (*fn)(void*), void* arg, const char* name)
 
     g_vglrSyncCount++;
     s_syncLast[s_syncLastN++ & 3] = name;
+    if (s_jobsDone != s_jobsSubmitted)
+        VGLR_JobFenceWaitAt(name, __builtin_return_address(0));
 
     A_Call* a = (A_Call*)VGLR_Reserve(OP_CALL, sizeof(A_Call), 0);
     a->fn = fn;
@@ -756,14 +759,39 @@ void VGLR_vglSwapBuffers(GLboolean has_commondialog)
 /* ---- frame jobs ----------------------------------------------------------------- */
 
 
-static void VGLR_JobFenceWait(void)
+/* Where the game thread waited, by call site, for [FRAMEJOB] (the return
+ * addresses resolve against the build's ELF with addr2line). */
+#define FENCE_SITES 8
+static struct { const char* who; void* ra; uint64_t us; uint32_t n; } s_fenceSite[FENCE_SITES];
+
+static void VGLR_JobFenceWaitAt(const char* who, void* ra)
 {
     if (s_jobsDone == s_jobsSubmitted)
         return;
     const uint64_t t0 = sceKernelGetProcessTimeWide();
     VGLR_PRODUCER_WAIT_UNTIL(s_jobsDone == s_jobsSubmitted);
-    s_fenceUs += sceKernelGetProcessTimeWide() - t0;
+    const uint64_t us = sceKernelGetProcessTimeWide() - t0;
+    s_fenceUs += us;
     s_fenceN++;
+    int i, slot = -1, least = 0;
+    for (i = 0; i < FENCE_SITES; i++)
+    {
+        if (s_fenceSite[i].ra == ra && s_fenceSite[i].who == who) { slot = i; break; }
+        if (s_fenceSite[i].us < s_fenceSite[least].us) least = i;
+    }
+    if (slot < 0)
+    {
+        slot = least;
+        s_fenceSite[slot].who = who; s_fenceSite[slot].ra = ra;
+        s_fenceSite[slot].us = 0; s_fenceSite[slot].n = 0;
+    }
+    s_fenceSite[slot].us += us;
+    s_fenceSite[slot].n++;
+}
+
+static void VGLR_JobFenceWait(void)
+{
+    VGLR_JobFenceWaitAt("wait", __builtin_return_address(0));
 }
 
 int VGLR_JobsEnabled(void)
@@ -776,7 +804,7 @@ void VGLR_JobFence(void)
 {
     if (!s_threaded || VGLR_OnRender() || s_jobsDone == s_jobsSubmitted)
         return;
-    VGLR_JobFenceWait();
+    VGLR_JobFenceWaitAt("VGLR_JobFence", __builtin_return_address(0));
 }
 
 /* Reserves a job of `bytes` payload in the ring and returns the payload for the
@@ -996,6 +1024,15 @@ void VGLR_Report(double frames)
     g_vglrSyncCount = 0;
     fprintf(g_ShDebugLog, "[FRAMEJOB] game thread waited for jobs %.2f times/frame, %.2f ms/frame; swap waited %.2f ms/frame\n",
             s_fenceN / frames, s_fenceUs / frames / 1000.0, s_swapWaitUs / frames / 1000.0);
+    {
+        int i;
+        fprintf(g_ShDebugLog, "[FRAMEJOB]   (address reference: VGLR_Report at %p)\n", (void*)VGLR_Report);
+        for (i = 0; i < FENCE_SITES; i++)
+            if (s_fenceSite[i].n)
+                fprintf(g_ShDebugLog, "[FRAMEJOB]   waited in %s from %p: %.2f ms/frame (%.2f times/frame)\n",
+                        s_fenceSite[i].who, s_fenceSite[i].ra, s_fenceSite[i].us / frames / 1000.0, s_fenceSite[i].n / frames);
+        memset(s_fenceSite, 0, sizeof(s_fenceSite));
+    }
     s_fenceN = 0;
     s_fenceUs = 0;
     s_swapWaitUs = 0;
