@@ -56,6 +56,12 @@ HOOKS = {
     "glUniformMatrix4fv":      "if (count == 1 && !transpose && VGLR_UniformSame(location, value, 64)) return;",
 }
 
+# Recorded without waiting for a running frame job: they touch none of the
+# recorder state the job uses, and the ring keeps them in order behind it.
+# GsDrawOt clears depth before each ordering table, and that wait put the
+# whole world job in front of the UI pass every frame.
+NOFENCE = {"glClear", "glClearDepthf"}
+
 # name -> (pointer param, C expression for payload bytes; may use params)
 PAYLOAD = {
     "glUniform1iv":        ("value", "(size_t)count * 4"),
@@ -149,7 +155,8 @@ def main():
         # recorder
         out.append(decl(ret, n, params) + "\n{")
         call = ', '.join(p for t, p in params)
-        out.append("    VGLR_GAME_FENCE();")
+        if n not in NOFENCE:
+            out.append("    VGLR_GAME_FENCE();")
         if n in HOOKS:
             out.append("    " + HOOKS[n])
         out.append(f"    if (VGLR_Direct()) {{ {n}({call}); return; }}")
@@ -158,7 +165,7 @@ def main():
             out.append(f"    const size_t pay = {expr};")
             out.append(f"    A_{n}* a = (A_{n}*)VGLR_Reserve(OP_{n}, sizeof(A_{n}), pay);")
         else:
-            out.append(f"    A_{n}* a = (A_{n}*)VGLR_Reserve(OP_{n}, sizeof(A_{n}), 0);")
+            out.append(f"    A_{n}* a = (A_{n}*)VGLR_ReserveEx(OP_{n}, sizeof(A_{n}), 0, {0 if n in NOFENCE else 1});")
         for t, p in params:
             if n in PAYLOAD and p == PAYLOAD[n][0]:
                 out.append(f"    a->{p}_bytes = (uint32_t)pay; a->{p}_null = ({p} == NULL);")

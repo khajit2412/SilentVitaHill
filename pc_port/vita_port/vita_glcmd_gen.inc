@@ -75,7 +75,7 @@ void VGLR_glActiveTexture(GLenum texture)
     VGLR_GAME_FENCE();
     if (s_sh.activeUnit == texture) return; s_sh.activeUnit = texture;
     if (VGLR_Direct()) { glActiveTexture(texture); return; }
-    A_glActiveTexture* a = (A_glActiveTexture*)VGLR_Reserve(OP_glActiveTexture, sizeof(A_glActiveTexture), 0);
+    A_glActiveTexture* a = (A_glActiveTexture*)VGLR_ReserveEx(OP_glActiveTexture, sizeof(A_glActiveTexture), 0, 1);
     a->texture = texture;
     VGLR_Commit();
 }
@@ -89,7 +89,7 @@ void VGLR_glAttachShader(GLuint prog, GLuint shad)
 {
     VGLR_GAME_FENCE();
     if (VGLR_Direct()) { glAttachShader(prog, shad); return; }
-    A_glAttachShader* a = (A_glAttachShader*)VGLR_Reserve(OP_glAttachShader, sizeof(A_glAttachShader), 0);
+    A_glAttachShader* a = (A_glAttachShader*)VGLR_ReserveEx(OP_glAttachShader, sizeof(A_glAttachShader), 0, 1);
     a->prog = prog;
     a->shad = shad;
     VGLR_Commit();
@@ -105,7 +105,7 @@ void VGLR_glBindBuffer(GLenum target, GLuint buffer)
     VGLR_GAME_FENCE();
     if (target == GL_ARRAY_BUFFER) s_sh.arrayBuffer = buffer;
     if (VGLR_Direct()) { glBindBuffer(target, buffer); return; }
-    A_glBindBuffer* a = (A_glBindBuffer*)VGLR_Reserve(OP_glBindBuffer, sizeof(A_glBindBuffer), 0);
+    A_glBindBuffer* a = (A_glBindBuffer*)VGLR_ReserveEx(OP_glBindBuffer, sizeof(A_glBindBuffer), 0, 1);
     a->target = target;
     a->buffer = buffer;
     VGLR_Commit();
@@ -121,7 +121,7 @@ void VGLR_glBindFramebuffer(GLenum target, GLuint framebuffer)
     VGLR_GAME_FENCE();
     VGLR_Shadow_BindFramebuffer(target, framebuffer);
     if (VGLR_Direct()) { glBindFramebuffer(target, framebuffer); return; }
-    A_glBindFramebuffer* a = (A_glBindFramebuffer*)VGLR_Reserve(OP_glBindFramebuffer, sizeof(A_glBindFramebuffer), 0);
+    A_glBindFramebuffer* a = (A_glBindFramebuffer*)VGLR_ReserveEx(OP_glBindFramebuffer, sizeof(A_glBindFramebuffer), 0, 1);
     a->target = target;
     a->framebuffer = framebuffer;
     VGLR_Commit();
@@ -136,7 +136,7 @@ void VGLR_glBindRenderbuffer(GLenum target, GLuint renderbuffer)
 {
     VGLR_GAME_FENCE();
     if (VGLR_Direct()) { glBindRenderbuffer(target, renderbuffer); return; }
-    A_glBindRenderbuffer* a = (A_glBindRenderbuffer*)VGLR_Reserve(OP_glBindRenderbuffer, sizeof(A_glBindRenderbuffer), 0);
+    A_glBindRenderbuffer* a = (A_glBindRenderbuffer*)VGLR_ReserveEx(OP_glBindRenderbuffer, sizeof(A_glBindRenderbuffer), 0, 1);
     a->target = target;
     a->renderbuffer = renderbuffer;
     VGLR_Commit();
@@ -152,7 +152,7 @@ void VGLR_glBindTexture(GLenum target, GLuint texture)
     VGLR_GAME_FENCE();
     if (target == GL_TEXTURE_2D && s_sh.activeUnit - GL_TEXTURE0 < 32u) { if (s_sh.tex2D[s_sh.activeUnit - GL_TEXTURE0] == texture) return; s_sh.tex2D[s_sh.activeUnit - GL_TEXTURE0] = texture; }
     if (VGLR_Direct()) { glBindTexture(target, texture); return; }
-    A_glBindTexture* a = (A_glBindTexture*)VGLR_Reserve(OP_glBindTexture, sizeof(A_glBindTexture), 0);
+    A_glBindTexture* a = (A_glBindTexture*)VGLR_ReserveEx(OP_glBindTexture, sizeof(A_glBindTexture), 0, 1);
     a->target = target;
     a->texture = texture;
     VGLR_Commit();
@@ -167,7 +167,7 @@ void VGLR_glBindVertexArray(GLuint array)
     VGLR_GAME_FENCE();
     s_sh.vao = array;
     if (VGLR_Direct()) { glBindVertexArray(array); return; }
-    A_glBindVertexArray* a = (A_glBindVertexArray*)VGLR_Reserve(OP_glBindVertexArray, sizeof(A_glBindVertexArray), 0);
+    A_glBindVertexArray* a = (A_glBindVertexArray*)VGLR_ReserveEx(OP_glBindVertexArray, sizeof(A_glBindVertexArray), 0, 1);
     a->array = array;
     VGLR_Commit();
 }
@@ -181,7 +181,7 @@ void VGLR_glBlendEquation(GLenum mode)
     VGLR_GAME_FENCE();
     s_sh.blendEq[0] = s_sh.blendEq[1] = mode;
     if (VGLR_Direct()) { glBlendEquation(mode); return; }
-    A_glBlendEquation* a = (A_glBlendEquation*)VGLR_Reserve(OP_glBlendEquation, sizeof(A_glBlendEquation), 0);
+    A_glBlendEquation* a = (A_glBlendEquation*)VGLR_ReserveEx(OP_glBlendEquation, sizeof(A_glBlendEquation), 0, 1);
     a->mode = mode;
     VGLR_Commit();
 }
@@ -196,7 +196,7 @@ void VGLR_glBlendEquationSeparate(GLenum modeRGB, GLenum modeAlpha)
     VGLR_GAME_FENCE();
     s_sh.blendEq[0] = modeRGB; s_sh.blendEq[1] = modeAlpha;
     if (VGLR_Direct()) { glBlendEquationSeparate(modeRGB, modeAlpha); return; }
-    A_glBlendEquationSeparate* a = (A_glBlendEquationSeparate*)VGLR_Reserve(OP_glBlendEquationSeparate, sizeof(A_glBlendEquationSeparate), 0);
+    A_glBlendEquationSeparate* a = (A_glBlendEquationSeparate*)VGLR_ReserveEx(OP_glBlendEquationSeparate, sizeof(A_glBlendEquationSeparate), 0, 1);
     a->modeRGB = modeRGB;
     a->modeAlpha = modeAlpha;
     VGLR_Commit();
@@ -212,7 +212,7 @@ void VGLR_glBlendFunc(GLenum sfactor, GLenum dfactor)
     VGLR_GAME_FENCE();
     s_sh.blend[0] = s_sh.blend[2] = sfactor; s_sh.blend[1] = s_sh.blend[3] = dfactor;
     if (VGLR_Direct()) { glBlendFunc(sfactor, dfactor); return; }
-    A_glBlendFunc* a = (A_glBlendFunc*)VGLR_Reserve(OP_glBlendFunc, sizeof(A_glBlendFunc), 0);
+    A_glBlendFunc* a = (A_glBlendFunc*)VGLR_ReserveEx(OP_glBlendFunc, sizeof(A_glBlendFunc), 0, 1);
     a->sfactor = sfactor;
     a->dfactor = dfactor;
     VGLR_Commit();
@@ -230,7 +230,7 @@ void VGLR_glBlendFuncSeparate(GLenum srcRGB, GLenum dstRGB, GLenum srcAlpha, GLe
     VGLR_GAME_FENCE();
     s_sh.blend[0] = srcRGB; s_sh.blend[1] = dstRGB; s_sh.blend[2] = srcAlpha; s_sh.blend[3] = dstAlpha;
     if (VGLR_Direct()) { glBlendFuncSeparate(srcRGB, dstRGB, srcAlpha, dstAlpha); return; }
-    A_glBlendFuncSeparate* a = (A_glBlendFuncSeparate*)VGLR_Reserve(OP_glBlendFuncSeparate, sizeof(A_glBlendFuncSeparate), 0);
+    A_glBlendFuncSeparate* a = (A_glBlendFuncSeparate*)VGLR_ReserveEx(OP_glBlendFuncSeparate, sizeof(A_glBlendFuncSeparate), 0, 1);
     a->srcRGB = srcRGB;
     a->dstRGB = dstRGB;
     a->srcAlpha = srcAlpha;
@@ -255,7 +255,7 @@ void VGLR_glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, 
 {
     VGLR_GAME_FENCE();
     if (VGLR_Direct()) { glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter); return; }
-    A_glBlitFramebuffer* a = (A_glBlitFramebuffer*)VGLR_Reserve(OP_glBlitFramebuffer, sizeof(A_glBlitFramebuffer), 0);
+    A_glBlitFramebuffer* a = (A_glBlitFramebuffer*)VGLR_ReserveEx(OP_glBlitFramebuffer, sizeof(A_glBlitFramebuffer), 0, 1);
     a->srcX0 = srcX0;
     a->srcY0 = srcY0;
     a->srcX1 = srcX1;
@@ -275,9 +275,8 @@ typedef struct {
 
 void VGLR_glClear(GLbitfield mask)
 {
-    VGLR_GAME_FENCE();
     if (VGLR_Direct()) { glClear(mask); return; }
-    A_glClear* a = (A_glClear*)VGLR_Reserve(OP_glClear, sizeof(A_glClear), 0);
+    A_glClear* a = (A_glClear*)VGLR_ReserveEx(OP_glClear, sizeof(A_glClear), 0, 0);
     a->mask = mask;
     VGLR_Commit();
 }
@@ -294,7 +293,7 @@ void VGLR_glClearColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha)
     VGLR_GAME_FENCE();
     s_sh.clear[0] = red; s_sh.clear[1] = green; s_sh.clear[2] = blue; s_sh.clear[3] = alpha;
     if (VGLR_Direct()) { glClearColor(red, green, blue, alpha); return; }
-    A_glClearColor* a = (A_glClearColor*)VGLR_Reserve(OP_glClearColor, sizeof(A_glClearColor), 0);
+    A_glClearColor* a = (A_glClearColor*)VGLR_ReserveEx(OP_glClearColor, sizeof(A_glClearColor), 0, 1);
     a->red = red;
     a->green = green;
     a->blue = blue;
@@ -308,9 +307,8 @@ typedef struct {
 
 void VGLR_glClearDepthf(GLclampf depth)
 {
-    VGLR_GAME_FENCE();
     if (VGLR_Direct()) { glClearDepthf(depth); return; }
-    A_glClearDepthf* a = (A_glClearDepthf*)VGLR_Reserve(OP_glClearDepthf, sizeof(A_glClearDepthf), 0);
+    A_glClearDepthf* a = (A_glClearDepthf*)VGLR_ReserveEx(OP_glClearDepthf, sizeof(A_glClearDepthf), 0, 0);
     a->depth = depth;
     VGLR_Commit();
 }
@@ -323,7 +321,7 @@ void VGLR_glCompileShader(GLuint shader)
 {
     VGLR_GAME_FENCE();
     if (VGLR_Direct()) { glCompileShader(shader); return; }
-    A_glCompileShader* a = (A_glCompileShader*)VGLR_Reserve(OP_glCompileShader, sizeof(A_glCompileShader), 0);
+    A_glCompileShader* a = (A_glCompileShader*)VGLR_ReserveEx(OP_glCompileShader, sizeof(A_glCompileShader), 0, 1);
     a->shader = shader;
     VGLR_Commit();
 }
@@ -343,7 +341,7 @@ void VGLR_glCopyTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint y
 {
     VGLR_GAME_FENCE();
     if (VGLR_Direct()) { glCopyTexSubImage2D(target, level, xoffset, yoffset, x, y, width, height); return; }
-    A_glCopyTexSubImage2D* a = (A_glCopyTexSubImage2D*)VGLR_Reserve(OP_glCopyTexSubImage2D, sizeof(A_glCopyTexSubImage2D), 0);
+    A_glCopyTexSubImage2D* a = (A_glCopyTexSubImage2D*)VGLR_ReserveEx(OP_glCopyTexSubImage2D, sizeof(A_glCopyTexSubImage2D), 0, 1);
     a->target = target;
     a->level = level;
     a->xoffset = xoffset;
@@ -364,7 +362,7 @@ void VGLR_glDeleteProgram(GLuint prog)
     VGLR_GAME_FENCE();
     if (s_sh.program == prog) s_sh.program = 0; VGLR_UniformCacheClear();
     if (VGLR_Direct()) { glDeleteProgram(prog); return; }
-    A_glDeleteProgram* a = (A_glDeleteProgram*)VGLR_Reserve(OP_glDeleteProgram, sizeof(A_glDeleteProgram), 0);
+    A_glDeleteProgram* a = (A_glDeleteProgram*)VGLR_ReserveEx(OP_glDeleteProgram, sizeof(A_glDeleteProgram), 0, 1);
     a->prog = prog;
     VGLR_Commit();
 }
@@ -377,7 +375,7 @@ void VGLR_glDeleteShader(GLuint shad)
 {
     VGLR_GAME_FENCE();
     if (VGLR_Direct()) { glDeleteShader(shad); return; }
-    A_glDeleteShader* a = (A_glDeleteShader*)VGLR_Reserve(OP_glDeleteShader, sizeof(A_glDeleteShader), 0);
+    A_glDeleteShader* a = (A_glDeleteShader*)VGLR_ReserveEx(OP_glDeleteShader, sizeof(A_glDeleteShader), 0, 1);
     a->shad = shad;
     VGLR_Commit();
 }
@@ -391,7 +389,7 @@ void VGLR_glDepthFunc(GLenum func)
     VGLR_GAME_FENCE();
     s_sh.depthFunc = func;
     if (VGLR_Direct()) { glDepthFunc(func); return; }
-    A_glDepthFunc* a = (A_glDepthFunc*)VGLR_Reserve(OP_glDepthFunc, sizeof(A_glDepthFunc), 0);
+    A_glDepthFunc* a = (A_glDepthFunc*)VGLR_ReserveEx(OP_glDepthFunc, sizeof(A_glDepthFunc), 0, 1);
     a->func = func;
     VGLR_Commit();
 }
@@ -404,7 +402,7 @@ void VGLR_glDepthMask(GLboolean flag)
 {
     VGLR_GAME_FENCE();
     if (VGLR_Direct()) { glDepthMask(flag); return; }
-    A_glDepthMask* a = (A_glDepthMask*)VGLR_Reserve(OP_glDepthMask, sizeof(A_glDepthMask), 0);
+    A_glDepthMask* a = (A_glDepthMask*)VGLR_ReserveEx(OP_glDepthMask, sizeof(A_glDepthMask), 0, 1);
     a->flag = flag;
     VGLR_Commit();
 }
@@ -418,7 +416,7 @@ void VGLR_glDisable(GLenum cap)
     VGLR_GAME_FENCE();
     VGLR_Shadow_Cap(cap, 0);
     if (VGLR_Direct()) { glDisable(cap); return; }
-    A_glDisable* a = (A_glDisable*)VGLR_Reserve(OP_glDisable, sizeof(A_glDisable), 0);
+    A_glDisable* a = (A_glDisable*)VGLR_ReserveEx(OP_glDisable, sizeof(A_glDisable), 0, 1);
     a->cap = cap;
     VGLR_Commit();
 }
@@ -433,7 +431,7 @@ void VGLR_glDrawArrays(GLenum mode, GLint first, GLsizei count)
 {
     VGLR_GAME_FENCE();
     if (VGLR_Direct()) { glDrawArrays(mode, first, count); return; }
-    A_glDrawArrays* a = (A_glDrawArrays*)VGLR_Reserve(OP_glDrawArrays, sizeof(A_glDrawArrays), 0);
+    A_glDrawArrays* a = (A_glDrawArrays*)VGLR_ReserveEx(OP_glDrawArrays, sizeof(A_glDrawArrays), 0, 1);
     a->mode = mode;
     a->first = first;
     a->count = count;
@@ -449,7 +447,7 @@ void VGLR_glEnable(GLenum cap)
     VGLR_GAME_FENCE();
     VGLR_Shadow_Cap(cap, 1);
     if (VGLR_Direct()) { glEnable(cap); return; }
-    A_glEnable* a = (A_glEnable*)VGLR_Reserve(OP_glEnable, sizeof(A_glEnable), 0);
+    A_glEnable* a = (A_glEnable*)VGLR_ReserveEx(OP_glEnable, sizeof(A_glEnable), 0, 1);
     a->cap = cap;
     VGLR_Commit();
 }
@@ -462,7 +460,7 @@ void VGLR_glEnableVertexAttribArray(GLuint index)
 {
     VGLR_GAME_FENCE();
     if (VGLR_Direct()) { glEnableVertexAttribArray(index); return; }
-    A_glEnableVertexAttribArray* a = (A_glEnableVertexAttribArray*)VGLR_Reserve(OP_glEnableVertexAttribArray, sizeof(A_glEnableVertexAttribArray), 0);
+    A_glEnableVertexAttribArray* a = (A_glEnableVertexAttribArray*)VGLR_ReserveEx(OP_glEnableVertexAttribArray, sizeof(A_glEnableVertexAttribArray), 0, 1);
     a->index = index;
     VGLR_Commit();
 }
@@ -478,7 +476,7 @@ void VGLR_glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum ren
 {
     VGLR_GAME_FENCE();
     if (VGLR_Direct()) { glFramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer); return; }
-    A_glFramebufferRenderbuffer* a = (A_glFramebufferRenderbuffer*)VGLR_Reserve(OP_glFramebufferRenderbuffer, sizeof(A_glFramebufferRenderbuffer), 0);
+    A_glFramebufferRenderbuffer* a = (A_glFramebufferRenderbuffer*)VGLR_ReserveEx(OP_glFramebufferRenderbuffer, sizeof(A_glFramebufferRenderbuffer), 0, 1);
     a->target = target;
     a->attachment = attachment;
     a->renderbuffertarget = renderbuffertarget;
@@ -499,7 +497,7 @@ void VGLR_glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textar
     VGLR_GAME_FENCE();
     VGLR_MemTexFbo(texture);
     if (VGLR_Direct()) { glFramebufferTexture2D(target, attachment, textarget, texture, level); return; }
-    A_glFramebufferTexture2D* a = (A_glFramebufferTexture2D*)VGLR_Reserve(OP_glFramebufferTexture2D, sizeof(A_glFramebufferTexture2D), 0);
+    A_glFramebufferTexture2D* a = (A_glFramebufferTexture2D*)VGLR_ReserveEx(OP_glFramebufferTexture2D, sizeof(A_glFramebufferTexture2D), 0, 1);
     a->target = target;
     a->attachment = attachment;
     a->textarget = textarget;
@@ -516,7 +514,7 @@ void VGLR_glGenerateMipmap(GLenum target)
 {
     VGLR_GAME_FENCE();
     if (VGLR_Direct()) { glGenerateMipmap(target); return; }
-    A_glGenerateMipmap* a = (A_glGenerateMipmap*)VGLR_Reserve(OP_glGenerateMipmap, sizeof(A_glGenerateMipmap), 0);
+    A_glGenerateMipmap* a = (A_glGenerateMipmap*)VGLR_ReserveEx(OP_glGenerateMipmap, sizeof(A_glGenerateMipmap), 0, 1);
     a->target = target;
     VGLR_Commit();
 }
@@ -529,7 +527,7 @@ void VGLR_glLineWidth(GLfloat width)
 {
     VGLR_GAME_FENCE();
     if (VGLR_Direct()) { glLineWidth(width); return; }
-    A_glLineWidth* a = (A_glLineWidth*)VGLR_Reserve(OP_glLineWidth, sizeof(A_glLineWidth), 0);
+    A_glLineWidth* a = (A_glLineWidth*)VGLR_ReserveEx(OP_glLineWidth, sizeof(A_glLineWidth), 0, 1);
     a->width = width;
     VGLR_Commit();
 }
@@ -543,7 +541,7 @@ void VGLR_glLinkProgram(GLuint progr)
     VGLR_GAME_FENCE();
     VGLR_UniformCacheClear();
     if (VGLR_Direct()) { glLinkProgram(progr); return; }
-    A_glLinkProgram* a = (A_glLinkProgram*)VGLR_Reserve(OP_glLinkProgram, sizeof(A_glLinkProgram), 0);
+    A_glLinkProgram* a = (A_glLinkProgram*)VGLR_ReserveEx(OP_glLinkProgram, sizeof(A_glLinkProgram), 0, 1);
     a->progr = progr;
     VGLR_Commit();
 }
@@ -557,7 +555,7 @@ void VGLR_glPolygonOffset(GLfloat factor, GLfloat units)
 {
     VGLR_GAME_FENCE();
     if (VGLR_Direct()) { glPolygonOffset(factor, units); return; }
-    A_glPolygonOffset* a = (A_glPolygonOffset*)VGLR_Reserve(OP_glPolygonOffset, sizeof(A_glPolygonOffset), 0);
+    A_glPolygonOffset* a = (A_glPolygonOffset*)VGLR_ReserveEx(OP_glPolygonOffset, sizeof(A_glPolygonOffset), 0, 1);
     a->factor = factor;
     a->units = units;
     VGLR_Commit();
@@ -571,7 +569,7 @@ void VGLR_glReadBuffer(GLenum mode)
 {
     VGLR_GAME_FENCE();
     if (VGLR_Direct()) { glReadBuffer(mode); return; }
-    A_glReadBuffer* a = (A_glReadBuffer*)VGLR_Reserve(OP_glReadBuffer, sizeof(A_glReadBuffer), 0);
+    A_glReadBuffer* a = (A_glReadBuffer*)VGLR_ReserveEx(OP_glReadBuffer, sizeof(A_glReadBuffer), 0, 1);
     a->mode = mode;
     VGLR_Commit();
 }
@@ -588,7 +586,7 @@ void VGLR_glRenderbufferStorage(GLenum target, GLenum internalformat, GLsizei wi
     VGLR_GAME_FENCE();
     VGLR_MemRb(width, height);
     if (VGLR_Direct()) { glRenderbufferStorage(target, internalformat, width, height); return; }
-    A_glRenderbufferStorage* a = (A_glRenderbufferStorage*)VGLR_Reserve(OP_glRenderbufferStorage, sizeof(A_glRenderbufferStorage), 0);
+    A_glRenderbufferStorage* a = (A_glRenderbufferStorage*)VGLR_ReserveEx(OP_glRenderbufferStorage, sizeof(A_glRenderbufferStorage), 0, 1);
     a->target = target;
     a->internalformat = internalformat;
     a->width = width;
@@ -608,7 +606,7 @@ void VGLR_glScissor(GLint x, GLint y, GLsizei width, GLsizei height)
     VGLR_GAME_FENCE();
     s_sh.scissor[0] = x; s_sh.scissor[1] = y; s_sh.scissor[2] = width; s_sh.scissor[3] = height; s_sh.scissorValid = 1;
     if (VGLR_Direct()) { glScissor(x, y, width, height); return; }
-    A_glScissor* a = (A_glScissor*)VGLR_Reserve(OP_glScissor, sizeof(A_glScissor), 0);
+    A_glScissor* a = (A_glScissor*)VGLR_ReserveEx(OP_glScissor, sizeof(A_glScissor), 0, 1);
     a->x = x;
     a->y = y;
     a->width = width;
@@ -626,7 +624,7 @@ void VGLR_glStencilFunc(GLenum func, GLint ref, GLuint mask)
 {
     VGLR_GAME_FENCE();
     if (VGLR_Direct()) { glStencilFunc(func, ref, mask); return; }
-    A_glStencilFunc* a = (A_glStencilFunc*)VGLR_Reserve(OP_glStencilFunc, sizeof(A_glStencilFunc), 0);
+    A_glStencilFunc* a = (A_glStencilFunc*)VGLR_ReserveEx(OP_glStencilFunc, sizeof(A_glStencilFunc), 0, 1);
     a->func = func;
     a->ref = ref;
     a->mask = mask;
@@ -643,7 +641,7 @@ void VGLR_glStencilOp(GLenum sfail, GLenum dpfail, GLenum dppass)
 {
     VGLR_GAME_FENCE();
     if (VGLR_Direct()) { glStencilOp(sfail, dpfail, dppass); return; }
-    A_glStencilOp* a = (A_glStencilOp*)VGLR_Reserve(OP_glStencilOp, sizeof(A_glStencilOp), 0);
+    A_glStencilOp* a = (A_glStencilOp*)VGLR_ReserveEx(OP_glStencilOp, sizeof(A_glStencilOp), 0, 1);
     a->sfail = sfail;
     a->dpfail = dpfail;
     a->dppass = dppass;
@@ -660,7 +658,7 @@ void VGLR_glTexParameterf(GLenum target, GLenum pname, GLfloat param)
 {
     VGLR_GAME_FENCE();
     if (VGLR_Direct()) { glTexParameterf(target, pname, param); return; }
-    A_glTexParameterf* a = (A_glTexParameterf*)VGLR_Reserve(OP_glTexParameterf, sizeof(A_glTexParameterf), 0);
+    A_glTexParameterf* a = (A_glTexParameterf*)VGLR_ReserveEx(OP_glTexParameterf, sizeof(A_glTexParameterf), 0, 1);
     a->target = target;
     a->pname = pname;
     a->param = param;
@@ -677,7 +675,7 @@ void VGLR_glTexParameteri(GLenum target, GLenum pname, GLint param)
 {
     VGLR_GAME_FENCE();
     if (VGLR_Direct()) { glTexParameteri(target, pname, param); return; }
-    A_glTexParameteri* a = (A_glTexParameteri*)VGLR_Reserve(OP_glTexParameteri, sizeof(A_glTexParameteri), 0);
+    A_glTexParameteri* a = (A_glTexParameteri*)VGLR_ReserveEx(OP_glTexParameteri, sizeof(A_glTexParameteri), 0, 1);
     a->target = target;
     a->pname = pname;
     a->param = param;
@@ -694,7 +692,7 @@ void VGLR_glUniform1f(GLint location, GLfloat v0)
     VGLR_GAME_FENCE();
     if (VGLR_UniformSame(location, &v0, 4)) return;
     if (VGLR_Direct()) { glUniform1f(location, v0); return; }
-    A_glUniform1f* a = (A_glUniform1f*)VGLR_Reserve(OP_glUniform1f, sizeof(A_glUniform1f), 0);
+    A_glUniform1f* a = (A_glUniform1f*)VGLR_ReserveEx(OP_glUniform1f, sizeof(A_glUniform1f), 0, 1);
     a->location = location;
     a->v0 = v0;
     VGLR_Commit();
@@ -710,7 +708,7 @@ void VGLR_glUniform1i(GLint location, GLint v0)
     VGLR_GAME_FENCE();
     if (VGLR_UniformSame(location, &v0, 4)) return;
     if (VGLR_Direct()) { glUniform1i(location, v0); return; }
-    A_glUniform1i* a = (A_glUniform1i*)VGLR_Reserve(OP_glUniform1i, sizeof(A_glUniform1i), 0);
+    A_glUniform1i* a = (A_glUniform1i*)VGLR_ReserveEx(OP_glUniform1i, sizeof(A_glUniform1i), 0, 1);
     a->location = location;
     a->v0 = v0;
     VGLR_Commit();
@@ -727,7 +725,7 @@ void VGLR_glUniform2f(GLint location, GLfloat v0, GLfloat v1)
     VGLR_GAME_FENCE();
     { const GLfloat t[2] = { v0, v1 }; if (VGLR_UniformSame(location, t, 8)) return; }
     if (VGLR_Direct()) { glUniform2f(location, v0, v1); return; }
-    A_glUniform2f* a = (A_glUniform2f*)VGLR_Reserve(OP_glUniform2f, sizeof(A_glUniform2f), 0);
+    A_glUniform2f* a = (A_glUniform2f*)VGLR_ReserveEx(OP_glUniform2f, sizeof(A_glUniform2f), 0, 1);
     a->location = location;
     a->v0 = v0;
     a->v1 = v1;
@@ -747,7 +745,7 @@ void VGLR_glUniform4f(GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloa
     VGLR_GAME_FENCE();
     { const GLfloat t[4] = { v0, v1, v2, v3 }; if (VGLR_UniformSame(location, t, 16)) return; }
     if (VGLR_Direct()) { glUniform4f(location, v0, v1, v2, v3); return; }
-    A_glUniform4f* a = (A_glUniform4f*)VGLR_Reserve(OP_glUniform4f, sizeof(A_glUniform4f), 0);
+    A_glUniform4f* a = (A_glUniform4f*)VGLR_ReserveEx(OP_glUniform4f, sizeof(A_glUniform4f), 0, 1);
     a->location = location;
     a->v0 = v0;
     a->v1 = v1;
@@ -765,7 +763,7 @@ void VGLR_glUseProgram(GLuint program)
     VGLR_GAME_FENCE();
     s_sh.program = program;
     if (VGLR_Direct()) { glUseProgram(program); return; }
-    A_glUseProgram* a = (A_glUseProgram*)VGLR_Reserve(OP_glUseProgram, sizeof(A_glUseProgram), 0);
+    A_glUseProgram* a = (A_glUseProgram*)VGLR_ReserveEx(OP_glUseProgram, sizeof(A_glUseProgram), 0, 1);
     a->program = program;
     VGLR_Commit();
 }
@@ -782,7 +780,7 @@ void VGLR_glViewport(GLint x, GLint y, GLsizei width, GLsizei height)
     VGLR_GAME_FENCE();
     s_sh.viewport[0] = x; s_sh.viewport[1] = y; s_sh.viewport[2] = width; s_sh.viewport[3] = height; s_sh.viewportValid = 1;
     if (VGLR_Direct()) { glViewport(x, y, width, height); return; }
-    A_glViewport* a = (A_glViewport*)VGLR_Reserve(OP_glViewport, sizeof(A_glViewport), 0);
+    A_glViewport* a = (A_glViewport*)VGLR_ReserveEx(OP_glViewport, sizeof(A_glViewport), 0, 1);
     a->x = x;
     a->y = y;
     a->width = width;
@@ -803,7 +801,7 @@ void VGLR_glVertexAttribPointer(GLuint index, GLint size, GLenum type, GLboolean
 {
     VGLR_GAME_FENCE();
     if (VGLR_Direct()) { glVertexAttribPointer(index, size, type, normalized, stride, pointer); return; }
-    A_glVertexAttribPointer* a = (A_glVertexAttribPointer*)VGLR_Reserve(OP_glVertexAttribPointer, sizeof(A_glVertexAttribPointer), 0);
+    A_glVertexAttribPointer* a = (A_glVertexAttribPointer*)VGLR_ReserveEx(OP_glVertexAttribPointer, sizeof(A_glVertexAttribPointer), 0, 1);
     a->index = index;
     a->size = size;
     a->type = type;
@@ -821,7 +819,7 @@ void VGLR_vglWaitVblankStart(GLboolean enable)
 {
     VGLR_GAME_FENCE();
     if (VGLR_Direct()) { vglWaitVblankStart(enable); return; }
-    A_vglWaitVblankStart* a = (A_vglWaitVblankStart*)VGLR_Reserve(OP_vglWaitVblankStart, sizeof(A_vglWaitVblankStart), 0);
+    A_vglWaitVblankStart* a = (A_vglWaitVblankStart*)VGLR_ReserveEx(OP_vglWaitVblankStart, sizeof(A_vglWaitVblankStart), 0, 1);
     a->enable = enable;
     VGLR_Commit();
 }
@@ -836,7 +834,7 @@ void VGLR_glPixelStorei(GLenum pname, GLint param)
     VGLR_GAME_FENCE();
     VGLR_TrackPixelStore(pname, param);
     if (VGLR_Direct()) { glPixelStorei(pname, param); return; }
-    A_glPixelStorei* a = (A_glPixelStorei*)VGLR_Reserve(OP_glPixelStorei, sizeof(A_glPixelStorei), 0);
+    A_glPixelStorei* a = (A_glPixelStorei*)VGLR_ReserveEx(OP_glPixelStorei, sizeof(A_glPixelStorei), 0, 1);
     a->pname = pname;
     a->param = param;
     VGLR_Commit();

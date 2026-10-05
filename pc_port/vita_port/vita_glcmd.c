@@ -178,12 +178,15 @@ static void VGLR_Publish(void)
 
 static void VGLR_Commit(void);
 
-static void* VGLR_Reserve(uint16_t op, size_t argsSize, size_t payload)
+#define VGLR_Reserve(op, argsSize, payload) VGLR_ReserveEx(op, argsSize, payload, 1)
+
+static void* VGLR_ReserveEx(uint16_t op, size_t argsSize, size_t payload, int fence)
 {
     /* Anything the game thread records while a frame job is still running
      * would read or change renderer state under it: wait for the job first.
-     * The swap and further jobs queue behind it in order and need no wait. */
-    if (s_jobsDone != s_jobsSubmitted && op != OP_SWAP && op != OP_JOB)
+     * The swap, further jobs and the NOFENCE ops (gen_glcmd.py) queue behind
+     * it in order and need no wait. */
+    if (fence && s_jobsDone != s_jobsSubmitted && op != OP_SWAP && op != OP_JOB)
         VGLR_JobFenceWait();
 
     /* A scratch upload left uncommitted (nothing called vglBufferData on it)
