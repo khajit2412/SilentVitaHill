@@ -676,16 +676,19 @@ static void Pc_TpsCamera_Apply(void)
             if (g_TpsCamPitch < -Q12_ANGLE(82.0f)) g_TpsCamPitch = -Q12_ANGLE(82.0f);
             if (g_TpsCamPitch >  Q12_ANGLE(82.0f)) g_TpsCamPitch =  Q12_ANGLE(82.0f);
 
-            /* Look up to ±90° of Harry's BODY yaw while standing still; past
+            /* Look up to ±45° of Harry's BODY yaw while standing still; past
              * that the body turns with the view (dragged along at the edge), so
-             * a full 360° turn works in place. When moving or aiming the body
+             * a full 360° turn works in place. ±90° let the view swing over the
+             * shoulders, which clipped into it. When moving or aiming the body
              * snaps to the camera anyway (player_control). */
             {
+                #define FPS_BODY_TURN Q12_ANGLE(45.0f)
                 s32 yd = Math_AngleNormalizeSigned(g_TpsCamYaw - tp_hr->rotation.vy);
-                if (yd >  Q12_ANGLE(90.0f))
-                    tp_hr->rotation.vy = Q12_ANGLE_NORM_U(g_TpsCamYaw - Q12_ANGLE(90.0f) + Q12_ANGLE(360.0f));
-                else if (yd < -Q12_ANGLE(90.0f))
-                    tp_hr->rotation.vy = Q12_ANGLE_NORM_U(g_TpsCamYaw + Q12_ANGLE(90.0f) + Q12_ANGLE(360.0f));
+                if (yd >  FPS_BODY_TURN)
+                    tp_hr->rotation.vy = Q12_ANGLE_NORM_U(g_TpsCamYaw - FPS_BODY_TURN + Q12_ANGLE(360.0f));
+                else if (yd < -FPS_BODY_TURN)
+                    tp_hr->rotation.vy = Q12_ANGLE_NORM_U(g_TpsCamYaw + FPS_BODY_TURN + Q12_ANGLE(360.0f));
+                #undef FPS_BODY_TURN
             }
         } else {
             if (g_TpsCamPitch < -Q12_ANGLE(40.0f)) g_TpsCamPitch = -Q12_ANGLE(40.0f);
