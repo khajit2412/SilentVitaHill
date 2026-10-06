@@ -3401,6 +3401,9 @@ void MainLoop(void) // 0x80032EE0
                             if (h[dt > 200 ? 200 : dt] < 0xFFFF)
                                 h[dt > 200 ? 200 : dt]++;
                         }
+#ifdef SH_VITA
+                        { extern void Pc_VitaGpuBenchFrame(u32 dtMs); Pc_VitaGpuBenchFrame(dt); }
+#endif
                     }
 #ifdef SH_VITA
                     {
@@ -4686,3 +4689,78 @@ void MainLoop(void) // 0x80032EE0
     #undef H_BLANKS_GRAVITY_SCALE
     #undef V_BLANKS_MAX
 }
+
+#ifdef SH_VITA
+/* Shadow_Test = Auto_Bench: while the player stands still, cycle the flashlight
+ * configurations and log each one's frame time and GPU (swap) wait, so their
+ * GPU cost is compared on the same view without menu frames mixed in. */
+void Pc_VitaGpuBenchFrame(u32 dtMs)
+{
+    extern int g_vitaShadowTest;
+    extern uint64_t VGLR_SwapWaitTotalUs(void);
+    static const struct { int mode, test; const char* name; } SEG[] = {
+        { 3, 0, "M+Shadows" }, { 2, 0, "Modern" }, { 3, 1, "M+Shadows No_Lookup" },
+        { 3, 2, "M+Shadows No_Map" }, { 1, 0, "C+Shadows" }, { 0, 0, "Classic" },
+    };
+    #define BENCH_SETTLE 60
+    #define BENCH_FRAMES 240
+    static int s_seg = -1, s_frame, s_origMode, s_hist[201];
+    static uint64_t s_wait0;
+    static u32 s_ms;
+
+    if (s_seg < 0)
+    {
+        if (g_vitaShadowTest != 3)
+            return;
+        s_origMode = g_PcConfig.flashlightMode;
+        s_seg = 0;
+        s_frame = 0;
+        SH_DBG("[GPUBENCH] start: stand still, %d segments of %d frames", (int)ARRAY_SIZE(SEG), BENCH_FRAMES);
+        Pc_FlashlightModeApply(SEG[0].mode, 0);
+        g_vitaShadowTest = SEG[0].test;
+        return;
+    }
+
+    if (s_frame == BENCH_SETTLE)
+    {
+        s_wait0 = VGLR_SwapWaitTotalUs();
+        s_ms = 0;
+        memset(s_hist, 0, sizeof(s_hist));
+    }
+    if (s_frame >= BENCH_SETTLE)
+    {
+        s_ms += dtMs;
+        s_hist[dtMs > 200 ? 200 : dtMs]++;
+    }
+    if (++s_frame < BENCH_SETTLE + BENCH_FRAMES)
+        return;
+
+    {
+        const int n = BENCH_FRAMES;
+        int i, acc = 0, p50 = 0, p90 = 0;
+        for (i = 0; i <= 200; i++)
+        {
+            acc += s_hist[i];
+            if (!p50 && acc * 2 >= n) p50 = i ? i : 1;
+            if (!p90 && acc * 10 >= n * 9) p90 = i ? i : 1;
+        }
+        SH_DBG("[GPUBENCH] %-20s avg %.1f fps, median %.1f, 10%% low %.1f, GPU wait %.2f ms/frame",
+               SEG[s_seg].name, 1000.0 * n / (double)s_ms, 1000.0 / p50, 1000.0 / p90,
+               (double)(VGLR_SwapWaitTotalUs() - s_wait0) / n / 1000.0);
+    }
+
+    if (++s_seg < (int)ARRAY_SIZE(SEG))
+    {
+        s_frame = 0;
+        Pc_FlashlightModeApply(SEG[s_seg].mode, 0);
+        g_vitaShadowTest = SEG[s_seg].test;
+        return;
+    }
+    SH_DBG("[GPUBENCH] done");
+    Pc_FlashlightModeApply(s_origMode, 0);
+    g_vitaShadowTest = 0;
+    s_seg = -1;
+    #undef BENCH_SETTLE
+    #undef BENCH_FRAMES
+}
+#endif

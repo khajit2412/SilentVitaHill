@@ -55,7 +55,12 @@ static int               s_jobsOn = 0;
 /* [FRAMEJOB] game-thread waits on unfinished jobs, and the swap's wait for
  * the render thread: where the two threads still serialize. */
 static uint32_t s_fenceN;
-static uint64_t s_fenceUs, s_swapWaitUs;
+static uint64_t s_fenceUs, s_swapWaitUs, s_swapWaitAllUs;
+
+uint64_t VGLR_SwapWaitTotalUs(void)
+{
+    return s_swapWaitAllUs;
+}
 
 static inline uint32_t VGLR_Tls(void)
 {
@@ -741,7 +746,9 @@ void VGLR_vglSwapBuffers(GLboolean has_commondialog)
     {
         const uint64_t t0 = sceKernelGetProcessTimeWide();
         VGLR_PRODUCER_WAIT_UNTIL(s_framesSubmitted - s_framesDone <= 1);
-        s_swapWaitUs += sceKernelGetProcessTimeWide() - t0;
+        const uint64_t w = sceKernelGetProcessTimeWide() - t0;
+        s_swapWaitUs += w;
+        s_swapWaitAllUs += w;
     }
 
     {
