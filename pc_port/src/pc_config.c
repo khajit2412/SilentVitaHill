@@ -35,8 +35,12 @@ s_PcConfig g_PcConfig = {
     .preloadChunks  = 1,
     .vsync          = 0,
     .refreshRate    = 0,
-#if defined(SH_IOS) || defined(__ANDROID__) || defined(SH_VITA)
-    /* 60 on a phone (and the Vita, where it shows performance headroom). 30 is the PSX-accurate gameplay rate and stays the desktop
+#if defined(SH_VITA)
+    /* The Vita holds about 30 in heavy areas, so a 30 cap keeps the frame
+     * pacing even instead of swinging between 25 and 40. */
+    .fpsCap         = 30,
+#elif defined(SH_IOS) || defined(__ANDROID__)
+    /* 60 on a phone. 30 is the PSX-accurate gameplay rate and stays the desktop
      * default, but a phone panel runs at 60 or better and the port paces
      * everything off g_DeltaTime, so 30 only halves the motion for nothing. */
     .fpsCap         = 60,
@@ -1669,6 +1673,13 @@ else if (strcmp(key, "enable_plugins") == 0)
         {
             g_PcConfig.msaaSamples = 2;
             PcConfig_SaveKeyValue("msaa", "2");
+        }
+
+        /* v15 (Vita only): fps_cap 60 -> 30, see the default above. */
+        if (g_PcConfig.configVersion < 15 && g_PcConfig.fpsCap == 60)
+        {
+            g_PcConfig.fpsCap = 30;
+            PcConfig_SaveKeyValue("fps_cap", "30");
         }
 #endif
 

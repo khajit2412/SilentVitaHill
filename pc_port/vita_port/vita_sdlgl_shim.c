@@ -361,9 +361,16 @@ void VitaGL_SwapWindow(SDL_Window* w)
     vglSwapBuffers(GL_FALSE);
 }
 
+/* vitaGL's eglSwapInterval takes any vblank count (vglWaitVblankStart only
+ * 0/1): 2 paces a 30 fps cap off the display itself. */
+static void T_SwapInterval(void* p)
+{
+    eglSwapInterval(NULL, (int)(intptr_t)p);
+}
+
 int VitaGL_SetSwapInterval(int interval)
 {
-    vglWaitVblankStart(interval ? GL_TRUE : GL_FALSE);
+    VGLR_Call(T_SwapInterval, (void*)(intptr_t)(interval < 0 ? 0 : interval));
     return 0;
 }
 

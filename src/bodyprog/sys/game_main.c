@@ -3221,6 +3221,9 @@ void MainLoop(void) // 0x80032EE0
                     static Uint64 s_lastFrameTime = 0;
                     int effectiveMin = g_IntervalVBlanks;
                     int screenUnlocked = Pc_ScreenFpsUnlocked();
+#ifdef SH_VITA
+                    { extern void PsyX_SetSwapInterval(int); PsyX_SetSwapInterval(1); }
+#endif
                     if (g_GameWork.gameState == GameState_InGame || screenUnlocked)
                     {
                         int effectiveFps;
@@ -3270,6 +3273,12 @@ void MainLoop(void) // 0x80032EE0
                         if (Pc_ScriptOwnsScene() &&
                             (effectiveFps <= 0 || effectiveFps > 60))
                             effectiveFps = 60;
+
+#ifdef SH_VITA
+                        /* With vsync on, a 30 cap waits two refreshes per frame so
+                         * the display paces it; everything else waits one. */
+                        { extern void PsyX_SetSwapInterval(int); PsyX_SetSwapInterval(effectiveFps == 30 ? 2 : 1); }
+#endif
 
                         if (effectiveFps <= 0)
                         {
