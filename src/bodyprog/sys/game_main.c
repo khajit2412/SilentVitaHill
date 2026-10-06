@@ -918,13 +918,15 @@ static void Pc_TpsCamera_Apply(void)
             tpCamPos.vy = tp_hr->position.vy + eyeLocal.vy;
 
             /* Running leans Harry's chest forward under the eye; looking down then
-             * shows the inside of the torso. Lift the eye and push it slightly ahead
-             * while running, the forward part clipped by a ray so it never crosses
-             * into doors or walls. */
+             * shows the inside of the torso, and looking down to the side catches
+             * the shoulders. Lift the eye while running and push it slightly ahead
+             * while running or looking down, the forward part clipped by a ray so it
+             * never crosses into doors or walls. */
             {
                 #define RUN_EYE_LIFT Q12(0.06f)
                 #define RUN_EYE_FWD  Q12(0.10f)
                 #define RUN_EYE_WALL Q12(0.15f)
+                #define DOWN_EYE_FWD Q12(0.08f)
                 static s32 s_fpsRunW = 0;
                 s32 spd    = g_SysWork.playerWork.player.moveSpeed;
                 s32 target = (spd <= Q12(2.0f)) ? 0 :
@@ -934,9 +936,15 @@ static void Pc_TpsCamera_Apply(void)
                 s_fpsRunW += TIMESTEP_SCALE_30_FPS(g_DeltaTime, d >> 2);
                 if (d > -16 && d < 16) s_fpsRunW = target;
 
-                if (s_fpsRunW > 0)
+                s32 downW = (viewPitch >= -Q12_ANGLE(20.0f)) ? 0 :
+                            (viewPitch <= -Q12_ANGLE(60.0f)) ? Q12(1.0f) :
+                            (s32)((s64)(-Q12_ANGLE(20.0f) - viewPitch) * Q12(1.0f) / Q12_ANGLE(40.0f));
+                s32 fwd   = (s32)((s64)RUN_EYE_FWD * s_fpsRunW >> 12);
+                s32 fwdDn = (s32)((s64)DOWN_EYE_FWD * downW >> 12);
+                if (fwdDn > fwd) fwd = fwdDn;
+
+                if (fwd > 0)
                 {
-                    s32        fwd = (s32)((s64)RUN_EYE_FWD * s_fpsRunW >> 12);
                     s_RayTrace runTrace;
                     VECTOR3    ahead;
                     tpCamPos.vy -= (s32)((s64)RUN_EYE_LIFT * s_fpsRunW >> 12);
@@ -955,6 +963,7 @@ static void Pc_TpsCamera_Apply(void)
                 #undef RUN_EYE_LIFT
                 #undef RUN_EYE_FWD
                 #undef RUN_EYE_WALL
+                #undef DOWN_EYE_FWD
             }
 
             /* Melee arm clearance: with the eye in the head, raise/swing poses put
