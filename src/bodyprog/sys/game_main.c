@@ -2779,6 +2779,9 @@ void MainLoop(void) // 0x80032EE0
             s_PcPacketBufEnds[1] = s_PcPacketBufs[1] + PC_PKTBUF_SIZE;
             memset(s_PcPacketBufEnds[0], PC_CANARY_VAL, PC_CANARY_SIZE);
             memset(s_PcPacketBufEnds[1], PC_CANARY_VAL, PC_CANARY_SIZE);
+#ifdef SH_VITA
+            { extern void PsyX_SetPacketBuffers(void*, void*); PsyX_SetPacketBuffers(s_PcPacketBufs[0], s_PcPacketBufs[1]); }
+#endif
         }
         GsOUT_PACKET_P = s_PcPacketBufs[g_ActiveBufferIdx];
 #else
