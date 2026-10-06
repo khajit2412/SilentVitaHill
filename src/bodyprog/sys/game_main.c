@@ -673,7 +673,9 @@ static void Pc_TpsCamera_Apply(void)
             /* First-person: allow looking down at the legs / up toward the sky,
              * but stay short of straight up/down so the forward vector + the
              * ratan2 in Vw_SetLookAtMatrix don't degenerate. */
-            if (g_TpsCamPitch < -Q12_ANGLE(82.0f)) g_TpsCamPitch = -Q12_ANGLE(82.0f);
+            /* Look-down stops at 60°: further, the forward lean of the run
+             * cycle put the eye's view down through Harry's neck. */
+            if (g_TpsCamPitch < -Q12_ANGLE(60.0f)) g_TpsCamPitch = -Q12_ANGLE(60.0f);
             if (g_TpsCamPitch >  Q12_ANGLE(82.0f)) g_TpsCamPitch =  Q12_ANGLE(82.0f);
 
             /* Look up to ±45° of Harry's BODY yaw while standing still; past
