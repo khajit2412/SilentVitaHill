@@ -2279,6 +2279,9 @@ void func_80057344(s_ModelInfo* modelInfo, GsOT_TAG* otTag, bool arg2, MATRIX* m
 
     for (curMeshHdr = modelHdr->meshHdrs; curMeshHdr < &modelHdr->meshHdrs[modelHdr->meshCount]; curMeshHdr++)
     {
+#ifdef SH_VITA
+        unsigned long long tp0 = Pc_ProfNowUs(), tp1;
+#endif
         if (vertOffset != 0 || normalOffset != 0)
         {
             func_8005759C(curMeshHdr, scratchData, vertOffset, normalOffset);
@@ -2287,6 +2290,9 @@ void func_80057344(s_ModelInfo* modelInfo, GsOT_TAG* otTag, bool arg2, MATRIX* m
         {
             func_800574D4(curMeshHdr, scratchData);
         }
+#ifdef SH_VITA
+        tp1 = Pc_ProfNowUs(); g_vitaProfUnlit[0] += tp1 - tp0; tp0 = tp1;
+#endif
 
         switch (g_WorldEnvWork.field_0)
         {
@@ -2302,9 +2308,18 @@ void func_80057344(s_ModelInfo* modelInfo, GsOT_TAG* otTag, bool arg2, MATRIX* m
                 break;
         }
 
+#ifdef SH_VITA
+        tp1 = Pc_ProfNowUs(); g_vitaProfUnlit[1] += tp1 - tp0; tp0 = tp1;
+#endif
         func_80057B7C(curMeshHdr, vertOffset, scratchData, mat);
+#ifdef SH_VITA
+        tp1 = Pc_ProfNowUs(); g_vitaProfUnlit[2] += tp1 - tp0; tp0 = tp1;
+#endif
 
         Gfx_MeshDraw(curMeshHdr, scratchData, otTag, arg2);
+#ifdef SH_VITA
+        g_vitaProfUnlit[3] += Pc_ProfNowUs() - tp0;
+#endif
     }
 
 }
