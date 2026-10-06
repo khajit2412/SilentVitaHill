@@ -10,7 +10,7 @@ export VITASDK=/usr/local/vitasdk   # vitasdk snapshot 2026-09-14 used
 cd pc_port
 cmake -S . -B build-vita -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE=$VITASDK/share/vita.toolchain.cmake -DCMAKE_BUILD_TYPE=Release
-ninja -C build-vita            # -> eboot.bin, SilentHillPC.vpk
+ninja -C build-vita            # -> eboot.bin, SilentHillVita.vpk
 ```
 Host needs llvm-nm + llvm-objcopy (static map symbol prefixing), python3.
 
@@ -24,7 +24,7 @@ Host needs llvm-nm + llvm-objcopy (static map symbol prefixing), python3.
   VRAM texture uses GL_RG8 (renderable U8U8 on GXM) instead of ES2 LUMINANCE_ALPHA;
   compat defines for desktop-only paths; EGL typedef clash with vitaGL.h guarded.
 - psycross_static: builds clean for arm-vita-eabi.
-- Game target links: eboot.bin + SilentHillPC.vpk (vitasdk 2026.08, packages snapshot 20260916).
+- Game target links: eboot.bin + SilentHillVita.vpk (vitasdk 2026.08, packages snapshot 20260916).
   glad.h forwards to vitaGL.h; dll_loader / pc_crash / pc_discord_ipc have Vita stubs;
   pc_ra_http.c excluded (RA off); libmathneon added after vitaGL.
 - arm-vita-eabi defaults to SHORT ENUMS (sizeof(enum) == 1). That broke the decomp's

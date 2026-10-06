@@ -1190,7 +1190,7 @@ if(VITA)
     foreach(asset ${SH_VITA_ASSETS})
         list(APPEND SH_VITA_VPK_FILES FILE "${CMAKE_CURRENT_SOURCE_DIR}/${asset}" "${asset}")
     endforeach()
-    vita_create_vpk(SilentHillPC.vpk ${VITA_TITLEID} eboot.bin
+    vita_create_vpk(SilentHillVita.vpk ${VITA_TITLEID} eboot.bin
         VERSION ${VITA_VERSION}
         NAME ${VITA_APP_NAME}
         ${SH_VITA_VPK_FILES}

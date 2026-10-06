@@ -1754,6 +1754,8 @@ static void Options_PcOptionsMenu_EntryStringsDraw(void)
     const char*    HEADING = "iOS_Options";
 #elif defined(__ANDROID__)
     const char*    HEADING = "Android_Options";
+#elif defined(SH_VITA)
+    const char*    HEADING = "Vita_Preferences";
 #else
     const char*    HEADING = "PC_Options";
 #endif
@@ -3061,6 +3063,8 @@ void Options_MainOptionsMenu_EntryStringsDraw(void) // 0x801E42EC
         "iOS_Options",
 #elif defined(__ANDROID__)
         "Android_Options",
+#elif defined(SH_VITA)
+        "Vita_Preferences",
 #elif defined(SH_PC_PORT)
         "PC_Options",
 #else
