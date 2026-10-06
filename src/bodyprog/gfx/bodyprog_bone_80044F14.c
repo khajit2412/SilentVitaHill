@@ -378,15 +378,15 @@ void func_80045534(s_Skeleton* skel, GsOT* ot, s32 arg2, GsCOORDINATE2* boneCoor
             }
 
 #ifdef SH_PC_PORT
-            /* First-person: skip only Harry's Head(2), which clips into the eye.
-             * Hiding the shoulders/upper-arms too leaves the forearms disconnected,
-             * and from the close eye the bare forearm foreshortens into a stretched
-             * bar — so keep the whole arm chain intact. Fog bbox below still runs.
-             * Bones >= 18 exist only on a play-as Lisa skin (hair, parented to the
-             * head) — hide them with it or the hair floats in front of the eye. */
+            /* First-person: draw only Harry's arms, LeftShoulder(3) through
+             * RightHand(10). Head, torso and legs clipped into the eye and filled
+             * the lower view when looking down. The whole arm chain stays: without
+             * the shoulders/upper arms the forearms float and foreshorten into a
+             * stretched bar from the close eye. Fog bbox below still runs. Bones
+             * >= 18 exist only on a play-as Lisa skin (hair) and go with the head. */
             {
                 int _hb = (u8)curBone->bone.idx;
-                if (!(g_PcHideHarryFpsBody && (_hb == 2 || _hb >= 18)))
+                if (!(g_PcHideHarryFpsBody && !(_hb >= 3 && _hb <= 10)))
                 {
                     func_80057090(&curBone->bone.modelInfo, ot, arg2, &viewMat, &worldMat, arg5);
                 }

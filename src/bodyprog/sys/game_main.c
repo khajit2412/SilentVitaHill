@@ -729,15 +729,18 @@ static void Pc_TpsCamera_Apply(void)
             q3_12 headPitchW = ratan2(-fY, hmag);
             q3_12 headYawL   = Math_AngleNormalizeSigned(headYawW - tp_hr->rotation.vy);
 
-            if (!s_fpsHeadRotValid)
+            /* As the head-position reference below: loads pose the bones late,
+             * so only live gameplay may feed the reference. */
+            if (g_GameWork.gameState != GameState_InGame ||
+                g_SysWork.sysState   != SysState_Gameplay)
             {
-                if (g_GameWork.gameState == GameState_InGame &&
-                    g_SysWork.sysState   == SysState_Gameplay)
-                {
-                    s_fpsHeadYawRef   = headYawL;
-                    s_fpsHeadPitchRef = headPitchW;
-                    s_fpsHeadRotValid = 1;
-                }
+                s_fpsHeadRotValid = 0;
+            }
+            else if (!s_fpsHeadRotValid)
+            {
+                s_fpsHeadYawRef   = headYawL;
+                s_fpsHeadPitchRef = headPitchW;
+                s_fpsHeadRotValid = 1;
             }
             else
             {
@@ -858,20 +861,36 @@ static void Pc_TpsCamera_Apply(void)
                  * tracks the lean and cancels it — the eye must ride the head fully
                  * through an aim/swing. >>8 (tau ~4s @60fps) passes the lean and idle
                  * breathing while still nulling multi-second drift. */
-                if (!s_fpsHeadRefValid)
+                /* Track only in settled live gameplay. Room loads and entry
+                 * events move Harry to the new spawn before his bones are posed
+                 * there, so their head offset is garbage; tracking through them
+                 * dragged the reference off and left the eye displaced for
+                 * seconds after every area change. Leaving gameplay drops the
+                 * reference, and it re-seeds a few frames into the next stretch,
+                 * once the skeleton has been posed at the new position. */
                 {
-                    if (g_GameWork.gameState == GameState_InGame &&
-                        g_SysWork.sysState   == SysState_Gameplay)
+                    static int s_fpsSettle = 0;
+                    const int live = g_GameWork.gameState == GameState_InGame &&
+                                     g_SysWork.sysState   == SysState_Gameplay;
+                    if (!live)
                     {
-                        s_fpsHeadRef      = headLocal;
-                        s_fpsHeadRefValid = 1;
+                        s_fpsHeadRefValid = 0;
+                        s_fpsSettle       = 0;
                     }
-                }
-                else
-                {
-                    s_fpsHeadRef.vx += (headLocal.vx - s_fpsHeadRef.vx) >> 8;
-                    s_fpsHeadRef.vy += (headLocal.vy - s_fpsHeadRef.vy) >> 8;
-                    s_fpsHeadRef.vz += (headLocal.vz - s_fpsHeadRef.vz) >> 8;
+                    else if (!s_fpsHeadRefValid)
+                    {
+                        if (++s_fpsSettle >= 4)
+                        {
+                            s_fpsHeadRef      = headLocal;
+                            s_fpsHeadRefValid = 1;
+                        }
+                    }
+                    else
+                    {
+                        s_fpsHeadRef.vx += (headLocal.vx - s_fpsHeadRef.vx) >> 8;
+                        s_fpsHeadRef.vy += (headLocal.vy - s_fpsHeadRef.vy) >> 8;
+                        s_fpsHeadRef.vz += (headLocal.vz - s_fpsHeadRef.vz) >> 8;
+                    }
                 }
 
                 if (s_fpsHeadRefValid)
