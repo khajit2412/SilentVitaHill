@@ -88,7 +88,11 @@ s_PcConfig g_PcConfig = {
     .itemDepthProbe = 0, /* 1=one-shot [ITEMDEPTH] depth dump per item-screen entry (diagnostic) */
     .charaPrimProbe = 0, /* 0=off, else e_CharaId to trace: one-shot [CHARAPRIM] per-model submit/reject dump */
     .psxPolySizeCull = 1, /* 1=PSX GPU parity: cull triangles with screen bbox >1023x511 (hardware never drew them) */
+#ifdef SH_VITA
+    .msaaSamples    = 2, /* Vita: 2x display MSAA by default (vitaGL, next launch) */
+#else
     .msaaSamples    = 0, /* 0=off, 2/4/8 = MSAA sample count */
+#endif
     .renderer       = "gl", /* native OpenGL — the long-tested path */
     .postProcess    = 0, /* 0=off, 1.. = post-process look */
     .tonemap        = 0, /* 0=off, 1=Reinhard, 2=ACES, 3=Filmic */
@@ -1658,6 +1662,13 @@ else if (strcmp(key, "enable_plugins") == 0)
         {
             g_PcConfig.usePgxp = 1;
             PcConfig_SaveKeyValue("use_pgxp", "1");
+        }
+
+        /* v14 (Vita only): 2x MSAA by default. */
+        if (g_PcConfig.configVersion < 14)
+        {
+            g_PcConfig.msaaSamples = 2;
+            PcConfig_SaveKeyValue("msaa", "2");
         }
 #endif
 
