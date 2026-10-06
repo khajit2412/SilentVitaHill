@@ -903,11 +903,18 @@ static int VGLR_ThreadMain(SceSize args, void* argp)
     return 0;
 }
 
-/* Affinity for the helper threads (timing, disc streaming, vitaGL's garbage
- * collector): core 3 when a CoreUnlocker80000H / CapUnlocker plugin lets apps
- * onto the system core, else core 2. Probed once, by moving the calling thread
- * there and back; on a stock Vita the kernel refuses and nothing changes. */
+/* Core 2 is the game's own and was idle: the threads that must run on time go
+ * there -- the vblank timer (frame pacing), the audio mixer and vitaGL's
+ * garbage collector, which every swap waits for. Core 3, opened by a
+ * CoreUnlocker80000H / CapUnlocker plugin, is shared with the system (65-100%
+ * busy on device), so only disc streaming, which tolerates delay, goes there
+ * (VGLR_SpareCoreMask); without the plugin it shares core 2. */
 int VGLR_HelperCoreMask(void)
+{
+    return SCE_KERNEL_CPU_MASK_USER_2;
+}
+
+int VGLR_SpareCoreMask(void)
 {
     static volatile int s_mask = 0;
 
@@ -923,7 +930,7 @@ int VGLR_HelperCoreMask(void)
             sceKernelChangeThreadCpuAffinityMask(self, prev);
         s_mask = mask;
         if (g_ShDebugLog)
-            fprintf(g_ShDebugLog, "[CORES] helper threads on core %s\n",
+            fprintf(g_ShDebugLog, "[CORES] timer, audio and vitaGL GC on core 2; disc streaming on core %s\n",
                     mask == SCE_KERNEL_CPU_MASK_SYSTEM ? "3 (unlocked by plugin)" : "2 (core 3 locked)");
     }
     return s_mask;
