@@ -232,6 +232,7 @@ extern float g_vitaShadowSoftK;
 static const int VAL_SHQ[] = { 256, 512, 128 };
 static const char* const LBL_SHQ[] = { "Normal", "Fine", "Soft" };
 extern int g_vitaShadowTest;
+extern int g_vitaParseThread;
 static const int VAL_SHTEST[] = { 0, 1, 2, 3 };
 static const char* const LBL_SHTEST[] = { "Normal", "No_Lookup", "No_Map", "Auto_Bench" };
 #endif
@@ -279,6 +280,7 @@ static const s_PcOpt PCOPT_G[] = {
     { "Soft_Shadows",   &g_vitaShadowSoft,             "vita_shadow_soft",     VAL_ONOFF, 2, LBL_ONOFF, NULL,                          1, PCK_INT    },
     { "Soft_Blur",      NULL, "vita_shadow_soft_blur", NULL, 0, NULL, NULL, 1, PCK_SLIDER, &g_vitaShadowSoftBlur, NULL, 0.0f, 4.0f, 0.25f },
     { "Soft_Sharpness", NULL, "vita_shadow_soft_k",    NULL, 0, NULL, NULL, 1, PCK_SLIDER, &g_vitaShadowSoftK,    NULL, 10.0f, 80.0f, 5.0f },
+    { "Parse_Thread",   &g_vitaParseThread,            "vita_parse_thread",    VAL_ONOFF, 2, LBL_ONOFF, NULL,                          1, PCK_INT    },
     { "Shadow_Test",    &g_vitaShadowTest,             "vita_shadow_test",     VAL_SHTEST, 4, LBL_SHTEST, NULL,                        1, PCK_INT    },
 #else
     { "Antialiasing",   &g_PcConfig.msaaSamples,        "msaa",                 VAL_AA,    4, LBL_AA,    NULL,                          0, PCK_INT    },
@@ -1309,7 +1311,7 @@ static void PcOpt_ResetEntry(const s_PcOpt* e)
     /* These live outside g_PcConfig, so the offset lookup below cannot find
      * their defaults. */
     if (e->field == &g_vitaShadowQuality || e->field == &g_vitaShadowSoft || e->field == &g_vitaResolution ||
-        e->field == &g_vitaShadowTest) {
+        e->field == &g_vitaShadowTest || e->field == &g_vitaParseThread) {
         *e->field = (e->field == &g_vitaShadowQuality) ? 256 : (e->field == &g_vitaResolution) ? 480 :
                     (e->field == &g_vitaShadowTest) ? 0 : 1;
         snprintf(buf, sizeof(buf), "%d", *e->field);

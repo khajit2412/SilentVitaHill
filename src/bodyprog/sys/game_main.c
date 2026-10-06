@@ -2783,6 +2783,10 @@ void MainLoop(void) // 0x80032EE0
             { extern void PsyX_SetPacketBuffers(void*, void*); PsyX_SetPacketBuffers(s_PcPacketBufs[0], s_PcPacketBufs[1]); }
 #endif
         }
+#ifdef SH_VITA
+        /* The parse worker may still read this buffer from two frames ago. */
+        { extern void PsyX_ParseFenceBuffer(int buf); PsyX_ParseFenceBuffer(g_ActiveBufferIdx); }
+#endif
         GsOUT_PACKET_P = s_PcPacketBufs[g_ActiveBufferIdx];
 #else
         if (g_GameWork.gameState == GameState_MainLoadScreen ||
@@ -4388,6 +4392,10 @@ void MainLoop(void) // 0x80032EE0
                                 scratchW = ax1 - ax0;
                                 scratchH = ay1 - ay0;
                                 GR_SetSceneFbRedirect(scratchX, scratchY, scratchW, scratchH);
+#ifdef SH_VITA
+                                /* The capture split draws inline: no parse worker. */
+                                { extern int g_PsyX_SyncParseNeeded; g_PsyX_SyncParseNeeded = 1; }
+#endif
                             } else if (scratchW > 0) {
                                 da->code[0] = 0xB4000000u | ((u32)scratchX & 0x3FFu) | (((u32)scratchY & 0x1FFu) << 10);
                                 da->code[1] = ((u32)scratchW & 0xFFFFu) | (((u32)scratchH & 0xFFFFu) << 16);

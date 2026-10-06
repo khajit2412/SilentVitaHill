@@ -1168,6 +1168,10 @@ int Pc_ModernMesh_Emit(void* object, void* orderingTable, int shift)
     packet->code[0] = 0xB3000000;
     packet->code[1] = (u32)entry->mesh.fileIdx + 1u;
     addPrim(&ot->org[bucket], packet);
+#ifdef SH_VITA
+    /* Modern-mesh splits draw inline: no parse worker for this frame. */
+    { extern int g_PsyX_SyncParseNeeded; g_PsyX_SyncParseNeeded = 1; }
+#endif
     GsOUT_PACKET_P = (PACKET*)((unsigned char*)packet + sizeof(*packet));
     return 1;
 }

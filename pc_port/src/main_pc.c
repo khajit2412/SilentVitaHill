@@ -1767,6 +1767,11 @@ int main(int argc, char* argv[])
             if ((v = Pc_ModConfig_Value("vita_pal_min_area")) != NULL)
                 g_vitaPalMinArea = atoi(v);
         }
+        {
+            extern int g_vitaParseThread;
+            if ((v = Pc_ModConfig_Value("vita_parse_thread")) != NULL)
+                g_vitaParseThread = atoi(v) != 0;
+        }
     }
 #endif
 
