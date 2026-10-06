@@ -322,6 +322,12 @@ static void VitaGL_InitOnRenderThread(void* unused)
      * buffer keeps its first size, and a larger mode later wrote past it (the
      * crash going 720x408 -> 960x544 in the options). Allocate for the largest
      * mode and switch to the chosen one at the first swap. */
+    /* One scene slot per render target makes sceGxmBeginScene block until the
+     * GPU has finished that target's previous scene. The shadow map takes two
+     * scenes a frame (depth, vertical blur) and the GPU runs a frame behind,
+     * queued behind the vsync-gated display scene, so every shadow pass stalled
+     * the render thread for about one vblank. */
+    vglSetupRenderTargetScenesNum(4, 4);
     vglInitExtended(0, 960, 544, 16 * 1024 * 1024,
                     g_vitaMsaa >= 4 ? SCE_GXM_MULTISAMPLE_4X : g_vitaMsaa >= 2 ? SCE_GXM_MULTISAMPLE_2X : SCE_GXM_MULTISAMPLE_NONE);
     if (VITA_SCREEN_W != 960)
