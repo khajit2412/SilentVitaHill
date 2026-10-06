@@ -917,6 +917,46 @@ static void Pc_TpsCamera_Apply(void)
                                              - (s32)((s64)eyeLocal.vx * sYaw >> 12);
             tpCamPos.vy = tp_hr->position.vy + eyeLocal.vy;
 
+            /* Running leans Harry's chest forward under the eye; looking down then
+             * shows the inside of the torso. Lift the eye and push it slightly ahead
+             * while running, the forward part clipped by a ray so it never crosses
+             * into doors or walls. */
+            {
+                #define RUN_EYE_LIFT Q12(0.06f)
+                #define RUN_EYE_FWD  Q12(0.10f)
+                #define RUN_EYE_WALL Q12(0.15f)
+                static s32 s_fpsRunW = 0;
+                s32 spd    = g_SysWork.playerWork.player.moveSpeed;
+                s32 target = (spd <= Q12(2.0f)) ? 0 :
+                             (spd >= Q12(3.5f)) ? Q12(1.0f) :
+                             (s32)((s64)(spd - Q12(2.0f)) * Q12(1.0f) / Q12(1.5f));
+                s32 d = target - s_fpsRunW;
+                s_fpsRunW += TIMESTEP_SCALE_30_FPS(g_DeltaTime, d >> 2);
+                if (d > -16 && d < 16) s_fpsRunW = target;
+
+                if (s_fpsRunW > 0)
+                {
+                    s32        fwd = (s32)((s64)RUN_EYE_FWD * s_fpsRunW >> 12);
+                    s_RayTrace runTrace;
+                    VECTOR3    ahead;
+                    tpCamPos.vy -= (s32)((s64)RUN_EYE_LIFT * s_fpsRunW >> 12);
+                    ahead.vx = tpCamPos.vx + (s32)((s64)(fwd + RUN_EYE_WALL) * sYaw >> 12);
+                    ahead.vy = tpCamPos.vy;
+                    ahead.vz = tpCamPos.vz + (s32)((s64)(fwd + RUN_EYE_WALL) * cYaw >> 12);
+                    if (Ray_TraceQuery(&runTrace, &tpCamPos, &ahead) && runTrace.hasHit)
+                    {
+                        s32 safe = runTrace.hitDistance - RUN_EYE_WALL;
+                        if (safe < 0)   safe = 0;
+                        if (safe < fwd) fwd = safe;
+                    }
+                    tpCamPos.vx += (s32)((s64)fwd * sYaw >> 12);
+                    tpCamPos.vz += (s32)((s64)fwd * cYaw >> 12);
+                }
+                #undef RUN_EYE_LIFT
+                #undef RUN_EYE_FWD
+                #undef RUN_EYE_WALL
+            }
+
             /* Melee arm clearance: with the eye in the head, raise/swing poses put
              * Harry's forearms right across the camera. Dolly the eye straight back
              * along the view axis by how much the nearest forearm/hand bone crowds
