@@ -676,17 +676,16 @@ static void Pc_TpsCamera_Apply(void)
             if (g_TpsCamPitch < -Q12_ANGLE(82.0f)) g_TpsCamPitch = -Q12_ANGLE(82.0f);
             if (g_TpsCamPitch >  Q12_ANGLE(82.0f)) g_TpsCamPitch =  Q12_ANGLE(82.0f);
 
-            /* Yaw limit: you can mouse-look from straight-left to straight-right
-             * (±90°) of Harry's BODY yaw, but not past his shoulders. When
-             * moving or aiming the body snaps to the camera (player_control), so
-             * the ±90° window rides along and turning is free; it only bites
-             * while standing still — then the body catches up when you move. */
+            /* Look up to ±90° of Harry's BODY yaw while standing still; past
+             * that the body turns with the view (dragged along at the edge), so
+             * a full 360° turn works in place. When moving or aiming the body
+             * snaps to the camera anyway (player_control). */
             {
                 s32 yd = Math_AngleNormalizeSigned(g_TpsCamYaw - tp_hr->rotation.vy);
                 if (yd >  Q12_ANGLE(90.0f))
-                    g_TpsCamYaw = Q12_ANGLE_NORM_U(tp_hr->rotation.vy + Q12_ANGLE(90.0f) + Q12_ANGLE(360.0f));
+                    tp_hr->rotation.vy = Q12_ANGLE_NORM_U(g_TpsCamYaw - Q12_ANGLE(90.0f) + Q12_ANGLE(360.0f));
                 else if (yd < -Q12_ANGLE(90.0f))
-                    g_TpsCamYaw = Q12_ANGLE_NORM_U(tp_hr->rotation.vy - Q12_ANGLE(90.0f) + Q12_ANGLE(360.0f));
+                    tp_hr->rotation.vy = Q12_ANGLE_NORM_U(g_TpsCamYaw + Q12_ANGLE(90.0f) + Q12_ANGLE(360.0f));
             }
         } else {
             if (g_TpsCamPitch < -Q12_ANGLE(40.0f)) g_TpsCamPitch = -Q12_ANGLE(40.0f);
