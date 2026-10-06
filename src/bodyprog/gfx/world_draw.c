@@ -1670,7 +1670,25 @@ void func_8003DA9C(e_CharaId charaId, GsCOORDINATE2* boneCoords, s32 arg2, q3_12
           && g_GameWork.gameState == GameState_InGame
           && g_SysWork.sysState == SysState_Gameplay
           && !(g_SysWork.sysFlags & SysFlag_CutsceneActive)
-          && g_SysWork.cutsceneBorderState == CutsceneBorderState_None); }
+          && g_SysWork.cutsceneBorderState == CutsceneBorderState_None);
+      /* [FPSHEAD]: why Harry's head is or is not hidden in first person,
+       * every ~2 s while the FPS camera is on in gameplay. */
+      if (g_PcFpsCam && charaId == Chara_Harry && g_SysWork.sysState == SysState_Gameplay)
+      {
+          static u32 s_fpsHeadLogMs = 0;
+          const u32 now = SDL_GetTicks();
+          if (now - s_fpsHeadLogMs >= 2000)
+          {
+              VECTOR3 _vp, _hp;
+              s_fpsHeadLogMs = now;
+              vwGetViewPosition(&_vp);
+              vcMakeHeroHeadPos(&_hp);
+              SH_DBG("[FPSHEAD] eye-head offset (%.2f, %.2f, %.2f) atEye=%d swingShow=%d cutscene=%d hidden=%d",
+                     (_vp.vx - _hp.vx) / 4096.0f, (_vp.vy - _hp.vy) / 4096.0f, (_vp.vz - _hp.vz) / 4096.0f,
+                     _atEye, g_PcFpsSwingHeadShow, (g_SysWork.sysFlags & SysFlag_CutsceneActive) ? 1 : 0,
+                     g_PcHideHarryFpsBody);
+          }
+      } }
     /* Harry doesn't cast a flashlight shadow — his own body between the light and
      * the scene looked odd. Flag his skeleton verts as non-casters for the depth
      * pre-pass (monsters still cast). Set here (build time) so the GTE captures it
