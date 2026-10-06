@@ -9,7 +9,7 @@ if(DEFINED VITASDK AND CMAKE_C_COMPILER MATCHES "arm-vita-eabi")
     include("${VITASDK}/share/vita.cmake" REQUIRED)
     set(VITA_APP_NAME "Silent Hill")
     set(VITA_TITLEID  "SHPC00001")
-    set(VITA_VERSION  "00.10")
+    set(VITA_VERSION  "00.70")
     # Route every SDL_GL_* call (PsyCross and game alike) to vitaGL.
     # -fsigned-char: the decomp (MIPS) and the PC port (x86) both assume plain
     # char is signed; ARM makes it unsigned, so any char holding a negative
@@ -1190,8 +1190,10 @@ if(VITA)
     foreach(asset ${SH_VITA_ASSETS})
         list(APPEND SH_VITA_VPK_FILES FILE "${CMAKE_CURRENT_SOURCE_DIR}/${asset}" "${asset}")
     endforeach()
-    # LiveArea: bubble icon (128x128, 8-bit palette PNG as the Vita requires).
-    list(APPEND SH_VITA_VPK_FILES FILE "${CMAKE_CURRENT_SOURCE_DIR}/vita_port/sce_sys/icon0.png" "sce_sys/icon0.png")
+    # LiveArea: bubble, start picture, background and gate (8-bit palette PNGs).
+    foreach(f icon0.png pic0.png livearea/contents/bg.png livearea/contents/startup.png livearea/contents/template.xml)
+        list(APPEND SH_VITA_VPK_FILES FILE "${CMAKE_CURRENT_SOURCE_DIR}/vita_port/sce_sys/${f}" "sce_sys/${f}")
+    endforeach()
     vita_create_vpk(SilentHillVita.vpk ${VITA_TITLEID} eboot.bin
         VERSION ${VITA_VERSION}
         NAME ${VITA_APP_NAME}
