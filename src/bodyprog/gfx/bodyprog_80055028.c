@@ -2165,11 +2165,11 @@ void func_80057090(s_ModelInfo* modelInfo, GsOT* arg1, s32 arg2, MATRIX* viewMat
         if (g_PcCharaPrimProbeActive) CharaPrimProbe_Note(modelInfo, "func_80059D50 chain (field_B_4)");
 #endif
 #ifdef SH_VITA
-        { unsigned long long t0 = Pc_ProfNowUs();
+        { unsigned long long t0 = g_ShDebugLog ? Pc_ProfNowUs() : 0;
 #endif
         func_80059D50(temp_a0, modelInfo, viewMat, arg2, otTag);
 #ifdef SH_VITA
-        g_vitaProfUs[2] += Pc_ProfNowUs() - t0; }
+        if (g_ShDebugLog) g_vitaProfUs[2] += Pc_ProfNowUs() - t0; }
 #endif
     }
     else
@@ -2183,11 +2183,11 @@ void func_80057090(s_ModelInfo* modelInfo, GsOT* arg1, s32 arg2, MATRIX* viewMat
         {
             g_WorldEnvWork.field_14C = arg5;
 #ifdef SH_VITA
-            { unsigned long long t0 = Pc_ProfNowUs();
+            { unsigned long long t0 = g_ShDebugLog ? Pc_ProfNowUs() : 0;
 #endif
             func_8005A21C(modelInfo, otTag, arg2, viewMat);
 #ifdef SH_VITA
-            g_vitaProfUs[0] += Pc_ProfNowUs() - t0; }
+            if (g_ShDebugLog) g_vitaProfUs[0] += Pc_ProfNowUs() - t0; }
 #endif
         }
         else
@@ -2196,11 +2196,11 @@ void func_80057090(s_ModelInfo* modelInfo, GsOT* arg1, s32 arg2, MATRIX* viewMat
             if (g_PcCharaPrimProbeActive) CharaPrimProbe_Note(modelInfo, "func_80057344 chain (unlit)");
 #endif
 #ifdef SH_VITA
-            { unsigned long long t0 = Pc_ProfNowUs();
+            { unsigned long long t0 = g_ShDebugLog ? Pc_ProfNowUs() : 0;
 #endif
             func_80057344(modelInfo, otTag, arg2, viewMat);
 #ifdef SH_VITA
-            g_vitaProfUs[1] += Pc_ProfNowUs() - t0; }
+            if (g_ShDebugLog) g_vitaProfUs[1] += Pc_ProfNowUs() - t0; }
 #endif
         }
     }
@@ -2280,7 +2280,9 @@ void func_80057344(s_ModelInfo* modelInfo, GsOT_TAG* otTag, bool arg2, MATRIX* m
     for (curMeshHdr = modelHdr->meshHdrs; curMeshHdr < &modelHdr->meshHdrs[modelHdr->meshCount]; curMeshHdr++)
     {
 #ifdef SH_VITA
-        unsigned long long tp0 = Pc_ProfNowUs(), tp1;
+        /* Timed only while the debug log is on: four clock reads a mesh. */
+        const int prof = g_ShDebugLog != NULL;
+        unsigned long long tp0 = prof ? Pc_ProfNowUs() : 0, tp1;
 #endif
         if (vertOffset != 0 || normalOffset != 0)
         {
@@ -2291,7 +2293,7 @@ void func_80057344(s_ModelInfo* modelInfo, GsOT_TAG* otTag, bool arg2, MATRIX* m
             func_800574D4(curMeshHdr, scratchData);
         }
 #ifdef SH_VITA
-        tp1 = Pc_ProfNowUs(); g_vitaProfUnlit[0] += tp1 - tp0; tp0 = tp1;
+        if (prof) { tp1 = Pc_ProfNowUs(); g_vitaProfUnlit[0] += tp1 - tp0; tp0 = tp1; }
 #endif
 
         switch (g_WorldEnvWork.field_0)
@@ -2309,16 +2311,16 @@ void func_80057344(s_ModelInfo* modelInfo, GsOT_TAG* otTag, bool arg2, MATRIX* m
         }
 
 #ifdef SH_VITA
-        tp1 = Pc_ProfNowUs(); g_vitaProfUnlit[1] += tp1 - tp0; tp0 = tp1;
+        if (prof) { tp1 = Pc_ProfNowUs(); g_vitaProfUnlit[1] += tp1 - tp0; tp0 = tp1; }
 #endif
         func_80057B7C(curMeshHdr, vertOffset, scratchData, mat);
 #ifdef SH_VITA
-        tp1 = Pc_ProfNowUs(); g_vitaProfUnlit[2] += tp1 - tp0; tp0 = tp1;
+        if (prof) { tp1 = Pc_ProfNowUs(); g_vitaProfUnlit[2] += tp1 - tp0; tp0 = tp1; }
 #endif
 
         Gfx_MeshDraw(curMeshHdr, scratchData, otTag, arg2);
 #ifdef SH_VITA
-        g_vitaProfUnlit[3] += Pc_ProfNowUs() - tp0;
+        if (prof) g_vitaProfUnlit[3] += Pc_ProfNowUs() - tp0;
 #endif
     }
 

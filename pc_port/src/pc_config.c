@@ -124,7 +124,12 @@ s_PcConfig g_PcConfig = {
      * never produced a log at all -- which is exactly when one is needed, since
      * a fresh install on unfamiliar hardware is the case you cannot debug from
      * here. Worth revisiting before a wider release. */
+#if defined(SH_VITA)
+    /* Off for release: enable_debug_log = 1 in config.cfg turns it back on. */
+    .enableDebugLog = 0, /* 0=no SilentHill.log, 1=write SilentHill.log */
+#else
     .enableDebugLog = 1, /* 0=no SilentHill.log, 1=write SilentHill.log */
+#endif
     .glVerbose      = 0, /* 1 = log GL/GLSL details + shader info logs on success; failures always log */
     .allowDebugControls = 0, /* 0=off (default), 1=enable dev/cheat keys */
     .controllerMovement = 2, /* 0=analog, 1=dpad, 2=both */
@@ -1673,6 +1678,13 @@ else if (strcmp(key, "enable_plugins") == 0)
         {
             g_PcConfig.msaaSamples = 2;
             PcConfig_SaveKeyValue("msaa", "2");
+        }
+
+        /* v16 (Vita only): debug log off, see the default above. */
+        if (g_PcConfig.configVersion < 16 && g_PcConfig.enableDebugLog)
+        {
+            g_PcConfig.enableDebugLog = 0;
+            PcConfig_SaveKeyValue("enable_debug_log", "0");
         }
 
         /* v15 (Vita only): fps_cap 60 -> 30, see the default above. */

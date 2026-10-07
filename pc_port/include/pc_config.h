@@ -13,7 +13,7 @@
  *   4: allow_loose_files default 0 -> 1, mobile only (no launcher to turn it on).
  *      Desktop configs are stamped to 4 with no value change.
  *   5: fps_cap default 30 -> 60, mobile only. Desktop keeps 30. */
-#define PC_CONFIG_VERSION 15
+#define PC_CONFIG_VERSION 16
 
 /* Minimap size range, as a percentage of the built-in MM_SIZE. The top end is a
  * little larger than the stock panel; the bottom end is a bit over half of it. */
