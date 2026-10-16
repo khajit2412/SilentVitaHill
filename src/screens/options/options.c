@@ -165,7 +165,12 @@ s32 g_PcOptions_HighlightSnap = 0;
  * to show Language here on the title screen. */
 int Pc_ExitToMenuRowActive(void)
 {
-    return g_GameWork.gameState == GameState_InGame;
+    /* The options screen is its own game state, so this asks where it was
+     * opened from: gameplay (pause) or the inventory, not the title screen. */
+    return g_GameWork.gameState == GameState_InGame ||
+           (g_GameWork.gameState == GameState_OptionScreen &&
+            (g_GameWork.gameStatePrev == GameState_InGame ||
+             g_GameWork.gameStatePrev == GameState_InventoryScreen));
 }
 
 
