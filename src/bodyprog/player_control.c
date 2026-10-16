@@ -2046,6 +2046,15 @@ void Player_LogicUpdate(s_SubCharacter* player, s_PlayerExtra* extra, GsCOORDINA
                                 int stickSprint = !g_PcConfig.altButtonSprint &&
                                                   (lx * lx + ly * ly) >= (96 * 96);
                                 g_Player_IsRunning = cfgRun || stickSprint;
+                                /* Melee has no run-and-aim pose, so the aim used to be
+                                 * dropped while sprinting and was hard to get into on
+                                 * the run. Aim wins instead: holding it stops the
+                                 * sprint and Harry goes straight into the stance. */
+                                if ((held & g_GameWorkPtr->config.controllerConfig.aim) &&
+                                    !(g_GameWorkPtr->config.controllerConfig.aim & runBtn) &&
+                                    g_SysWork.playerCombat.weaponAttack != (s8)NO_VALUE &&
+                                    g_SysWork.playerCombat.weaponAttack < WEAPON_ATTACK(EquippedWeaponId_Handgun, AttackInputType_Tap))
+                                    g_Player_IsRunning = 0;
                             }
                             else
 #endif
