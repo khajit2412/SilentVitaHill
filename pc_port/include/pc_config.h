@@ -504,6 +504,9 @@ int Pc_WholeMapDrawActive(void);
  * (Modern 2.10/2.40, Classic+Shadows 1.20/3.00); customized values are kept.
  * persist=1 also writes the config keys. Used by boot, F4, options, console. */
 void Pc_FlashlightModeApply(int mode, int persist);
+#if defined(SH_VITA)
+int PcConfig_VitaGraphicsPreset(int mode);
+#endif
 
 /* "Classic" / "Classic + Shadows" / "Modern" / "Modern + Shadows" */
 const char* Pc_FlashlightModeLabel(int mode);

@@ -135,6 +135,10 @@ static s32 g_PcOptionsMenu_Page       = 0; /* 0 = Graphics, 1 = System, 2 = Cont
  * twelfth row runs Back off the screen), so a new Controls row needed a page
  * to push the overflow onto. PCOPT_M, after HUD. */
 #define PCOPT_PAGE_COUNT 6
+#elif defined(SH_VITA)
+/* Graphics (Graphics_Mode + 2D controls), Camera, HUD: the presets replace the
+ * individual graphics, system and controls rows. */
+#define PCOPT_PAGE_COUNT 3
 #else
 #define PCOPT_PAGE_COUNT 5
 #endif
@@ -165,7 +169,7 @@ int Pc_ExitToMenuRowActive(void)
 }
 
 
-enum { PCK_INT, PCK_RES, PCK_FILTER, PCK_WINMODE, PCK_VSYNC, PCK_SLIDER, PCK_MAP, PCK_FLMODE, PCK_CAMSTYLE, PCK_NEXT, PCK_PREV, PCK_BACK, PCK_RESET, PCK_STORAGE, PCK_RALOGIN };
+enum { PCK_INT, PCK_RES, PCK_FILTER, PCK_WINMODE, PCK_VSYNC, PCK_SLIDER, PCK_MAP, PCK_FLMODE, PCK_CAMSTYLE, PCK_GFXMODE, PCK_NEXT, PCK_PREV, PCK_BACK, PCK_RESET, PCK_STORAGE, PCK_RALOGIN };
 
 /* PC-options row origin. The heading sits at y=20 and the rows used to start at 56,
  * leaving a full empty row beneath it while the pages ran off the BOTTOM of the
@@ -234,6 +238,10 @@ static const char* const LBL_SHQ[] = { "Normal", "Fine", "Soft" };
 extern int g_vitaShadowTest;
 static const int VAL_SHTEST[] = { 0, 1, 2, 3 };
 static const char* const LBL_SHTEST[] = { "Normal", "No_Lookup", "No_Map", "Auto_Bench" };
+/* Graphics_Mode (config vita_graphics_mode): 0 Performance, 1 Quality. */
+int g_vitaGraphicsMode = 1;
+static const int VAL_GFXMODE[] = { 1, 0 };
+static const char* const LBL_GFXMODE[] = { "Quality", "Performance" };
 #endif
 static const char* const LBL_AA[]    = { "Off", "2x", "4x", "8x" };
 static const char* const LBL_POST[]  = { "Off", "CRT", "Scanlines", "Vignette", "Color_Grade", "Film_Grain", "Sharpen", "PSX_Retro", "Cinematic" };
@@ -324,6 +332,18 @@ static const s_PcOpt PCOPT_G[] = {
     { "Next_Page",      NULL,                           NULL,                   NULL,      0, NULL,      NULL,                          0, PCK_NEXT   },
     { "Back",           NULL,                           NULL,                   NULL,      0, NULL,      NULL,                          0, PCK_BACK   },
 };
+
+#if defined(SH_VITA)
+/* Vita page 1: the graphics preset and the one remaining controls row. Every
+ * individual graphics, system and controls row is set by the preset or left
+ * at its default; their config.cfg keys still work. */
+static const s_PcOpt PCOPT_VG[] = {
+    { "Graphics_Mode",  &g_vitaGraphicsMode,           "vita_graphics_mode",   VAL_GFXMODE, 2, LBL_GFXMODE, NULL,                      1, PCK_GFXMODE },
+    { "2D_Controls",    &g_PcConfig.control2d,          "control_2d",           VAL_ONOFF, 2, LBL_ONOFF, NULL,                          1, PCK_INT    },
+    { "Next_Page",      NULL,                           NULL,                   NULL,      0, NULL,      NULL,                          0, PCK_NEXT   },
+    { "Back",           NULL,                           NULL,                   NULL,      0, NULL,      NULL,                          0, PCK_BACK   },
+};
+#endif
 
 static const s_PcOpt PCOPT_S[] = {
     /* One row for the whole flashlight look: Classic (PSX per-vertex),
@@ -515,6 +535,12 @@ static void PcMouse_InjectDir(int dir)
 
 const s_PcOpt* PcOpt_PageByIndex(int page, int* count)
 {
+#if defined(SH_VITA)
+    if (page == 0) { *count = (int)(sizeof(PCOPT_VG) / sizeof(PCOPT_VG[0])); return PCOPT_VG; }
+    if (page == 1) { *count = (int)(sizeof(PCOPT_T) / sizeof(PCOPT_T[0])); return PCOPT_T; }
+    *count = (int)(sizeof(PCOPT_H) / sizeof(PCOPT_H[0]));
+    return PCOPT_H;
+#endif
     if (page == 0) { *count = (int)(sizeof(PCOPT_G) / sizeof(PCOPT_G[0])); return PCOPT_G; }
     if (page == 1) { *count = (int)(sizeof(PCOPT_S) / sizeof(PCOPT_S[0])); return PCOPT_S; }
     if (page == 2) { *count = (int)(sizeof(PCOPT_C) / sizeof(PCOPT_C[0])); return PCOPT_C; }
@@ -528,6 +554,9 @@ const s_PcOpt* PcOpt_PageByIndex(int page, int* count)
 
 static const s_PcOpt* PcOpt_Page(int* count)
 {
+#if defined(SH_VITA)
+    return PcOpt_PageByIndex(g_PcOptionsMenu_Page, count);
+#endif
     if (g_PcOptionsMenu_Page == 0) { *count = (int)(sizeof(PCOPT_G) / sizeof(PCOPT_G[0])); return PCOPT_G; }
     if (g_PcOptionsMenu_Page == 1) { *count = (int)(sizeof(PCOPT_S) / sizeof(PCOPT_S[0])); return PCOPT_S; }
     if (g_PcOptionsMenu_Page == 2) { *count = (int)(sizeof(PCOPT_C) / sizeof(PCOPT_C[0])); return PCOPT_C; }
@@ -655,6 +684,32 @@ static void PcOpt_SliderDragCommit(const s_PcOpt* e)
     SH_DBG_ECHO("%s: %.2f", e->name, *e->ffield);
 }
 
+#if defined(SH_VITA)
+/* Applies a Graphics_Mode preset now. Antialiasing is fixed when vitaGL
+ * starts, so it alone waits for the next launch. */
+static void PcOpt_VitaGraphicsModeApply(int mode)
+{
+    extern int g_vitaMsaa;
+    char buf[16];
+
+    g_vitaResolution = PcConfig_VitaGraphicsPreset(mode);
+    g_PsxUsePgxp     = g_PcConfig.usePgxp ? 1 : 0;
+    /* The style switch swaps the beam to that style's defaults; the preset's
+     * own beam goes back on afterwards. */
+    Pc_FlashlightModeApply(g_PcConfig.flashlightMode, 1);
+    g_PcConfig.flashlightIntensity = 1.00f;
+    g_PcConfig.flashlightSize      = 1.60f;
+    PcConfig_SaveKeyValue("flashlight_intensity", "1.000");
+    PcConfig_SaveKeyValue("flashlight_size", "1.600");
+    g_PsyX_FlashlightIntensity = g_PcConfig.flashlightIntensity;
+    g_PsyX_FlashlightSize      = g_PcConfig.flashlightSize;
+    g_PsyX_FogStrength         = g_PcConfig.fogStrength;
+    if (g_PcConfig.msaaSamples != g_vitaMsaa)
+        SH_DBG_ECHO("Antialiasing will change the next time the game is started.");
+    (void)buf;
+}
+#endif
+
 static void PcOpt_Adjust(const s_PcOpt* e, int dir)
 {
     char buf[24];
@@ -738,6 +793,10 @@ static void PcOpt_Adjust(const s_PcOpt* e, int dir)
             Pc_FlashlightModeApply(*e->field, 1);
         } else if (e->kind == PCK_CAMSTYLE) {
             Pc_ControlStyleSet(*e->field);
+#if defined(SH_VITA)
+        } else if (e->kind == PCK_GFXMODE) {
+            PcOpt_VitaGraphicsModeApply(*e->field);
+#endif
         } else if (e->live) {
             *e->live = *e->field;
         }
@@ -1306,6 +1365,11 @@ static void PcOpt_ResetEntry(const s_PcOpt* e)
         e->kind == PCK_MAP) return;
 
 #if defined(SH_VITA)
+    if (e->kind == PCK_GFXMODE) {
+        *e->field = 1;
+        PcOpt_VitaGraphicsModeApply(1);
+        return;
+    }
     /* These live outside g_PcConfig, so the offset lookup below cannot find
      * their defaults. */
     if (e->field == &g_vitaShadowQuality || e->field == &g_vitaShadowSoft || e->field == &g_vitaResolution ||

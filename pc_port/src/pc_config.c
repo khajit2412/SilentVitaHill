@@ -482,6 +482,37 @@ static int s_sawFlashlightMode = 0;
 static int s_minimapSeen       = 0;
 static int s_minimapShapeSeen  = 0;
 
+#if defined(SH_VITA)
+/* Vita Preferences Graphics_Mode: 0 = Performance, 1 = Quality. Writes the
+ * settings it covers into g_PcConfig and config.cfg and returns the display
+ * width; the caller applies the live renderer globals. */
+int PcConfig_VitaGraphicsPreset(int mode)
+{
+    const int quality = (mode != 0);
+    const int res     = quality ? 480 : 960;
+    char      buf[16];
+
+    g_PcConfig.msaaSamples         = quality ? 2 : 0;
+    g_PcConfig.usePgxp             = quality ? 1 : 0;
+    g_PcConfig.flashlightMode      = quality ? 3 : 0;
+    g_PcConfig.fpsCap              = quality ? 30 : 60;
+    g_PcConfig.flashlightIntensity = 1.00f;
+    g_PcConfig.flashlightSize      = 1.60f;
+    g_PcConfig.fogStrength         = 1.10f;
+
+    snprintf(buf, sizeof(buf), "%d", quality); PcConfig_SaveKeyValue("vita_graphics_mode", buf);
+    snprintf(buf, sizeof(buf), "%d", res);     PcConfig_SaveKeyValue("vita_resolution", buf);
+    PcConfig_SaveKeyValue("msaa",            quality ? "2" : "0");
+    PcConfig_SaveKeyValue("use_pgxp",        quality ? "1" : "0");
+    PcConfig_SaveKeyValue("flashlight_mode", quality ? "3" : "0");
+    PcConfig_SaveKeyValue("fps_cap",         quality ? "30" : "60");
+    PcConfig_SaveKeyValue("flashlight_intensity", "1.000");
+    PcConfig_SaveKeyValue("flashlight_size",      "1.600");
+    PcConfig_SaveKeyValue("fog_strength",         "1.100");
+    return res;
+}
+#endif
+
 void Pc_FlashlightModeApply(int mode, int persist)
 {
     extern int   g_PsyX_UsePerPixelFlashlight;

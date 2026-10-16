@@ -266,6 +266,10 @@ extern s_DemoFrameData* g_Demo_PlayFileBufferPtr;
  * visible console window.  Set g_ShDebugEchoStdout from main() after
  * config is parsed. */
 FILE* g_ShDebugLog = NULL;
+#ifdef SH_VITA
+/* Display width a first-run Graphics_Mode preset picked (0 = from config). */
+static int s_vitaPresetRes = 0;
+#endif
 int   g_ShDebugEchoStdout = 0;
 void (*g_ShOverlayPushLine)(const char* line) = NULL;
 void (*g_ShOverlayToastLine)(const char* line) = NULL;
@@ -1550,6 +1554,17 @@ int main(int argc, char* argv[])
      * GL attributes chosen at context-creation time (inside GR_InitialiseRender).
      * If the driver can't honor it, PsyCross retries without MSAA and clears
      * g_cfg_msaaSamples back to 0. */
+#ifdef SH_VITA
+    {
+        /* A config from before Graphics_Mode starts on Quality, the preset the
+         * defaults already matched. Before MSAA is read: the preset sets it. */
+        extern int g_vitaGraphicsMode;
+        const char* gm = Pc_ModConfig_Value("vita_graphics_mode");
+        g_vitaGraphicsMode = gm ? (atoi(gm) != 0) : 1;
+        if (!gm)
+            s_vitaPresetRes = PcConfig_VitaGraphicsPreset(1);
+    }
+#endif
     g_cfg_msaaSamples = g_PcConfig.msaaSamples;
 #ifdef SH_VITA
     {
@@ -1570,7 +1585,7 @@ int main(int argc, char* argv[])
 #ifdef SH_VITA
         {
             const char* v = Pc_ModConfig_Value("vita_resolution");
-            const int w = v ? atoi(v) : 0;
+            const int w = s_vitaPresetRes ? s_vitaPresetRes : (v ? atoi(v) : 0);
             if (w == 960 || w == 720 || w == 640 || w == 480)
                 g_cfg_renderScale = (float)w / 960.0f + 0.001f;
         }
