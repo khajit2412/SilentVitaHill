@@ -1946,6 +1946,14 @@ void Player_LogicUpdate(s_SubCharacter* player, s_PlayerExtra* extra, GsCOORDINA
                         int stickSprint = !g_PcConfig.altButtonSprint &&
                                           (lx * lx + ly * ly) >= (96 * 96);
                         g_Player_IsRunning = cfgRun || stickSprint;
+                        /* Same as the alt-camera path: with a melee weapon, aim
+                         * stops the sprint (stick or button) so the stance is
+                         * entered instead of the aim being dropped. */
+                        if ((held & g_GameWorkPtr->config.controllerConfig.aim) &&
+                            !(g_GameWorkPtr->config.controllerConfig.aim & runBtn) &&
+                            g_SysWork.playerCombat.weaponAttack != (s8)NO_VALUE &&
+                            g_SysWork.playerCombat.weaponAttack < WEAPON_ATTACK(EquippedWeaponId_Handgun, AttackInputType_Tap))
+                            g_Player_IsRunning = 0;
                     }
                     /* Travel along the MOVE vector (stick relative to the camera), NOT
                      * Harry's turning facing: set the heading OFFSET = (move dir − facing)
