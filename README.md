@@ -77,7 +77,7 @@ Logging is off by default. To get a log for a bug report, set `enable_debug_log 
 
 This port exists because of the work of many people.
 
-- **Konami and Team Silent**: Silent Hill (1999). All game content, characters and artwork, including the LiveArea and bubble artwork, belong to Konami.
+- **Team Silent / Konami**: the original Silent Hill (1999).
 - **The [silent-hill-decomp](https://github.com/shdecompilations/silent-hill-decomp) contributors**: the decompilation of the PlayStation game that everything here is built on.
 - **Chris Hardin (SlickAmogus) and the contributors of the [Silent Hill PC port](https://github.com/SlickAmogus/silent-hill-decomp)**: the native port, widescreen, the camera styles, PGXP, the per-pixel flashlight and most of the gameplay additions. Almost everything here is their work.
 - **[PsyCross](https://github.com/OpenDriver2/PsyCross)** by the REDRIVER2 Project (SoapyMan, InspirationByte): the PsyQ SDK compatibility layer. This port uses its own fork with Vita support: [PsyCross (vita-port branch)](https://github.com/khajit2412/PsyCross/tree/vita-port).
@@ -118,8 +118,8 @@ Technical notes: [pc_port/vita_port/HANDOFF.md](pc_port/vita_port/HANDOFF.md).
 
 **The port code is GPL-3.0**, as in the upstream PC port. That covers `pc_port/` and every `SH_PC_PORT` addition to the decompiled sources.
 
-**The decompilation is not licensed by this project.** `src/`, `include/`, `configs/`, `asm/`, `lib/` and `rom/` are a decompilation of Konami's Silent Hill by the [silent-hill-decomp](https://github.com/shdecompilations/silent-hill-decomp) contributors. Silent Hill is © Konami.
+**The decompilation is not licensed by this project.** `src/`, `include/`, `configs/`, `asm/`, `lib/` and `rom/` are a decompilation of Silent Hill by the [silent-hill-decomp](https://github.com/shdecompilations/silent-hill-decomp) contributors.
 
 **PsyCross is MIT-licensed** (© 2020 REDRIVER2 Project). See its `LICENSE`.
 
-Full breakdown: [COPYRIGHT.md](COPYRIGHT.md). This project is not affiliated with or endorsed by Konami.
+Full breakdown: [COPYRIGHT.md](COPYRIGHT.md).

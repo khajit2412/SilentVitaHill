@@ -44,7 +44,7 @@ Silent Hill now runs natively on the PS Vita. This is **not an emulator** and **
 
 **Credits**
 
-* **Konami / Team Silent**: Silent Hill. All game content and artwork belong to Konami.
+* **Team Silent / Konami**: the original Silent Hill
 * **silent-hill-decomp contributors**: the PS1 decompilation everything is built on
 * **Chris Hardin (SlickAmogus) and contributors**: the Silent Hill native PC port. Almost all of the game work in this port is theirs.
 * **REDRIVER2 Project (SoapyMan, InspirationByte)**: PsyCross
@@ -55,5 +55,3 @@ Silent Hill now runs natively on the PS Vita. This is **not an emulator** and **
 * Vita port: **ShellingBest**
 
 **Download / source:** https://github.com/khajit2412/SilentVitaHill (GPL-3.0)
-
-This project is not affiliated with or endorsed by Konami.
