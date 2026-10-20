@@ -243,10 +243,10 @@ static const char* const LBL_SHQ[] = { "Normal", "Fine", "Soft" };
 extern int g_vitaShadowTest;
 static const int VAL_SHTEST[] = { 0, 1, 2, 3 };
 static const char* const LBL_SHTEST[] = { "Normal", "No_Lookup", "No_Map", "Auto_Bench" };
-/* Graphics_Mode (config vita_graphics_mode): 0 Performance, 1 Quality. */
+/* Graphics_Mode (config vita_graphics_mode): 0 Classic, 1 Quality. */
 int g_vitaGraphicsMode = 1;
 static const int VAL_GFXMODE[] = { 1, 0 };
-static const char* const LBL_GFXMODE[] = { "Quality", "Performance" };
+static const char* const LBL_GFXMODE[] = { "Quality", "Classic" };
 #endif
 static const char* const LBL_AA[]    = { "Off", "2x", "4x", "8x" };
 static const char* const LBL_POST[]  = { "Off", "CRT", "Scanlines", "Vignette", "Color_Grade", "Film_Grain", "Sharpen", "PSX_Retro", "Cinematic" };
