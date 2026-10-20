@@ -59,3 +59,5 @@ To change the camera: Select > Option > Vita Preferences > **tap top-right corne
 * Vita port: **ShellingBest**
 
 **Download / source:** https://github.com/khajit2412/SilentVitaHill (GPL-3.0)
+
+Fan project, not affiliated with or endorsed by Konami. Requires your own copy of the game.

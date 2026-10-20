@@ -4,6 +4,8 @@ A native PlayStation Vita port of Silent Hill (1999). It is built from the [Sile
 
 **No game data is included.** You need your own copy of Silent Hill for PlayStation.
 
+Fan project, not affiliated with or endorsed by Konami. Requires your own copy of the game.
+
 ## Features
 
 - Native code with OpenGL ES rendering through vitaGL.
