@@ -50,8 +50,8 @@ Silent Hill now runs natively on the PS Vita. This is **not an emulator** and **
 * **VitaSDK team** and the **SDL2 Vita port** contributors
 * **iCatButler** (PGXP) and **DuckStation** (precise-vertex approach)
 * **HENkaku / Enso / VitaShell developers**
-* Vita port: **khajit2412**
+* Vita port: **ShellingBest**
 
-**Download / source:** https://github.com/khajit2412/SilentVitaHill (GPL-3.0)
+**Download / source:** https://github.com/ShellingBest/SilentHillVita (GPL-3.0)
 
 This project is not affiliated with or endorsed by Konami.

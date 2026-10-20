@@ -79,21 +79,21 @@ This port exists because of the work of many people.
 - **Konami and Team Silent**: Silent Hill (1999). All game content, characters and artwork, including the LiveArea and bubble artwork, belong to Konami.
 - **The [silent-hill-decomp](https://github.com/shdecompilations/silent-hill-decomp) contributors**: the decompilation of the PlayStation game that everything here is built on.
 - **Chris Hardin (SlickAmogus) and the contributors of the [Silent Hill PC port](https://github.com/SlickAmogus/silent-hill-decomp)**: the native port, widescreen, the camera styles, PGXP, the per-pixel flashlight and most of the gameplay additions. Almost everything here is their work.
-- **[PsyCross](https://github.com/OpenDriver2/PsyCross)** by the REDRIVER2 Project (SoapyMan, InspirationByte): the PsyQ SDK compatibility layer. This port uses its own fork with Vita support: [khajit2412/PsyCross](https://github.com/khajit2412/PsyCross).
+- **[PsyCross](https://github.com/OpenDriver2/PsyCross)** by the REDRIVER2 Project (SoapyMan, InspirationByte): the PsyQ SDK compatibility layer. This port uses its own fork with Vita support: [ShellingBest/PsyCross](https://github.com/ShellingBest/PsyCross).
 - **Rinnegatamante**: [vitaGL](https://github.com/Rinnegatamante/vitaGL), vitaShaRK and [ShaRKBR33D](https://github.com/Rinnegatamante/ShaRKBR33D). His [Crash Team Racing: High Octane](https://github.com/Rinnegatamante/Crash-Team-Racing-High-Octane) Vita port was the reference for many of this port's renderer optimizations.
 - **The [VitaSDK](https://vitasdk.org) team** and the SDL2 Vita port contributors.
 - **PGXP**: the original PGXP by iCatButler; the precise-vertex lookup follows [DuckStation](https://github.com/stenzek/duckstation)'s approach.
 - **Fonts**: Oswald and Barlow Semi Condensed, under the SIL Open Font License 1.1.
 - **The HENkaku / Enso and VitaShell developers**, for making homebrew on the Vita possible.
-- **Vita port**: [khajit2412](https://github.com/khajit2412).
+- **Vita port**: [ShellingBest](https://github.com/ShellingBest).
 
 ## Building
 
 You need VitaSDK and a Linux host (WSL works) with CMake, Ninja, Python 3, `llvm-nm` and `llvm-objcopy`.
 
 ```sh
-git clone --recursive -b v0.7 https://github.com/khajit2412/SilentVitaHill.git
-cd SilentVitaHill
+git clone --recursive https://github.com/ShellingBest/SilentHillVita.git
+cd SilentHillVita
 
 export VITASDK=/usr/local/vitasdk
 export PATH=$VITASDK/bin:$PATH
