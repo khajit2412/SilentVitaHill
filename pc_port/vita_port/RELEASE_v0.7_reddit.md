@@ -4,7 +4,7 @@
 
 Silent Hill now runs natively on the PS Vita. This is **not an emulator** and **not a recompilation**: it's built from the Silent Hill PSX decompilation and the native PC port, compiled for the Vita and rendered with vitaGL.
 
-**You need your own copy of Silent Hill (USA) for PS1 as a `.bin` image. No game data is included.**
+**You need your own copy of Silent Hill (USA) for PS1 as a single `.bin` image. No game data is included.**
 
 **Features**
 
@@ -22,6 +22,8 @@ Silent Hill now runs natively on the PS Vita. This is **not an emulator** and **
 2. Install `SilentHillVita.vpk` with VitaShell.
 3. Copy your Silent Hill (USA) `.bin` to `ux0:data/silenthill/gamedata/`. Any file name works.
 4. Launch. The first time a new effect appears there can be a short pause while its shader compiles; after that it's cached.
+
+**Optional:** if you have a core-unlocking plugin (CapUnlocker / CoreUnlocker80000H), the game detects it and moves disc streaming onto the Vita's otherwise system-reserved fourth core (core 3) for smoother loading. It works fine without it.
 
 **Controls**
 

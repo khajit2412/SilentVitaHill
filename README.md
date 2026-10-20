@@ -21,6 +21,7 @@ A native PlayStation Vita port of Silent Hill (1999). It is built from the [Sile
 - A PS Vita or PS TV on custom firmware (HENkaku / h-encore / Enso) with VitaShell.
 - `libshacccg.suprx` in `ur0:data/` or `ur0:data/external/`. The game compiles its shaders on the console the first time they are used. Extract it with [ShaRKBR33D](https://github.com/Rinnegatamante/ShaRKBR33D).
 - Your own legally obtained **Silent Hill (USA)** PlayStation disc image as a single `.bin` file. PAL and Japanese images are detected too, but USA is the tested version.
+- Optional: a core-unlocking plugin (CapUnlocker / CoreUnlocker80000H). The Vita normally reserves its fourth CPU core (core 3) for the system. With the plugin installed, the game detects it at startup and moves disc streaming onto that core, which smooths out loading hitches. Without it, everything still runs on the other three cores.
 
 ## Installation
 
