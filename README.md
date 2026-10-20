@@ -28,6 +28,7 @@ A native PlayStation Vita port of Silent Hill (1999). It is built from the [Sile
 1. Install `SilentHillVita.vpk` with VitaShell.
 2. Copy your disc image (`.bin`) to `ux0:data/silenthill/gamedata/`. Any file name works; the game finds it by its disc serial.
 3. Start the game from the LiveArea. The first boot creates its folders and copies its fonts.
+4. To pick a camera style, go to Select (inventory) > Option > Vita Preferences and **tap the top-right corner of the touch screen** to reach the Camera page. See [Menus](#menus-use-the-touch-screen-corners).
 
 The first time a new effect or area appears, the game compiles a shader, which can cause a short pause. Compiled shaders are cached in `ux0:data/silenthill/shader_cache/`, so this only happens once.
 
@@ -45,17 +46,23 @@ The first time a new effect or area appears, the game compiles a shader, which c
 | Start | Pause / skip cutscenes |
 | R | Aim |
 | L | Look (original camera) |
-| **Top-left corner** of the touch screen | Sidestep left (PS1 L1) |
-| **Top-right corner** of the touch screen | Sidestep right (PS1 R1) |
+| **Top-left corner** of the touch screen | Sidestep left (PS1 L1) / previous page in Vita Preferences |
+| **Top-right corner** of the touch screen | Sidestep right (PS1 R1) / next page in Vita Preferences |
 
 The Vita has two shoulder buttons where the PS1 had four, so L and R take the PS1's L2 and R2 (look and aim), and the PS1's L1 and R1 are the two top corners of the front touch screen. Each corner is a quarter of the screen wide and a third of it tall.
 
-### Menus
+### Menus: use the touch screen corners
+
+> **Important:** Vita Preferences has three pages, and only the first one (Graphics) is visible when you open it. **The camera styles, aim assist, field of view, minimap and crosshair are on pages 2 and 3.** To get there, **tap the top-right corner of the front touch screen**. Tap the **top-left corner** to go back a page. These are the same corners that sidestep during gameplay.
+
+- **Page 1, Graphics**: Graphics Mode (Quality / Classic), 2D Controls
+- **Page 2, Camera**: camera style (Original, Third Person, Over the Shoulder, First Person), aim assist, field of view, aim zoom, camera collision
+- **Page 3, HUD**: minimap (scale, corner, opacity), low-HP glow, crosshair
+
+To change the camera: Select (inventory) > Option > Vita Preferences > **tap the top-right corner** > Camera.
 
 - Cross confirms; Circle, Triangle or Square goes back.
 - **Options** is on the title screen, and in-game in the inventory (Select > Option).
-- **Vita Preferences** (Options > Vita Preferences) has three pages: Graphics, Camera and HUD. Tap the **top-left** or **top-right corner** of the touch screen to go to the previous or next page, or use the Next Page / Prev Page rows.
-- To change the camera style: Options > Vita Preferences > next page > Camera.
 - To return to the title screen during play: Select (inventory) > Option > Exit to Menu. Unsaved progress is lost, just like quitting on the PS1.
 
 ### Melee weapons in the free-aim cameras
